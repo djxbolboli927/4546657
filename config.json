@@ -1,0 +1,39 @@
+{
+  // استفاده از Processed برای سریع‌ترین دریافت
+  "commitment": "Processed",
+
+  // فیلتر تراکنش‌ها - در حال حاضر خالی چون از shreds استفاده می‌کنیم
+  "transactions": {},
+
+  // فیلتر account ها - فقط PumpFun bonding curves
+  "accounts": {
+    "pumpfun_bonding_curves": {
+      // آدرس‌های خاص (در صورت نیاز)
+      "account": [],
+
+      // فقط account های متعلق به PumpFun program
+      "owner": ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"],
+
+      // فیلترهای اضافی
+      "filters": [
+        // حداقل 4 SOL نقدینگی
+        {
+          "lamports": {
+            "cmp": "gt",
+            "value": 4000000000
+          }
+        },
+        // اندازه داده 256 بایت (اندازه استاندارد bonding curve)
+        {
+          "dataSize": 256
+        }
+      ]
+    }
+  },
+
+  // سایر فیلترها غیرفعال
+  "slots": {},
+  "blocks": {},
+  "blocks_meta": {},
+  "entry": {}
+}
