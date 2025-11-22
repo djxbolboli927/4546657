@@ -29,9 +29,38 @@ struct BundleParams {
     frontrun_target: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct SendBundleResponse {
     result: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BundleStatusResponse {
+    jsonrpc: String,
+    result: BundleStatusResult,
+    id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BundleStatusResult {
+    context: BundleContext,
+    value: Vec<BundleStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BundleContext {
+    slot: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleStatus {
+    pub bundle_id: String,
+    pub transactions: Vec<String>,
+    pub slot: u64,
+    pub confirmation_status: String,
+    pub err: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,6 +227,56 @@ impl JitoClient {
                 Err(anyhow!("Failed to send bundle: {}", e))
             }
         }
+    }
+
+    /// چک کردن وضعیت bundle
+    pub async fn check_bundle_status(&self, bundle_ids: Vec<String>) -> Result<Vec<BundleStatus>> {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBundleStatuses",
+            "params": [bundle_ids]
+        });
+
+        // سعی با Frankfurt
+        for endpoint in &self.endpoints {
+            let url = format!("{}/api/v1/bundles", endpoint);
+
+            match self.http_client
+                .post(&url)
+                .json(&request)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        if let Ok(result) = response.json::<BundleStatusResponse>().await {
+                            return Ok(result.result.value);
+                        }
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+
+        Err(anyhow!("Failed to get bundle status from any endpoint"))
+    }
+
+    /// لاگ کردن جزئیات bundle برای debugging
+    pub fn log_bundle_details(
+        &self,
+        bundle_id: &str,
+        victim_sig: &str,
+        front_tx_sig: &str,
+        back_tx_sig: &str,
+    ) {
+        info!("📦 Bundle Details:");
+        info!("   Bundle ID: {}", bundle_id);
+        info!("   Victim Tx: {}", victim_sig);
+        info!("   Front-run Tx: {}", front_tx_sig);
+        info!("   Back-run Tx: {}", back_tx_sig);
+        info!("   Check status: https://explorer.jito.wtf/bundle/{}", bundle_id);
     }
 
     async fn send_to_endpoint(

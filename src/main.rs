@@ -796,6 +796,10 @@ async fn unified_worker_thread(
             info!("📦 [W{}] Sending bundle to Jito...", worker_id);
             info!("   🎯 Victim: {}", tx_info.signature);
 
+            // Get transaction signatures for logging
+            let front_tx_sig = bs58::encode(&front_tx.signatures[0]).into_string();
+            let back_tx_sig = bs58::encode(&back_tx.signatures[0]).into_string();
+
             match jito_client.send_bundle_with_victim(
                 vec![front_tx, back_tx],
                 Some(tx_info.signature.clone()),
@@ -806,6 +810,36 @@ async fn unified_worker_thread(
                     info!("   Tip: {:.6} SOL", JITO_TIP_LAMPORTS as f64 / LAMPORTS_PER_SOL as f64);
                     info!("   Expected profit: {:.6} SOL", simulation.net_profit as f64 / LAMPORTS_PER_SOL as f64);
                     stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
+
+                    // Log detailed bundle info
+                    jito_client.log_bundle_details(
+                        &bundle_id,
+                        &tx_info.signature,
+                        &front_tx_sig,
+                        &back_tx_sig,
+                    );
+
+                    // Check bundle status after delay
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    match jito_client.check_bundle_status(vec![bundle_id.clone()]).await {
+                        Ok(statuses) => {
+                            for status in statuses {
+                                info!("📊 [W{}] Bundle Status:", worker_id);
+                                info!("   Bundle ID: {}", status.bundle_id);
+                                info!("   Confirmation: {}", status.confirmation_status);
+                                info!("   Slot: {}", status.slot);
+                                if let Some(err) = status.err {
+                                    error!("   ❌ Error: {:?}", err);
+                                    error!("   This is why Jito rejected the bundle!");
+                                } else {
+                                    info!("   ✅ No error - bundle accepted!");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("⚠️ [W{}] Could not check bundle status: {}", worker_id, e);
+                        }
+                    }
                 }
                 Err(e) => {
                     error!("❌ [W{}] Bundle failed: {}", worker_id, e);
