@@ -88,7 +88,9 @@ const CLEANUP_INTERVAL_SECS: u64 = 300; // 5 minutes
 const MAX_ACTIVITY_AGE_SECS: u64 = 600; // 10 minutes
 
 // Simulation control
-const ENABLE_RPC_SIMULATION: bool = true; // تنظیم به true برای فعال کردن شبیه‌سازی
+// ✅ DISABLED for maximum speed! RPC simulation is too slow for front-running.
+// We use local AMM calculations instead (much faster & more accurate).
+const ENABLE_RPC_SIMULATION: bool = false;
 
 // ═══════════════════════════════════════════════════════════════
 // Data Structures
