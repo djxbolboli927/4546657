@@ -1,0 +1,25 @@
+{
+  "commitment": "Processed",
+  "transactions": {},
+  "accounts": {
+    "pumpfun_bonding_curves": {
+      "account": [],
+      "owner": ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"],
+      "filters": [
+        {
+          "lamports": {
+            "cmp": "gt",
+            "value": 4000000000
+          }
+        },
+        {
+          "dataSize": 256
+        }
+      ]
+    }
+  },
+  "slots": {},
+  "blocks": {},
+  "blocks_meta": {},
+  "entry": {}
+}
