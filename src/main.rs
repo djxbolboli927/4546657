@@ -41,7 +41,7 @@ mod wallet_manager;
 use wallet_manager::WalletManager;
 
 mod jito_client;
-use jito_client::{JitoClient, TargetTxStatus};
+use jito_client::{JitoClient, TargetTxStatus, TokenProgramType};
 
 mod transaction_builder;
 use transaction_builder::TransactionBuilder;
@@ -687,6 +687,19 @@ async fn unified_worker_thread(
             };
 
             // ═══════════════════════════════════════════════════════════
+            // 🔍 Detect Token Program Type (CRITICAL FIX!)
+            // ═══════════════════════════════════════════════════════════
+            let token_program_type = match jito_client.detect_token_program_type(&tx_info.mint).await {
+                Ok(tp) => tp,
+                Err(e) => {
+                    error!("❌ [W{}] Failed to detect token program type: {}", worker_id, e);
+                    // Default to Token Program if detection fails
+                    warn!("   ⚠️  Defaulting to Token Program");
+                    TokenProgramType::TokenProgram
+                }
+            };
+
+            // ═══════════════════════════════════════════════════════════
             // 🔨 Build transactions
             // ═══════════════════════════════════════════════════════════
             let front_tx = match tx_builder.build_front_run_transaction(
@@ -698,6 +711,7 @@ async fn unified_worker_thread(
                 simulation.front_run_sol,
                 front_run_priority_fee,
                 blockhash,
+                token_program_type,  // ✅ NEW: پاس دادن Token Program type
             ).await {
                 Ok(tx) => tx,
                 Err(e) => {
@@ -718,6 +732,7 @@ async fn unified_worker_thread(
                 JITO_TIP_LAMPORTS,
                 &jito_tip_account,
                 blockhash,
+                token_program_type,  // ✅ NEW: پاس دادن Token Program type
             ).await {
                 Ok(tx) => tx,
                 Err(e) => {

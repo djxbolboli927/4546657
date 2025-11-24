@@ -392,6 +392,72 @@ impl JitoClient {
         Err(anyhow!("Failed to get bundle status from any endpoint"))
     }
 
+    /// ✅ تشخیص نوع Token Program از mint account
+    /// CRITICAL FIX: PumpFun uses both Token Program and Token-2022!
+    pub async fn detect_token_program_type(&self, mint: &str) -> Result<TokenProgramType> {
+        debug!("🔍 Detecting token program type for mint: {}", mint);
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [
+                mint,
+                {
+                    "encoding": "jsonParsed",
+                    "commitment": "processed"
+                }
+            ]
+        });
+
+        let response = self.http_client
+            .post(&self.rpc_endpoint)
+            .json(&request)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| anyhow!("Failed to fetch mint account: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("RPC error: {}", response.status()));
+        }
+
+        let response_json: serde_json::Value = response.json().await?;
+
+        // استخراج owner از account info
+        if let Some(result) = response_json.get("result") {
+            if let Some(value) = result.get("value") {
+                if !value.is_null() {
+                    if let Some(owner) = value.get("owner") {
+                        if let Some(owner_str) = owner.as_str() {
+                            debug!("   Mint owner: {}", owner_str);
+
+                            // Token-2022 Program
+                            if owner_str == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" {
+                                info!("   ✅ Token-2022 Program detected");
+                                return Ok(TokenProgramType::Token2022Program);
+                            }
+                            // Token Program معمولی
+                            else if owner_str == "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" {
+                                info!("   ✅ Token Program detected");
+                                return Ok(TokenProgramType::TokenProgram);
+                            }
+                            else {
+                                warn!("   ⚠️  Unknown token program: {}", owner_str);
+                                // Default: Token Program معمولی
+                                return Ok(TokenProgramType::TokenProgram);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // اگر نتوانستیم تشخیص دهیم، از Token Program معمولی استفاده می‌کنیم
+        warn!("   ⚠️  Could not detect token program, defaulting to Token Program");
+        Ok(TokenProgramType::TokenProgram)
+    }
+
     /// چک کردن اینکه آیا تراکنش روی blockchain landed شده یا نه
     pub async fn check_transaction_status(&self, signature: &str) -> Result<bool> {
         let request = serde_json::json!({
@@ -496,4 +562,11 @@ pub enum TargetTxStatus {
     InMempool,          // در mempool است
     AlreadyConfirmed,   // قبلاً confirmed شده (دیر رسیدیم!)
     Unknown,            // نامشخص
+}
+
+/// ✅ نوع Token Program (معمولی یا Token-2022)
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum TokenProgramType {
+    TokenProgram,       // Token Program معمولی
+    Token2022Program,   // Token-2022 Program
 }

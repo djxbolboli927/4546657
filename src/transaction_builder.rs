@@ -16,10 +16,16 @@ use crate::pumpfun_instructions::{
     create_buy_instruction, create_sell_instruction,
 };
 use crate::spl_utils::{
-    get_associated_token_address_2022,  // ✅ تغییر به Token-2022
-    create_associated_token_account_2022,  // ✅ تغییر به Token-2022
-    close_account_2022,  // ✅ تغییر به Token-2022
+    // Token Program معمولی
+    get_associated_token_address,
+    create_associated_token_account,
+    close_account,
+    // Token-2022 Program
+    get_associated_token_address_2022,
+    create_associated_token_account_2022,
+    close_account_2022,
 };
+use crate::jito_client::TokenProgramType;
 
 pub struct TransactionBuilder {
     pub rpc_client: solana_client::rpc_client::RpcClient,
@@ -46,16 +52,30 @@ impl TransactionBuilder {
         max_sol_cost: u64,
         priority_fee_microlamports: u64,
         recent_blockhash: Hash,
+        token_program_type: TokenProgramType,  // ✅ NEW: پارامتر جدید
     ) -> Result<Transaction> {
-        // ✅ استفاده از Token-2022 برای محاسبه ATA
-        let user_token_account = get_associated_token_address_2022(&buyer.pubkey(), mint);
+        // ✅ انتخاب تابع مناسب بر اساس نوع Token Program
+        let user_token_account = match token_program_type {
+            TokenProgramType::Token2022Program => {
+                get_associated_token_address_2022(&buyer.pubkey(), mint)
+            }
+            TokenProgramType::TokenProgram => {
+                get_associated_token_address(&buyer.pubkey(), mint)
+            }
+        };
+
+        let token_program_name = match token_program_type {
+            TokenProgramType::Token2022Program => "Token-2022",
+            TokenProgramType::TokenProgram => "Token Program",
+        };
 
         debug!("🔨 Building FRONT-RUN transaction:");
         debug!("   Buyer: {}", buyer.pubkey());
         debug!("   Mint: {}", mint);
         debug!("   Bonding Curve: {}", bonding_curve);
         debug!("   Creator Vault: {}", creator_vault);
-        debug!("   User Token Account (Token-2022): {}", user_token_account);
+        debug!("   Token Program: {}", token_program_name);
+        debug!("   User Token Account: {}", user_token_account);
         debug!("   Token Amount: {}", token_amount);
         debug!("   Max SOL Cost: {} lamports", max_sol_cost);
         debug!("   Priority Fee: {} μLamp", priority_fee_microlamports);
@@ -73,15 +93,25 @@ impl TransactionBuilder {
         );
         debug!("   ✅ Added priority fee: {}", priority_fee_microlamports);
 
-        // ✅ Create ATA با Token-2022
-        instructions.push(
-            create_associated_token_account_2022(
-                &buyer.pubkey(),
-                &buyer.pubkey(),
-                mint,
-            )
-        );
-        debug!("   ✅ Added create ATA instruction (Token-2022)");
+        // ✅ Create ATA با Token Program مناسب
+        let create_ata_ix = match token_program_type {
+            TokenProgramType::Token2022Program => {
+                create_associated_token_account_2022(
+                    &buyer.pubkey(),
+                    &buyer.pubkey(),
+                    mint,
+                )
+            }
+            TokenProgramType::TokenProgram => {
+                create_associated_token_account(
+                    &buyer.pubkey(),
+                    &buyer.pubkey(),
+                    mint,
+                )
+            }
+        };
+        instructions.push(create_ata_ix);
+        debug!("   ✅ Added create ATA instruction ({})", token_program_name);
 
         // Buy instruction
         instructions.push(
@@ -125,16 +155,30 @@ impl TransactionBuilder {
         jito_tip_lamports: u64,
         jito_tip_account: &Pubkey,
         recent_blockhash: Hash,
+        token_program_type: TokenProgramType,  // ✅ NEW: پارامتر جدید
     ) -> Result<Transaction> {
-        // ✅ استفاده از Token-2022 برای محاسبه ATA
-        let user_token_account = get_associated_token_address_2022(&seller.pubkey(), mint);
+        // ✅ انتخاب تابع مناسب بر اساس نوع Token Program
+        let user_token_account = match token_program_type {
+            TokenProgramType::Token2022Program => {
+                get_associated_token_address_2022(&seller.pubkey(), mint)
+            }
+            TokenProgramType::TokenProgram => {
+                get_associated_token_address(&seller.pubkey(), mint)
+            }
+        };
+
+        let token_program_name = match token_program_type {
+            TokenProgramType::Token2022Program => "Token-2022",
+            TokenProgramType::TokenProgram => "Token Program",
+        };
 
         debug!("🔨 Building BACK-RUN transaction:");
         debug!("   Seller: {}", seller.pubkey());
         debug!("   Mint: {}", mint);
         debug!("   Bonding Curve: {}", bonding_curve);
         debug!("   Creator Vault: {}", creator_vault);
-        debug!("   User Token Account (Token-2022): {}", user_token_account);
+        debug!("   Token Program: {}", token_program_name);
+        debug!("   User Token Account: {}", user_token_account);
         debug!("   Token Amount: {}", token_amount);
         debug!("   Min SOL Output: {} lamports", min_sol_output);
         debug!("   Priority Fee: {} μLamp", priority_fee_microlamports);
@@ -167,15 +211,25 @@ impl TransactionBuilder {
         );
         debug!("   ✅ Added sell instruction");
 
-        // ✅ Close account با Token-2022
-        instructions.push(
-            close_account_2022(
-                &user_token_account,
-                &seller.pubkey(),
-                &seller.pubkey(),
-            )?
-        );
-        debug!("   ✅ Added close account instruction (Token-2022)");
+        // ✅ Close account با Token Program مناسب
+        let close_account_ix = match token_program_type {
+            TokenProgramType::Token2022Program => {
+                close_account_2022(
+                    &user_token_account,
+                    &seller.pubkey(),
+                    &seller.pubkey(),
+                )?
+            }
+            TokenProgramType::TokenProgram => {
+                close_account(
+                    &user_token_account,
+                    &seller.pubkey(),
+                    &seller.pubkey(),
+                )?
+            }
+        };
+        instructions.push(close_account_ix);
+        debug!("   ✅ Added close account instruction ({})", token_program_name);
 
         // Jito tip
         instructions.push(
