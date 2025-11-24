@@ -16,14 +16,10 @@ use crate::pumpfun_instructions::{
     create_buy_instruction, create_sell_instruction,
 };
 use crate::spl_utils::{
-    // Token Program معمولی
-    get_associated_token_address,
-    create_associated_token_account,
-    close_account,
-    // Token-2022 Program
-    get_associated_token_address_2022,
-    create_associated_token_account_2022,
-    close_account_2022,
+    // ✅ NEW: استفاده از توابع جدید که token_program_id را به عنوان پارامتر می‌گیرند
+    get_associated_token_address_with_program_id,
+    create_associated_token_account_with_program_id,
+    close_account_with_program_id,
 };
 use crate::jito_client::TokenProgramType;
 
@@ -57,15 +53,12 @@ impl TransactionBuilder {
         bonding_curve_token_account: &Pubkey,  // ✅ NEW: از victim tx
         token_program_id: &Pubkey,  // ✅ NEW: از victim tx
     ) -> Result<Transaction> {
-        // ✅ انتخاب تابع مناسب بر اساس نوع Token Program
-        let user_token_account = match token_program_type {
-            TokenProgramType::Token2022Program => {
-                get_associated_token_address_2022(&buyer.pubkey(), mint)
-            }
-            TokenProgramType::TokenProgram => {
-                get_associated_token_address(&buyer.pubkey(), mint)
-            }
-        };
+        // ✅ محاسبه User Token Account با استفاده از دقیقاً همان token_program_id از victim tx
+        let user_token_account = get_associated_token_address_with_program_id(
+            &buyer.pubkey(),
+            mint,
+            token_program_id,  // ✅ از victim tx!
+        );
 
         let token_program_name = match token_program_type {
             TokenProgramType::Token2022Program => "Token-2022",
@@ -96,23 +89,13 @@ impl TransactionBuilder {
         );
         debug!("   ✅ Added priority fee: {}", priority_fee_microlamports);
 
-        // ✅ Create ATA با Token Program مناسب
-        let create_ata_ix = match token_program_type {
-            TokenProgramType::Token2022Program => {
-                create_associated_token_account_2022(
-                    &buyer.pubkey(),
-                    &buyer.pubkey(),
-                    mint,
-                )
-            }
-            TokenProgramType::TokenProgram => {
-                create_associated_token_account(
-                    &buyer.pubkey(),
-                    &buyer.pubkey(),
-                    mint,
-                )
-            }
-        };
+        // ✅ Create ATA با استفاده از دقیقاً همان token_program_id از victim tx
+        let create_ata_ix = create_associated_token_account_with_program_id(
+            &buyer.pubkey(),
+            &buyer.pubkey(),
+            mint,
+            token_program_id,  // ✅ از victim tx!
+        );
         instructions.push(create_ata_ix);
         debug!("   ✅ Added create ATA instruction ({})", token_program_name);
 
@@ -167,15 +150,12 @@ impl TransactionBuilder {
         bonding_curve_token_account: &Pubkey,  // ✅ NEW: از victim tx
         token_program_id: &Pubkey,  // ✅ NEW: از victim tx
     ) -> Result<Transaction> {
-        // ✅ انتخاب تابع مناسب بر اساس نوع Token Program
-        let user_token_account = match token_program_type {
-            TokenProgramType::Token2022Program => {
-                get_associated_token_address_2022(&seller.pubkey(), mint)
-            }
-            TokenProgramType::TokenProgram => {
-                get_associated_token_address(&seller.pubkey(), mint)
-            }
-        };
+        // ✅ محاسبه User Token Account با استفاده از دقیقاً همان token_program_id از victim tx
+        let user_token_account = get_associated_token_address_with_program_id(
+            &seller.pubkey(),
+            mint,
+            token_program_id,  // ✅ از victim tx!
+        );
 
         let token_program_name = match token_program_type {
             TokenProgramType::Token2022Program => "Token-2022",
@@ -225,23 +205,13 @@ impl TransactionBuilder {
         );
         debug!("   ✅ Added sell instruction");
 
-        // ✅ Close account با Token Program مناسب
-        let close_account_ix = match token_program_type {
-            TokenProgramType::Token2022Program => {
-                close_account_2022(
-                    &user_token_account,
-                    &seller.pubkey(),
-                    &seller.pubkey(),
-                )?
-            }
-            TokenProgramType::TokenProgram => {
-                close_account(
-                    &user_token_account,
-                    &seller.pubkey(),
-                    &seller.pubkey(),
-                )?
-            }
-        };
+        // ✅ Close account با استفاده از دقیقاً همان token_program_id از victim tx
+        let close_account_ix = close_account_with_program_id(
+            &user_token_account,
+            &seller.pubkey(),
+            &seller.pubkey(),
+            token_program_id,  // ✅ از victim tx!
+        )?;
         instructions.push(close_account_ix);
         debug!("   ✅ Added close account instruction ({})", token_program_name);
 
