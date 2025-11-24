@@ -3,6 +3,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use solana_sdk::transaction::Transaction;
 use log::{info, warn, error, debug};
+use std::time::Duration;
+use tokio::time::sleep;
 
 const JITO_TIP_ACCOUNTS: [&str; 8] = [
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
