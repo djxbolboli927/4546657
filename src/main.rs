@@ -135,7 +135,11 @@ struct TransactionInfo {
     signature: String,
     timestamp: Instant,
     slot: u64,
+    // ✅ دسته 2: accounts که باید از victim tx کپی شوند
     creator_vault: Option<String>,
+    fee_recipient: Option<String>,  // ✅ NEW! متغیر است، نه ثابت!
+    bonding_curve_token_account: Option<String>,  // ✅ NEW! Associated Bonding Curve
+    token_program_id: Option<String>,  // ✅ NEW! Token Program ID (account #9)
 }
 
 #[derive(Debug, Clone)]
@@ -687,17 +691,72 @@ async fn unified_worker_thread(
             };
 
             // ═══════════════════════════════════════════════════════════
-            // 🔍 Detect Token Program Type (CRITICAL FIX!)
+            // ✅ استخراج Token Program Type از تراکنش قربانی (بدون RPC!)
             // ═══════════════════════════════════════════════════════════
-            let token_program_type = match jito_client.detect_token_program_type(&tx_info.mint).await {
-                Ok(tp) => tp,
-                Err(e) => {
-                    error!("❌ [W{}] Failed to detect token program type: {}", worker_id, e);
-                    // Default to Token Program if detection fails
-                    warn!("   ⚠️  Defaulting to Token Program");
-                    TokenProgramType::TokenProgram
+            let token_program_id_str = match &tx_info.token_program_id {
+                Some(tp) => tp,
+                None => {
+                    error!("❌ [W{}] No token program ID in victim tx!", worker_id);
+                    continue;
                 }
             };
+
+            let token_program_type = if token_program_id_str == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" {
+                debug!("✅ [W{}] Token Program: Token-2022", worker_id);
+                TokenProgramType::Token2022Program
+            } else if token_program_id_str == "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" {
+                debug!("✅ [W{}] Token Program: Standard Token Program", worker_id);
+                TokenProgramType::TokenProgram
+            } else {
+                error!("❌ [W{}] Unknown token program ID: {}", worker_id, token_program_id_str);
+                continue;
+            };
+
+            let token_program_id_pubkey = match Pubkey::from_str(token_program_id_str) {
+                Ok(tpid) => tpid,
+                Err(e) => {
+                    error!("❌ [W{}] Invalid token program ID pubkey: {}", worker_id, e);
+                    continue;
+                }
+            };
+
+            // ✅ دریافت Fee Recipient از victim tx (متغیر است!)
+            let fee_recipient_str = match &tx_info.fee_recipient {
+                Some(fr) => fr,
+                None => {
+                    error!("❌ [W{}] No fee recipient in victim tx!", worker_id);
+                    continue;
+                }
+            };
+
+            let fee_recipient = match Pubkey::from_str(fee_recipient_str) {
+                Ok(fr) => fr,
+                Err(e) => {
+                    error!("❌ [W{}] Invalid fee recipient pubkey: {}", worker_id, e);
+                    continue;
+                }
+            };
+
+            debug!("✅ [W{}] Fee Recipient from victim tx: {}", worker_id, fee_recipient);
+
+            // ✅ دریافت Bonding Curve Token Account از victim tx
+            let bonding_curve_token_account_str = match &tx_info.bonding_curve_token_account {
+                Some(bcta) => bcta,
+                None => {
+                    error!("❌ [W{}] No bonding curve token account in victim tx!", worker_id);
+                    continue;
+                }
+            };
+
+            let bonding_curve_token_account = match Pubkey::from_str(bonding_curve_token_account_str) {
+                Ok(bcta) => bcta,
+                Err(e) => {
+                    error!("❌ [W{}] Invalid bonding curve token account pubkey: {}", worker_id, e);
+                    continue;
+                }
+            };
+
+            debug!("✅ [W{}] Bonding Curve Token Account from victim tx: {}", worker_id, bonding_curve_token_account);
 
             // ═══════════════════════════════════════════════════════════
             // 🔨 Build transactions
@@ -711,7 +770,10 @@ async fn unified_worker_thread(
                 simulation.front_run_sol,
                 front_run_priority_fee,
                 blockhash,
-                token_program_type,  // ✅ NEW: پاس دادن Token Program type
+                token_program_type,
+                &fee_recipient,  // ✅ NEW: از victim tx
+                &bonding_curve_token_account,  // ✅ NEW: از victim tx
+                &token_program_id_pubkey,  // ✅ NEW: از victim tx
             ).await {
                 Ok(tx) => tx,
                 Err(e) => {
@@ -732,7 +794,10 @@ async fn unified_worker_thread(
                 JITO_TIP_LAMPORTS,
                 &jito_tip_account,
                 blockhash,
-                token_program_type,  // ✅ NEW: پاس دادن Token Program type
+                token_program_type,
+                &fee_recipient,  // ✅ NEW: از victim tx
+                &bonding_curve_token_account,  // ✅ NEW: از victim tx
+                &token_program_id_pubkey,  // ✅ NEW: از victim tx
             ).await {
                 Ok(tx) => tx,
                 Err(e) => {
@@ -925,7 +990,23 @@ fn extract_transaction_info(
                         let mint_pubkey = instruction.accounts.get(2)
                             .and_then(|&idx| account_keys.get(idx as usize));
 
-                        // ✅ دریافت Creator Vault از account #9
+                        // ✅ دسته 2: استخراج accounts مهم از تراکنش قربانی
+                        // Account #2 = Fee Recipient (متغیر است!)
+                        let fee_recipient = instruction.accounts.get(1)
+                            .and_then(|&idx| account_keys.get(idx as usize))
+                            .map(|pk| pk.to_string());
+
+                        // Account #5 = Associated Bonding Curve Token Account
+                        let bonding_curve_token_account = instruction.accounts.get(4)
+                            .and_then(|&idx| account_keys.get(idx as usize))
+                            .map(|pk| pk.to_string());
+
+                        // Account #9 = Token Program ID (Token Program یا Token-2022)
+                        let token_program_id = instruction.accounts.get(8)
+                            .and_then(|&idx| account_keys.get(idx as usize))
+                            .map(|pk| pk.to_string());
+
+                        // Account #10 = Creator Vault
                         let creator_vault = instruction.accounts.get(9)
                             .and_then(|&idx| account_keys.get(idx as usize))
                             .map(|pk| pk.to_string());
@@ -947,6 +1028,9 @@ fn extract_transaction_info(
                                 timestamp: Instant::now(),
                                 slot: current_slot,
                                 creator_vault,
+                                fee_recipient,
+                                bonding_curve_token_account,
+                                token_program_id,
                             });
                         }
                     }
@@ -1114,15 +1198,17 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     info!("═══════════════════════════════════════════════════════════");
-    info!("MEV Bot v16.0 - TOKEN-2022 + REPLACEBLOCKHASH FIX 🚀");
+    info!("MEV Bot v17.0 - EXTRACT ALL ACCOUNTS FROM VICTIM TX 🚀");
     info!("Workers: {}", WORKER_COUNT);
     info!("RPC Simulation: {}", if ENABLE_RPC_SIMULATION { "ENABLED (with replaceRecentBlockhash)" } else { "DISABLED" });
     info!("═══════════════════════════════════════════════════════════");
     info!("🎯 CRITICAL FIXES:");
-    info!("   ✅ Using Token-2022 Program (not standard Token Program)");
+    info!("   ✅ Fee Recipient extracted from victim tx (NOT hardcoded!)");
+    info!("   ✅ Bonding Curve Token Account from victim tx (NOT calculated!)");
+    info!("   ✅ Token Program ID from victim tx (NO RPC detection!)");
+    info!("   ✅ Creator vault from victim tx (NO RPC calls!)");
     info!("   ✅ replaceRecentBlockhash=true in simulation");
     info!("   ✅ Check target tx status before sending bundle");
-    info!("   ✅ Creator vault from victim tx (no RPC calls)");
     info!("   ✅ Full debugging logs");
     info!("═══════════════════════════════════════════════════════════");
 

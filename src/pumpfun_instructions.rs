@@ -52,27 +52,14 @@ pub fn create_buy_instruction(
     user_token_account: &Pubkey,
     token_amount: u64,
     max_sol_cost: u64,
-    token_program_type: TokenProgramType,  // ✅ NEW: پارامتر جدید
+    token_program_type: TokenProgramType,
+    fee_recipient: &Pubkey,  // ✅ NEW: از victim tx استخراج شده
+    bonding_curve_token_account: &Pubkey,  // ✅ NEW: از victim tx استخراج شده
+    token_program_id: &Pubkey,  // ✅ NEW: از victim tx استخراج شده
 ) -> Result<Instruction> {
-    // ✅ انتخاب تابع مناسب بر اساس Token Program type
-    let bonding_curve_token_account = match token_program_type {
-        TokenProgramType::Token2022Program => {
-            get_associated_token_address_2022(bonding_curve, mint)
-        }
-        TokenProgramType::TokenProgram => {
-            get_associated_token_address(bonding_curve, mint)
-        }
-    };
-
-    let token_program_id = match token_program_type {
-        TokenProgramType::Token2022Program => TOKEN_2022_PROGRAM_ID,
-        TokenProgramType::TokenProgram => TOKEN_PROGRAM_ID,
-    };
-
     let user_volume_accumulator = derive_user_volume_accumulator(buyer);
 
     let global_config = Pubkey::from_str(GLOBAL_CONFIG)?;
-    let fee_recipient = Pubkey::from_str(FEE_RECIPIENT)?;
     let event_authority = Pubkey::from_str(EVENT_AUTHORITY)?;
     let program_id = Pubkey::from_str(PUMP_FUN_PROGRAM)?;
     let global_volume = Pubkey::from_str(GLOBAL_VOLUME_ACCUMULATOR)?;
@@ -81,14 +68,14 @@ pub fn create_buy_instruction(
 
     let accounts = vec![
         AccountMeta::new_readonly(global_config, false),
-        AccountMeta::new(fee_recipient, false),
+        AccountMeta::new(*fee_recipient, false),  // ✅ از victim tx
         AccountMeta::new_readonly(*mint, false),
         AccountMeta::new(*bonding_curve, false),
-        AccountMeta::new(bonding_curve_token_account, false),
+        AccountMeta::new(*bonding_curve_token_account, false),  // ✅ از victim tx
         AccountMeta::new(*user_token_account, false),
         AccountMeta::new(*buyer, true),
         AccountMeta::new_readonly(system_program::ID, false),
-        AccountMeta::new_readonly(token_program_id, false),  // ✅ Dynamic Token Program!
+        AccountMeta::new_readonly(*token_program_id, false),  // ✅ از victim tx
         AccountMeta::new(*creator_vault, false),
         AccountMeta::new_readonly(event_authority, false),
         AccountMeta::new_readonly(program_id, false),
@@ -118,25 +105,12 @@ pub fn create_sell_instruction(
     user_token_account: &Pubkey,
     token_amount: u64,
     min_sol_output: u64,
-    token_program_type: TokenProgramType,  // ✅ NEW: پارامتر جدید
+    token_program_type: TokenProgramType,
+    fee_recipient: &Pubkey,  // ✅ NEW: از victim tx استخراج شده
+    bonding_curve_token_account: &Pubkey,  // ✅ NEW: از victim tx استخراج شده
+    token_program_id: &Pubkey,  // ✅ NEW: از victim tx استخراج شده
 ) -> Result<Instruction> {
-    // ✅ انتخاب تابع مناسب بر اساس Token Program type
-    let bonding_curve_token_account = match token_program_type {
-        TokenProgramType::Token2022Program => {
-            get_associated_token_address_2022(bonding_curve, mint)
-        }
-        TokenProgramType::TokenProgram => {
-            get_associated_token_address(bonding_curve, mint)
-        }
-    };
-
-    let token_program_id = match token_program_type {
-        TokenProgramType::Token2022Program => TOKEN_2022_PROGRAM_ID,
-        TokenProgramType::TokenProgram => TOKEN_PROGRAM_ID,
-    };
-
     let global_config = Pubkey::from_str(GLOBAL_CONFIG)?;
-    let fee_recipient = Pubkey::from_str(FEE_RECIPIENT)?;
     let event_authority = Pubkey::from_str(EVENT_AUTHORITY)?;
     let program_id = Pubkey::from_str(PUMP_FUN_PROGRAM)?;
     let fee_config = Pubkey::from_str(FEE_CONFIG)?;
@@ -144,15 +118,15 @@ pub fn create_sell_instruction(
 
     let accounts = vec![
         AccountMeta::new_readonly(global_config, false),
-        AccountMeta::new(fee_recipient, false),
+        AccountMeta::new(*fee_recipient, false),  // ✅ از victim tx
         AccountMeta::new_readonly(*mint, false),
         AccountMeta::new(*bonding_curve, false),
-        AccountMeta::new(bonding_curve_token_account, false),
+        AccountMeta::new(*bonding_curve_token_account, false),  // ✅ از victim tx
         AccountMeta::new(*user_token_account, false),
         AccountMeta::new(*seller, true),
         AccountMeta::new_readonly(system_program::ID, false),
         AccountMeta::new(*creator_vault, false),
-        AccountMeta::new_readonly(token_program_id, false),  // ✅ Dynamic Token Program!
+        AccountMeta::new_readonly(*token_program_id, false),  // ✅ از victim tx
         AccountMeta::new_readonly(event_authority, false),
         AccountMeta::new_readonly(program_id, false),
         AccountMeta::new_readonly(fee_config, false),

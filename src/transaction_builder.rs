@@ -52,7 +52,10 @@ impl TransactionBuilder {
         max_sol_cost: u64,
         priority_fee_microlamports: u64,
         recent_blockhash: Hash,
-        token_program_type: TokenProgramType,  // ✅ NEW: پارامتر جدید
+        token_program_type: TokenProgramType,
+        fee_recipient: &Pubkey,  // ✅ NEW: از victim tx
+        bonding_curve_token_account: &Pubkey,  // ✅ NEW: از victim tx
+        token_program_id: &Pubkey,  // ✅ NEW: از victim tx
     ) -> Result<Transaction> {
         // ✅ انتخاب تابع مناسب بر اساس نوع Token Program
         let user_token_account = match token_program_type {
@@ -123,7 +126,10 @@ impl TransactionBuilder {
                 &user_token_account,
                 token_amount,
                 max_sol_cost,
-                token_program_type,  // ✅ NEW: پاس دادن Token Program type
+                token_program_type,
+                fee_recipient,  // ✅ NEW: از victim tx
+                bonding_curve_token_account,  // ✅ NEW: از victim tx
+                token_program_id,  // ✅ NEW: از victim tx
             )?
         );
         debug!("   ✅ Added buy instruction");
@@ -156,7 +162,10 @@ impl TransactionBuilder {
         jito_tip_lamports: u64,
         jito_tip_account: &Pubkey,
         recent_blockhash: Hash,
-        token_program_type: TokenProgramType,  // ✅ NEW: پارامتر جدید
+        token_program_type: TokenProgramType,
+        fee_recipient: &Pubkey,  // ✅ NEW: از victim tx
+        bonding_curve_token_account: &Pubkey,  // ✅ NEW: از victim tx
+        token_program_id: &Pubkey,  // ✅ NEW: از victim tx
     ) -> Result<Transaction> {
         // ✅ انتخاب تابع مناسب بر اساس نوع Token Program
         let user_token_account = match token_program_type {
@@ -208,7 +217,10 @@ impl TransactionBuilder {
                 &user_token_account,
                 token_amount,
                 min_sol_output,
-                token_program_type,  // ✅ NEW: پاس دادن Token Program type
+                token_program_type,
+                fee_recipient,  // ✅ NEW: از victim tx
+                bonding_curve_token_account,  // ✅ NEW: از victim tx
+                token_program_id,  // ✅ NEW: از victim tx
             )?
         );
         debug!("   ✅ Added sell instruction");
