@@ -5,7 +5,13 @@ use solana_sdk::{
     system_program,
 };
 use std::str::FromStr;
-use crate::spl_utils::{get_associated_token_address_2022, TOKEN_2022_PROGRAM_ID};
+use crate::spl_utils::{
+    get_associated_token_address,
+    get_associated_token_address_2022,
+    TOKEN_PROGRAM_ID,
+    TOKEN_2022_PROGRAM_ID,
+};
+use crate::jito_client::TokenProgramType;
 
 pub const PUMP_FUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 pub const GLOBAL_CONFIG: &str = "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf";
@@ -46,9 +52,23 @@ pub fn create_buy_instruction(
     user_token_account: &Pubkey,
     token_amount: u64,
     max_sol_cost: u64,
+    token_program_type: TokenProgramType,  // ✅ NEW: پارامتر جدید
 ) -> Result<Instruction> {
-    // ✅ استفاده از Token-2022 برای bonding curve token account
-    let bonding_curve_token_account = get_associated_token_address_2022(bonding_curve, mint);
+    // ✅ انتخاب تابع مناسب بر اساس Token Program type
+    let bonding_curve_token_account = match token_program_type {
+        TokenProgramType::Token2022Program => {
+            get_associated_token_address_2022(bonding_curve, mint)
+        }
+        TokenProgramType::TokenProgram => {
+            get_associated_token_address(bonding_curve, mint)
+        }
+    };
+
+    let token_program_id = match token_program_type {
+        TokenProgramType::Token2022Program => TOKEN_2022_PROGRAM_ID,
+        TokenProgramType::TokenProgram => TOKEN_PROGRAM_ID,
+    };
+
     let user_volume_accumulator = derive_user_volume_accumulator(buyer);
 
     let global_config = Pubkey::from_str(GLOBAL_CONFIG)?;
@@ -68,7 +88,7 @@ pub fn create_buy_instruction(
         AccountMeta::new(*user_token_account, false),
         AccountMeta::new(*buyer, true),
         AccountMeta::new_readonly(system_program::ID, false),
-        AccountMeta::new_readonly(TOKEN_2022_PROGRAM_ID, false),  // ✅ TOKEN-2022!
+        AccountMeta::new_readonly(token_program_id, false),  // ✅ Dynamic Token Program!
         AccountMeta::new(*creator_vault, false),
         AccountMeta::new_readonly(event_authority, false),
         AccountMeta::new_readonly(program_id, false),
@@ -98,9 +118,22 @@ pub fn create_sell_instruction(
     user_token_account: &Pubkey,
     token_amount: u64,
     min_sol_output: u64,
+    token_program_type: TokenProgramType,  // ✅ NEW: پارامتر جدید
 ) -> Result<Instruction> {
-    // ✅ استفاده از Token-2022 برای bonding curve token account
-    let bonding_curve_token_account = get_associated_token_address_2022(bonding_curve, mint);
+    // ✅ انتخاب تابع مناسب بر اساس Token Program type
+    let bonding_curve_token_account = match token_program_type {
+        TokenProgramType::Token2022Program => {
+            get_associated_token_address_2022(bonding_curve, mint)
+        }
+        TokenProgramType::TokenProgram => {
+            get_associated_token_address(bonding_curve, mint)
+        }
+    };
+
+    let token_program_id = match token_program_type {
+        TokenProgramType::Token2022Program => TOKEN_2022_PROGRAM_ID,
+        TokenProgramType::TokenProgram => TOKEN_PROGRAM_ID,
+    };
 
     let global_config = Pubkey::from_str(GLOBAL_CONFIG)?;
     let fee_recipient = Pubkey::from_str(FEE_RECIPIENT)?;
@@ -119,7 +152,7 @@ pub fn create_sell_instruction(
         AccountMeta::new(*seller, true),
         AccountMeta::new_readonly(system_program::ID, false),
         AccountMeta::new(*creator_vault, false),
-        AccountMeta::new_readonly(TOKEN_2022_PROGRAM_ID, false),  // ✅ TOKEN-2022!
+        AccountMeta::new_readonly(token_program_id, false),  // ✅ Dynamic Token Program!
         AccountMeta::new_readonly(event_authority, false),
         AccountMeta::new_readonly(program_id, false),
         AccountMeta::new_readonly(fee_config, false),

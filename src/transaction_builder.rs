@@ -123,6 +123,7 @@ impl TransactionBuilder {
                 &user_token_account,
                 token_amount,
                 max_sol_cost,
+                token_program_type,  // ✅ NEW: پاس دادن Token Program type
             )?
         );
         debug!("   ✅ Added buy instruction");
@@ -207,6 +208,7 @@ impl TransactionBuilder {
                 &user_token_account,
                 token_amount,
                 min_sol_output,
+                token_program_type,  // ✅ NEW: پاس دادن Token Program type
             )?
         );
         debug!("   ✅ Added sell instruction");
