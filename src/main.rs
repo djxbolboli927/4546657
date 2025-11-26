@@ -996,6 +996,11 @@ fn extract_transaction_info(
                             .and_then(|&idx| account_keys.get(idx as usize))
                             .map(|pk| pk.to_string());
 
+                        // ✅ Account #4 = Bonding Curve - CRITICAL: استخراج از victim tx به جای محاسبه!
+                        let bonding_curve = instruction.accounts.get(3)
+                            .and_then(|&idx| account_keys.get(idx as usize))
+                            .map(|pk| pk.to_string());
+
                         // Account #5 = Associated Bonding Curve Token Account
                         let bonding_curve_token_account = instruction.accounts.get(4)
                             .and_then(|&idx| account_keys.get(idx as usize))
@@ -1013,14 +1018,12 @@ fn extract_transaction_info(
 
                         let priority_fee = get_priority_fee(&tx);
 
-                        if let (Some(buyer), Some(mint)) = (buyer_pubkey, mint_pubkey) {
-                            let bonding_curve_pk = derive_bonding_curve(mint);
-                            let bonding_curve = bonding_curve_pk.to_string();
+                        if let (Some(buyer), Some(mint), Some(bonding_curve)) = (buyer_pubkey, mint_pubkey, &bonding_curve) {
 
                             return Some(TransactionInfo {
                                 buyer: buyer.to_string(),
                                 mint: mint.to_string(),
-                                bonding_curve,
+                                bonding_curve: bonding_curve.clone(),
                                 max_sol: args.max_sol_cost,
                                 token_amount: args.token_amount,
                                 priority_fee,

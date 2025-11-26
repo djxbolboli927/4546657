@@ -32,9 +32,9 @@ These accounts are VARIABLE and must be extracted from the victim transaction:
 - **Location:** `src/main.rs:990-991` in `extract_transaction_info()`
 
 #### #4: Bonding Curve
-- **Derivation:** Calculated from mint using PDA seeds `["bonding-curve", mint]`
-- **Location:** `src/pumpfun_instructions.rs:41-45` in `derive_bonding_curve()`
-- **Note:** Although calculated, seeds come from victim's mint
+- **Extraction:** `instruction.accounts[3]` from victim tx
+- **Location:** `src/main.rs:1000-1002` in `extract_transaction_info()`
+- **Critical:** MUST be extracted, NOT calculated! Using `derive_bonding_curve()` causes Error 2006
 
 #### #5: Associated Bonding Curve Token Account
 - **Extraction:** `instruction.accounts[4]` from victim tx
@@ -102,7 +102,7 @@ Your bot's own addresses:
 TransactionInfo {
     buyer: String,                                    // Account #6 from victim
     mint: String,                                     // Account #3 from victim
-    bonding_curve: String,                            // Calculated from mint
+    bonding_curve: String,                            // Account #4 from victim - EXTRACTED!
     max_sol: u64,                                     // From instruction data
     token_amount: u64,                                // From instruction data
     priority_fee: u64,                                // Extracted from ComputeBudget instruction
@@ -423,12 +423,12 @@ RPC Simulation: ENABLED (with replaceRecentBlockhash)
 **What is Extracted from Victim Transaction:**
 - Fee Recipient (#2) - ⚠️ ROTATES!
 - Mint (#3)
+- Bonding Curve (#4) - ⚠️ MUST EXTRACT, NOT CALCULATE!
 - Associated Bonding Curve Token Account (#5)
 - Token Program ID (#9)
 - Creator Vault (#10)
 
 **What is Calculated:**
-- Bonding Curve PDA (from mint)
 - User Volume Accumulator PDA (from bot wallet)
 - Associated User Token Account (from bot wallet + mint + token program type)
 
