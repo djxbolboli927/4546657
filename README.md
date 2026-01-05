@@ -17,10 +17,10 @@
    - لاگ کامل از خطاها و موفقیت‌ها
 
 3. **Rate Limiting (محدودیت نرخ)**
-   - محدودیت ۱ درخواست در هر ۳ ثانیه
-   - استفاده از `tokio::sync::Semaphore`
-   - Retry logic با exponential backoff (5s, 10s, 15s)
-   - جلوگیری از محدودیت‌های شبکه Jito
+   - محدودیت ۱ درخواست در ثانیه (دقیقاً 1 req/sec)
+   - استفاده از `tokio::sync::Semaphore` با `try_acquire()` (non-blocking)
+   - **هیچ انتظاری نمی‌کشد**: اگر rate limit فعال باشد، تراکنش skip می‌شود
+   - اطمینان از ارسال فوری تراکنش‌های سودده
 
 4. **فیلتر سودآوری**
    - فقط تراکنش‌های سودده به Jito ارسال می‌شوند
@@ -61,8 +61,8 @@
    - Back-run: فروش + close account + Jito tip
 
 4. **ارسال برای شبیه‌سازی**
-   - محدودیت ۱ req/3sec (برای جلوگیری از rate limit Jito)
-   - Retry با exponential backoff در صورت rate limit
+   - محدودیت ۱ req/sec (non-blocking)
+   - اگر rate limit فعال باشد، تراکنش skip می‌شود (بدون انتظار)
    - فقط profitable bundles
    - دریافت نتایج کامل
 
@@ -119,9 +119,9 @@ RUST_LOG=info cargo run --release
 ## ⚠️ نکات مهم
 
 1. **فقط شبیه‌سازی**: این کد فقط باندل‌ها را شبیه‌سازی می‌کند، اجرا نمی‌کند
-2. **Rate Limit**: حتماً ۱ req/3sec رعایت می‌شود + retry logic
+2. **Rate Limit**: دقیقاً ۱ req/sec - بدون انتظار (non-blocking)
 3. **Profitable Only**: فقط تراکنش‌های سودده ارسال می‌شوند
-4. **Wallet Safety**: کد تراکنش امضا می‌کند اما ارسال نمی‌کند
+4. **No Queueing**: تراکنش‌ها در صف انتظار قرار نمی‌گیرند - یا فوراً ارسال یا skip
 
 ## 🐛 رفع خطاهای رایج
 
@@ -129,17 +129,27 @@ RUST_LOG=info cargo run --release
 ```
 invalid value: continue signal on byte-three
 ```
-**راه‌حل**: ✅ اصلاح شد - از `VersionedTransaction` استفاده می‌شود
 
-### خطای Rate Limit
-```
-Network congested. Endpoint is globally rate limited.
-```
-**راه‌حل**: ✅ اصلاح شد - rate limit افزایش یافت به 3 ثانیه + retry logic
+**دلیل**:
+- ما `VersionedTransaction` را serialize می‌کردیم
+- اما سعی داشتیم به `Transaction` (legacy) deserialize کنیم
+- فرمت‌های متفاوت باعث خطا می‌شدند
+- **نتیجه**: victim transaction به bundle اضافه نمی‌شد
 
-### اگر هنوز rate limit می‌خورید
-- Rate limit را در `main.rs` خط ~686 افزایش دهید (مثلاً 5 ثانیه)
-- یا `max_retries` را کاهش دهید
+**راه‌حل**: ✅ اصلاح شد
+```rust
+// قبل (اشتباه)
+bincode::deserialize::<Transaction>(&raw_tx)
+
+// بعد (درست)
+let versioned = bincode::deserialize::<VersionedTransaction>(&raw_tx)?;
+let legacy = versioned.into_legacy_transaction()?;
+```
+
+### نحوه عملکرد Rate Limiting
+- از `try_acquire()` استفاده می‌کند (non-blocking)
+- اگر semaphore available نباشد → تراکنش skip می‌شود
+- **هیچ انتظاری نمی‌کشد** - برای جلوگیری از missed opportunities
 
 ## 🔄 مراحل بعدی (اختیاری)
 

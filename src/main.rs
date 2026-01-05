@@ -620,70 +620,56 @@ async fn unified_worker_thread(
         };
 
         // ═══════════════════════════════════════════════════════════
-        // 🔬 SEND BUNDLE TO JITO FOR SIMULATION (Rate Limited)
+        // 🔬 SEND BUNDLE TO JITO FOR SIMULATION (No Waiting!)
         // ═══════════════════════════════════════════════════════════
 
         if ENABLE_BUNDLE_SIMULATION {
-            // Acquire rate limit permit (1 req/sec)
-            let _permit = rate_limiter.acquire().await.unwrap();
+            // Try to acquire rate limit permit (non-blocking)
+            // If not available, skip this transaction entirely
+            match rate_limiter.try_acquire() {
+                Ok(_permit) => {
+                    let bundle = vec![front_tx, victim_tx, back_tx];
 
-            let bundle = vec![front_tx, victim_tx, back_tx];
+                    info!("   📦 Sending bundle to Jito for simulation...");
 
-            info!("   📦 Sending bundle to Jito for simulation...");
+                    match jito_client.simulate_bundle(bundle).await {
+                        Ok(sim_result) => {
+                            info!("   ✅ BUNDLE SIMULATION SUCCESS!");
+                            info!("      📊 Summary: {:?}", sim_result.summary);
 
-            // Retry logic with exponential backoff for rate limiting
-            let mut retry_count = 0;
-            let max_retries = 3;
-            let mut success = false;
-
-            while retry_count <= max_retries && !success {
-                match jito_client.simulate_bundle(bundle.clone()).await {
-                    Ok(sim_result) => {
-                        info!("   ✅ BUNDLE SIMULATION SUCCESS!");
-                        info!("      📊 Summary: {:?}", sim_result.summary);
-
-                        for (idx, tx_result) in sim_result.transaction_results.iter().enumerate() {
-                            if let Some(err) = &tx_result.err {
-                                error!("      ❌ TX {} FAILED: {:?}", idx, err);
-                                if let Some(logs) = &tx_result.logs {
-                                    for log in logs.iter().take(3) {
-                                        info!("         {}", log);
+                            for (idx, tx_result) in sim_result.transaction_results.iter().enumerate() {
+                                if let Some(err) = &tx_result.err {
+                                    error!("      ❌ TX {} FAILED: {:?}", idx, err);
+                                    if let Some(logs) = &tx_result.logs {
+                                        for log in logs.iter().take(3) {
+                                            info!("         {}", log);
+                                        }
+                                    }
+                                } else {
+                                    info!("      ✅ TX {} SUCCESS", idx);
+                                    if let Some(units) = tx_result.units_consumed {
+                                        info!("         ⛽ Units: {}", units);
                                     }
                                 }
-                            } else {
-                                info!("      ✅ TX {} SUCCESS", idx);
-                                if let Some(units) = tx_result.units_consumed {
-                                    info!("         ⛽ Units: {}", units);
-                                }
                             }
-                        }
 
-                        stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
-                        success = true;
-                    }
-                    Err(e) => {
-                        let error_msg = format!("{}", e);
-                        if error_msg.contains("rate limited") || error_msg.contains("congested") {
-                            retry_count += 1;
-                            if retry_count <= max_retries {
-                                let backoff_secs = 5 * retry_count; // 5s, 10s, 15s
-                                warn!("   ⚠️  Rate limited! Retry {}/{} after {}s...", retry_count, max_retries, backoff_secs);
-                                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                            } else {
-                                error!("   ❌ Bundle Simulation Failed after {} retries: {}", max_retries, e);
-                                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
-                            }
-                        } else {
+                            stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
                             error!("   ❌ Bundle Simulation Failed: {}", e);
                             stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
-                            break;
                         }
                     }
+
+                    // Rate limit: sleep for 1 second after successful send
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(_) => {
+                    // Rate limit not available - skip this transaction
+                    debug!("   ⏭️  Skipped: Rate limit active, not waiting");
+                    continue;
                 }
             }
-
-            // Rate limit: sleep for 3 seconds (Jito is strict!)
-            tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
     info!("Worker {} stopped", worker_id);
