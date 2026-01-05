@@ -173,7 +173,6 @@ struct GlobalStats {
     skipped_low_sol: AtomicUsize,
     skipped_same_block: AtomicUsize,
     skipped_no_creator: AtomicUsize,
-    skipped_target_confirmed: AtomicUsize,
     skipped_simulation_failed: AtomicUsize,
     skipped_unprofitable: AtomicUsize,
 }
@@ -194,7 +193,6 @@ impl GlobalStats {
             skipped_low_sol: AtomicUsize::new(0),
             skipped_same_block: AtomicUsize::new(0),
             skipped_no_creator: AtomicUsize::new(0),
-            skipped_target_confirmed: AtomicUsize::new(0),
             skipped_simulation_failed: AtomicUsize::new(0),
             skipped_unprofitable: AtomicUsize::new(0),
         }
@@ -338,13 +336,11 @@ fn print_statistics(stats: &GlobalStats) {
     let skipped_low_sol = stats.skipped_low_sol.load(Ordering::Relaxed);
     let skipped_same_block = stats.skipped_same_block.load(Ordering::Relaxed);
     let skipped_no_creator = stats.skipped_no_creator.load(Ordering::Relaxed);
-    let skipped_target_confirmed = stats.skipped_target_confirmed.load(Ordering::Relaxed);
     let skipped_simulation_failed = stats.skipped_simulation_failed.load(Ordering::Relaxed);
     let skipped_unprofitable = stats.skipped_unprofitable.load(Ordering::Relaxed);
 
     let total_skipped = skipped_no_pool + skipped_low_sol + skipped_same_block
-        + skipped_no_creator + skipped_target_confirmed + skipped_simulation_failed
-        + skipped_unprofitable;
+        + skipped_no_creator + skipped_simulation_failed + skipped_unprofitable;
 
     let shreds = stats.shreds_received.load(Ordering::Relaxed);
     let geyser = stats.geyser_updates.load(Ordering::Relaxed);
@@ -360,35 +356,19 @@ fn print_statistics(stats: &GlobalStats) {
     info!("═══════════════════════════════════════════════════════════");
     info!("📊 STATISTICS REPORT (Runtime: {} min {} sec)", elapsed_mins, elapsed % 60);
     info!("═══════════════════════════════════════════════════════════");
-    info!("");
     info!("🔍 DATA SOURCES:");
     info!("   ShredStream Messages: {}", shreds);
     info!("   Geyser Updates: {}", geyser);
-    info!("");
     info!("📈 TRANSACTION PROCESSING:");
     info!("   Total Processed: {} ({} tx/min)", total_tx, tx_per_min);
-    info!("   ✅ Profitable: {} ({:.1}%)", profitable, if total_tx > 0 { profitable as f64 / total_tx as f64 * 100.0 } else { 0.0 });
-    info!("   ❌ Unprofitable: {} ({:.1}%)", unprofitable, if total_tx > 0 { unprofitable as f64 / total_tx as f64 * 100.0 } else { 0.0 });
-    info!("   ⏭️  Total Skipped: {} ({:.1}%)", total_skipped, if total_tx > 0 { total_skipped as f64 / total_tx as f64 * 100.0 } else { 0.0 });
-    info!("");
+    info!("   ✅ Profitable (Local Calc): {}", profitable);
+    info!("   ⏭️  Skipped: {}", total_skipped);
     info!("📦 JITO BUNDLE SIMULATION:");
-    info!("   ✅ Successful Simulations: {}", bundles_sent);
-    info!("   ❌ Failed Simulations: {}", bundles_failed);
-    info!("   📊 Success Rate: {:.1}%", success_rate);
-    info!("");
-    info!("⏭️  SKIP BREAKDOWN:");
-    info!("   No Pool Data: {}", skipped_no_pool);
-    info!("   Max SOL Exceeded: {}", skipped_low_sol);
-    info!("   Same Block Activity: {}", skipped_same_block);
-    info!("   No Creator Vault: {}", skipped_no_creator);
-    info!("   Target Already Confirmed: {}", skipped_target_confirmed);
-    info!("   Local Simulation Failed: {}", skipped_simulation_failed);
-    info!("   Unprofitable (after calc): {}", skipped_unprofitable);
-    info!("");
-    info!("💰 ESTIMATED PROFIT:");
-    info!("   Total Profit: {:.6} SOL ({} lamports)", profit_sol, total_profit);
+    info!("   ✅ Sent to Simulation: {}", bundles_sent);
+    info!("   ❌ Simulation Errors: {}", bundles_failed);
+    info!("   📊 Request Success Rate: {:.1}%", success_rate);
+    info!("💰 POTENTIAL PROFIT (If Executed): {:.6} SOL", profit_sol);
     info!("═══════════════════════════════════════════════════════════");
-    info!("");
 }
 
 fn calculate_token_out_with_fee(sol_in: u64, sol_reserve: u64, token_reserve: u64) -> u64 {
@@ -522,7 +502,7 @@ async fn unified_worker_thread(
     tx_builder: Arc<TransactionBuilder>,
     recent_activity: RecentActivity,
 ) {
-    info!("Worker {} started 🚀 (📦 NO RATE LIMIT - Full Speed!)", worker_id);
+    info!("Worker {} started 🚀", worker_id);
 
     for tx_info in rx.iter() {
         stats.total_tx_processed.fetch_add(1, Ordering::Relaxed);
@@ -548,16 +528,10 @@ async fn unified_worker_thread(
             continue;
         }
 
-        // 4. Check Target Status
-        match jito_client.check_target_transaction_status(&tx_info.signature).await {
-            Ok(TargetTxStatus::AlreadyConfirmed) => {
-                stats.skipped_target_confirmed.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            _ => {}
-        }
+        // ⚠️ REMOVED: check_target_transaction_status (Too slow, relies on RPC)
+        // We assume fresh data from ShredStream. If target is gone, Jito will fail atomically.
 
-        // 5. Local Simulation
+        // 4. Local Simulation
         let simulation = simulate_sandwich_attack(&tx_info, &pool_state);
 
         if simulation.front_run_sol == 0 || simulation.front_run_tokens == 0 {
@@ -565,15 +539,14 @@ async fn unified_worker_thread(
             continue;
         }
 
-        // 6. Check Profitability
+        // 5. Check Profitability
         if !simulation.is_profitable {
             stats.skipped_unprofitable.fetch_add(1, Ordering::Relaxed);
             stats.unprofitable_count.fetch_add(1, Ordering::Relaxed);
             continue;
         }
 
-        // ✅ تراکنش سودده است - لاگ کنیم
-        print_simulation_result(&simulation, worker_id, true);
+        // ✅ تراکنش سودده است
         stats.profitable_count.fetch_add(1, Ordering::Relaxed);
 
         // ═══════════════════════════════════════════════════════════
@@ -585,11 +558,11 @@ async fn unified_worker_thread(
             Err(_) => continue,
         };
 
+        // Get Latest Blockhash (Must be fast!)
         let blockhash = match tx_builder.get_recent_blockhash().await {
             Ok(bh) => bh,
-            Err(e) => {
-                error!("   ❌ Blockhash fetch failed: {}", e);
-                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+            Err(_) => {
+                // Silent error - blockhash fetch failures are common
                 continue;
             }
         };
@@ -688,39 +661,43 @@ async fn unified_worker_thread(
         };
 
         // ═══════════════════════════════════════════════════════════
-        // 🔬 SEND BUNDLE TO JITO FOR SIMULATION (No Rate Limit!)
+        // 🔬 SEND BUNDLE TO JITO FOR SIMULATION (SANITY CHECK)
         // ═══════════════════════════════════════════════════════════
 
         if ENABLE_BUNDLE_SIMULATION {
             let bundle = vec![front_tx, victim_tx, back_tx];
 
-            info!("   📦 Sending bundle to Jito for simulation...");
+            info!("🧪 Testing Bundle Logic via Jito Simulation...");
 
             match jito_client.simulate_bundle(bundle).await {
                 Ok(sim_result) => {
-                    info!("   ✅ BUNDLE SIMULATION SUCCESS!");
-                    info!("      📊 Summary: {:?}", sim_result.summary);
+                    let mut all_passed = true;
 
-                    for (idx, tx_result) in sim_result.transaction_results.iter().enumerate() {
-                        if let Some(err) = &tx_result.err {
-                            error!("      ❌ TX {} FAILED: {:?}", idx, err);
-                            if let Some(logs) = &tx_result.logs {
-                                for log in logs.iter().take(3) {
-                                    info!("         {}", log);
+                    // بررسی تک تک تراکنش‌ها
+                    for (i, tx_res) in sim_result.transaction_results.iter().enumerate() {
+                        if let Some(err) = &tx_res.err {
+                            all_passed = false;
+                            error!("❌ TX #{} Failed!", i);
+                            error!("   Error: {:?}", err);
+
+                            if let Some(logs) = &tx_res.logs {
+                                for log in logs {
+                                    error!("      log: {}", log);
                                 }
-                            }
-                        } else {
-                            info!("      ✅ TX {} SUCCESS", idx);
-                            if let Some(units) = tx_result.units_consumed {
-                                info!("         ⛽ Units: {}", units);
                             }
                         }
                     }
 
-                    stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
+                    if all_passed {
+                        info!("🎉 BUNDLE LOGIC IS PERFECT! (Ready for Mainnet execution)");
+                        stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        error!("⚠️ Bundle Logic has errors. Do not enable real sending yet.");
+                        stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 Err(e) => {
-                    error!("   ❌ Bundle Simulation Failed: {}", e);
+                    error!("❌ Simulation Request Failed (Network/Format Error): {}", e);
                     stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -920,7 +897,7 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     info!("═══════════════════════════════════════════════════════════");
-    info!("📦 BUNDLE SIMULATION MODE: Jito Bundle Simulation (1 req/sec) 📦");
+    info!("📦 BUNDLE SIMULATION MODE: Jito Atomic Check 📦");
     info!("═══════════════════════════════════════════════════════════");
 
     let wallet_manager = Arc::new(WalletManager::new(

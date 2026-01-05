@@ -130,8 +130,9 @@ impl JitoClient {
         JITO_TIP_ACCOUNTS[index]
     }
 
-    /// ✅ شبیه‌سازی باندل با استفاده از ERPC RPC endpoint
+    /// ✅ شبیه‌سازی باندل با ارسال به Jito Block Engine (نه RPC معمولی)
     pub async fn simulate_bundle(&self, transactions: Vec<Transaction>) -> Result<SimulateBundleValue> {
+        // 1. سریالایز کردن تراکنش‌ها به Base58
         let encoded_txs: Vec<String> = transactions
             .iter()
             .map(|tx| {
@@ -141,14 +142,12 @@ impl JitoClient {
             })
             .collect();
 
-        // Helius/QuickNode compatible format
+        // 2. فرمت صحیح Jito (طبق مستندات رسمی)
         let params_vec = vec![
-            serde_json::json!(encoded_txs),
             serde_json::json!({
-                "encoding": "base58",
-                "commitment": "processed",
-                "replaceRecentBlockhash": true,
-                "skipSigVerify": true
+                "encodedTransactions": encoded_txs,
+                "bundleUuid": null,
+                "decoding": "base58"
             })
         ];
 
@@ -159,31 +158,34 @@ impl JitoClient {
             "params": params_vec
         });
 
-        // ✅ استفاده از ERPC endpoint (نه Jito Block Engine)
-        let simulation_url = &self.rpc_endpoint;
+        // 3. ✅ ارسال به Jito Block Engine (Frankfurt)
+        let simulation_url = format!("{}/api/v1/bundles", self.endpoints[0]);
 
         let response = self.http_client
-            .post(simulation_url)
+            .post(&simulation_url)
             .json(&request)
-            .timeout(std::time::Duration::from_secs(15))
+            .header("Content-Type", "application/json")
+            .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
             .map_err(|e| anyhow!("Bundle simulation network error: {}", e))?;
 
-        if !response.status().is_success() {
+        // 4. ذخیره status قبل از text() (رفع خطای ownership)
+        let status = response.status();
+        if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("Jito HTTP error: {}", error_text));
+            return Err(anyhow!("Jito HTTP error ({}): {}", status, error_text));
         }
 
         let response_text = response.text().await.unwrap_or_default();
 
-        // تلاش برای پارس کردن با لاگ کردن محتوا در صورت خطا
+        // 5. پارس کردن پاسخ
         let sim_response: SimulateBundleResponse = match serde_json::from_str(&response_text) {
             Ok(v) => v,
             Err(e) => {
                 error!("❌ Failed to parse Jito response!");
-                error!("   Raw Response: {}", response_text); // این خط به ما می‌گوید سرور دقیقاً چه گفته
-                return Err(anyhow!("Parse error: {}", e));
+                debug!("   Raw Response: {}", response_text);
+                return Err(anyhow!("Parse error: {} | Response: {}", e, response_text));
             }
         };
 
