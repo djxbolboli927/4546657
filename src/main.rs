@@ -87,6 +87,11 @@ const MAX_ACTIVITY_AGE_SECS: u64 = 600;
 
 const ENABLE_BUNDLE_SIMULATION: bool = true;
 
+// ✅ Leader Slot Configuration: فقط به لیدرهای اروپایی ارسال کن
+const ENABLE_LEADER_FILTERING: bool = true;
+const TARGET_REGION: &str = "europe"; // Regions: europe, amsterdam, frankfurt, etc.
+const LEADER_CHECK_LOOKAHEAD: usize = 10; // چند slot جلوتر را بررسی کنیم
+
 // ═══════════════════════════════════════════════════════════════
 // DATA STRUCTURES
 // ═══════════════════════════════════════════════════════════════
@@ -175,6 +180,7 @@ struct GlobalStats {
     skipped_no_creator: AtomicUsize,
     skipped_simulation_failed: AtomicUsize,
     skipped_unprofitable: AtomicUsize,
+    skipped_non_europe_leader: AtomicUsize, // ✅ تعداد تراکنش‌هایی که به دلیل leader غیراروپایی رد شدند
 }
 
 impl GlobalStats {
@@ -195,6 +201,7 @@ impl GlobalStats {
             skipped_no_creator: AtomicUsize::new(0),
             skipped_simulation_failed: AtomicUsize::new(0),
             skipped_unprofitable: AtomicUsize::new(0),
+            skipped_non_europe_leader: AtomicUsize::new(0),
         }
     }
 }
@@ -215,6 +222,7 @@ impl WorkerPool {
         wallet_manager: Arc<WalletManager>,
         tx_builder: Arc<TransactionBuilder>,
         recent_activity: RecentActivity,
+        leader_slot_client: Arc<LeaderSlotClient>, // ✅ اضافه شد
     ) -> Self {
         let mut workers = Vec::new();
 
@@ -228,6 +236,7 @@ impl WorkerPool {
             let wallet_clone = wallet_manager.clone();
             let builder_clone = tx_builder.clone();
             let activity_clone = recent_activity.clone();
+            let leader_clone = leader_slot_client.clone(); // ✅ اضافه شد
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
@@ -241,6 +250,7 @@ impl WorkerPool {
                         wallet_clone,
                         builder_clone,
                         activity_clone,
+                        leader_clone, // ✅ اضافه شد
                     ).await;
                 });
             });
@@ -338,9 +348,10 @@ fn print_statistics(stats: &GlobalStats) {
     let skipped_no_creator = stats.skipped_no_creator.load(Ordering::Relaxed);
     let skipped_simulation_failed = stats.skipped_simulation_failed.load(Ordering::Relaxed);
     let skipped_unprofitable = stats.skipped_unprofitable.load(Ordering::Relaxed);
+    let skipped_non_europe_leader = stats.skipped_non_europe_leader.load(Ordering::Relaxed);
 
     let total_skipped = skipped_no_pool + skipped_low_sol + skipped_same_block
-        + skipped_no_creator + skipped_simulation_failed + skipped_unprofitable;
+        + skipped_no_creator + skipped_simulation_failed + skipped_unprofitable + skipped_non_europe_leader;
 
     let shreds = stats.shreds_received.load(Ordering::Relaxed);
     let geyser = stats.geyser_updates.load(Ordering::Relaxed);
@@ -362,7 +373,7 @@ fn print_statistics(stats: &GlobalStats) {
     info!("📈 TRANSACTION PROCESSING:");
     info!("   Total Processed: {} ({} tx/min)", total_tx, tx_per_min);
     info!("   ✅ Profitable (Local Calc): {}", profitable);
-    info!("   ⏭️  Skipped: {}", total_skipped);
+    info!("   ⏭️  Skipped: {} (Non-EU Leader: {})", total_skipped, skipped_non_europe_leader);
     info!("📦 JITO BUNDLE SIMULATION:");
     info!("   ✅ Sent to Simulation: {}", bundles_sent);
     info!("   ❌ Simulation Errors: {}", bundles_failed);
@@ -501,6 +512,7 @@ async fn unified_worker_thread(
     wallet_manager: Arc<WalletManager>,
     tx_builder: Arc<TransactionBuilder>,
     recent_activity: RecentActivity,
+    leader_slot_client: Arc<LeaderSlotClient>, // ✅ اضافه شد
 ) {
     info!("Worker {} started 🚀", worker_id);
 
@@ -690,6 +702,36 @@ async fn unified_worker_thread(
         // ═══════════════════════════════════════════════════════════
 
         if ENABLE_BUNDLE_SIMULATION {
+            // ✅ چک کنید: آیا leader بعدی در اروپا است؟
+            if ENABLE_LEADER_FILTERING {
+                match leader_slot_client.get_upcoming_leader_slots(LEADER_CHECK_LOOKAHEAD).await {
+                    Ok(upcoming_leaders) => {
+                        let mut found_europe_leader = false;
+
+                        for leader_slot in upcoming_leaders.iter() {
+                            if let Some(region) = &leader_slot.region {
+                                if region.to_lowercase().contains(TARGET_REGION) {
+                                    found_europe_leader = true;
+                                    debug!("🌍 European leader found at slot {}: {} ({})",
+                                           leader_slot.slot, leader_slot.leader, region);
+                                    break;
+                                }
+                            }
+                        }
+
+                        if !found_europe_leader {
+                            debug!("⏭️  Skipped: No European leader in next {} slots", LEADER_CHECK_LOOKAHEAD);
+                            stats.skipped_non_europe_leader.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        debug!("⚠️  Leader API error (continuing anyway): {}", e);
+                        // Continue even if leader API fails - don't block transactions
+                    }
+                }
+            }
+
             let bundle = vec![front_tx, victim_tx, back_tx];
 
             debug!("✅ Bundle built successfully for victim sig: ...{}", &tx_info.signature[tx_info.signature.len()-8..]);
@@ -920,7 +962,16 @@ async fn run_geyser_task(grpc_endpoint: String, x_token: Option<String>, request
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
-    env_logger::init();
+
+    // ✅ فیلتر لاگ: فقط لاگ‌های mev_bot را نمایش بده، h2/hyper را مخفی کن
+    env_logger::Builder::from_default_env()
+        .filter_module("h2", log::LevelFilter::Off)
+        .filter_module("hyper", log::LevelFilter::Off)
+        .filter_module("tonic", log::LevelFilter::Warn)
+        .filter_module("tower", log::LevelFilter::Warn)
+        .filter_module("reqwest", log::LevelFilter::Warn)
+        .filter_module("mev_bot_unified", log::LevelFilter::Debug)
+        .init();
 
     info!("═══════════════════════════════════════════════════════════");
     info!("📦 BUNDLE SIMULATION MODE: Jito Atomic Check 📦");
@@ -963,6 +1014,16 @@ async fn main() -> Result<()> {
     let tx_builder = Arc::new(TransactionBuilder::new(&rpc_endpoint));
     let recent_activity = Arc::new(DashMap::new());
 
+    // ✅ Leader Slot Client: برای شناسایی لیدرهای اروپایی
+    let erpc_endpoint = env::var("ERPC_ENDPOINT").context("ERPC_ENDPOINT missing")?;
+    let leader_slot_client = Arc::new(LeaderSlotClient::new(erpc_endpoint));
+
+    if ENABLE_LEADER_FILTERING {
+        info!("🌍 Leader Filtering ENABLED: Only {} leaders (lookahead: {} slots)", TARGET_REGION, LEADER_CHECK_LOOKAHEAD);
+    } else {
+        info!("🌍 Leader Filtering DISABLED: All leaders accepted");
+    }
+
     let worker_pool = Arc::new(WorkerPool::new(
         WORKER_COUNT,
         pool_tracker.clone(),
@@ -971,6 +1032,7 @@ async fn main() -> Result<()> {
         wallet_manager.clone(),
         tx_builder.clone(),
         recent_activity.clone(),
+        leader_slot_client.clone(), // ✅ اضافه شد
     ));
 
     let (shreds_tx, shreds_rx) = unbounded::<ShredsData>();
