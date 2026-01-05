@@ -89,8 +89,7 @@ const ENABLE_BUNDLE_SIMULATION: bool = true;
 
 // ✅ Leader Slot Configuration: فقط به لیدرهای اروپایی ارسال کن
 const ENABLE_LEADER_FILTERING: bool = true;
-const TARGET_REGION: &str = "europe"; // Regions: europe, amsterdam, frankfurt, etc.
-const LEADER_CHECK_LOOKAHEAD: usize = 10; // چند slot جلوتر را بررسی کنیم
+const ALLOWED_REGIONS: [&str; 4] = ["frankfurt", "germany", "amsterdam", "europe"]; // مناطق مجاز
 
 // ═══════════════════════════════════════════════════════════════
 // DATA STRUCTURES
@@ -704,31 +703,13 @@ async fn unified_worker_thread(
         if ENABLE_BUNDLE_SIMULATION {
             // ✅ چک کنید: آیا leader بعدی در اروپا است؟
             if ENABLE_LEADER_FILTERING {
-                match leader_slot_client.get_upcoming_leader_slots(LEADER_CHECK_LOOKAHEAD).await {
-                    Ok(upcoming_leaders) => {
-                        let mut found_europe_leader = false;
+                // باندل ما معمولا در slot + 2 تا 5 اجرا می‌شود
+                let target_slot = tx_info.slot + 2;
 
-                        for leader_slot in upcoming_leaders.iter() {
-                            if let Some(region) = &leader_slot.region {
-                                if region.to_lowercase().contains(TARGET_REGION) {
-                                    found_europe_leader = true;
-                                    debug!("🌍 European leader found at slot {}: {} ({})",
-                                           leader_slot.slot, leader_slot.leader, region);
-                                    break;
-                                }
-                            }
-                        }
-
-                        if !found_europe_leader {
-                            debug!("⏭️  Skipped: No European leader in next {} slots", LEADER_CHECK_LOOKAHEAD);
-                            stats.skipped_non_europe_leader.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        debug!("⚠️  Leader API error (continuing anyway): {}", e);
-                        // Continue even if leader API fails - don't block transactions
-                    }
+                if !leader_slot_client.is_leader_in_region(target_slot, &ALLOWED_REGIONS).await {
+                    debug!("⏭️  Skipped: No European leader in next slots from {}", target_slot);
+                    stats.skipped_non_europe_leader.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
             }
 
@@ -1019,7 +1000,7 @@ async fn main() -> Result<()> {
     let leader_slot_client = Arc::new(LeaderSlotClient::new(erpc_endpoint));
 
     if ENABLE_LEADER_FILTERING {
-        info!("🌍 Leader Filtering ENABLED: Only {} leaders (lookahead: {} slots)", TARGET_REGION, LEADER_CHECK_LOOKAHEAD);
+        info!("🌍 Leader Filtering ENABLED: Only {:?} leaders", ALLOWED_REGIONS);
     } else {
         info!("🌍 Leader Filtering DISABLED: All leaders accepted");
     }

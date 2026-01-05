@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use log::{info, debug, error};
 use std::time::Duration;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct LeaderSlot {
     pub slot: u64,
@@ -31,11 +31,11 @@ pub struct LeaderSlotClient {
 impl LeaderSlotClient {
     pub fn new(rpc_endpoint: String) -> Self {
         let http_client = Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(5)) // کاهش timeout برای سرعت بیشتر
             .build()
             .unwrap();
 
-        info!("📍 Leader Slot API Client initialized");
+        info!("📍 Leader Slot API Client initialized (ERPC specific)");
         info!("   Endpoint: {}", rpc_endpoint);
 
         Self {
@@ -44,13 +44,14 @@ impl LeaderSlotClient {
         }
     }
 
-    /// دریافت لیست leader slots آینده (برای شناسایی بهترین timing)
-    pub async fn get_upcoming_leader_slots(&self, limit: usize) -> Result<Vec<LeaderSlot>> {
+    /// ✅ اصلاح شده: دریافت لیدرهای آینده از یک اسلات مشخص
+    /// طبق داکیومنت ERPC، پارامتر ورودی start_slot است، نه limit.
+    pub async fn get_leader_slots_from(&self, start_slot: u64) -> Result<Vec<LeaderSlot>> {
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "getLeaderSlots",
-            "params": [limit]
+            "params": [start_slot] // ✅ پارامتر صحیح: اسلات شروع (مثلا 245000000)
         });
 
         let response = self.http_client
@@ -68,7 +69,7 @@ impl LeaderSlotClient {
         let response_text = response.text().await.unwrap_or_default();
 
         let leader_response: LeaderSlotsResponse = serde_json::from_str(&response_text)
-            .map_err(|e| anyhow!("Failed to parse leader slots response: {}", e))?;
+            .map_err(|e| anyhow!("Failed to parse leader slots response: {} | Response: {}", e, response_text))?;
 
         if let Some(err) = leader_response.error {
             return Err(anyhow!("Leader Slot API Error: {:?}", err));
@@ -77,43 +78,32 @@ impl LeaderSlotClient {
         leader_response.result.ok_or_else(|| anyhow!("Empty result from Leader Slot API"))
     }
 
-    /// بررسی کنید که آیا slot فعلی در منطقه ما leader دارد یا نه
-    pub async fn is_optimal_slot(&self, current_slot: u64, target_region: &str) -> Result<bool> {
-        let upcoming_slots = self.get_upcoming_leader_slots(20).await?;
-
-        for leader_slot in upcoming_slots.iter() {
-            if leader_slot.slot >= current_slot && leader_slot.slot <= current_slot + 5 {
-                if let Some(region) = &leader_slot.region {
-                    if region.to_lowercase().contains(&target_region.to_lowercase()) {
-                        debug!("✅ Optimal slot found! Slot {} has leader in {}", leader_slot.slot, region);
-                        return Ok(true);
+    /// ✅ بررسی اینکه آیا لیدر اسلات هدف در منطقه مناسب (اروپا) است؟
+    /// target_slot: اسلاتی که تراکنش قرار است در آن ماین شود (معمولا current + 2 تا 5)
+    pub async fn is_leader_in_region(&self, target_slot: u64, allowed_regions: &[&str]) -> bool {
+        // درخواست دیتای لیدرها از اسلات هدف
+        match self.get_leader_slots_from(target_slot).await {
+            Ok(slots) => {
+                // بررسی اولین چند اسلات (تا 10 تا بعدی)
+                for leader_info in slots.iter().take(10) {
+                    if leader_info.slot >= target_slot && leader_info.slot <= target_slot + 10 {
+                        if let Some(region) = &leader_info.region {
+                            let region_lower = region.to_lowercase();
+                            for allowed in allowed_regions {
+                                if region_lower.contains(&allowed.to_lowercase()) {
+                                    debug!("✅ Leader for slot {} is in {} (Allowed)", leader_info.slot, region);
+                                    return true;
+                                }
+                            }
+                        }
                     }
                 }
+                debug!("⚠️ No European leader found in next 10 slots from {}", target_slot);
+            }
+            Err(e) => {
+                error!("❌ Failed to fetch leader info: {}", e);
             }
         }
-
-        Ok(false)
-    }
-
-    /// دریافت بهترین slot بعدی با کمترین latency
-    pub async fn get_next_optimal_slot(&self, target_region: &str) -> Result<Option<LeaderSlot>> {
-        let upcoming_slots = self.get_upcoming_leader_slots(50).await?;
-
-        let mut best_slot: Option<LeaderSlot> = None;
-        let mut best_ping = f64::MAX;
-
-        for slot in upcoming_slots {
-            if let Some(region) = &slot.region {
-                if region.to_lowercase().contains(&target_region.to_lowercase()) {
-                    let ping = slot.ping_ms.unwrap_or(999.0);
-                    if ping < best_ping {
-                        best_ping = ping;
-                        best_slot = Some(slot);
-                    }
-                }
-            }
-        }
-
-        Ok(best_slot)
+        false
     }
 }
