@@ -17,9 +17,10 @@
    - لاگ کامل از خطاها و موفقیت‌ها
 
 3. **Rate Limiting (محدودیت نرخ)**
-   - محدودیت ۱ درخواست در ثانیه
+   - محدودیت ۱ درخواست در هر ۳ ثانیه
    - استفاده از `tokio::sync::Semaphore`
-   - جلوگیری از محدودیت‌های شبکه
+   - Retry logic با exponential backoff (5s, 10s, 15s)
+   - جلوگیری از محدودیت‌های شبکه Jito
 
 4. **فیلتر سودآوری**
    - فقط تراکنش‌های سودده به Jito ارسال می‌شوند
@@ -60,7 +61,8 @@
    - Back-run: فروش + close account + Jito tip
 
 4. **ارسال برای شبیه‌سازی**
-   - محدودیت ۱ req/sec
+   - محدودیت ۱ req/3sec (برای جلوگیری از rate limit Jito)
+   - Retry با exponential backoff در صورت rate limit
    - فقط profitable bundles
    - دریافت نتایج کامل
 
@@ -117,9 +119,27 @@ RUST_LOG=info cargo run --release
 ## ⚠️ نکات مهم
 
 1. **فقط شبیه‌سازی**: این کد فقط باندل‌ها را شبیه‌سازی می‌کند، اجرا نمی‌کند
-2. **Rate Limit**: حتماً ۱ req/sec رعایت می‌شود
+2. **Rate Limit**: حتماً ۱ req/3sec رعایت می‌شود + retry logic
 3. **Profitable Only**: فقط تراکنش‌های سودده ارسال می‌شوند
 4. **Wallet Safety**: کد تراکنش امضا می‌کند اما ارسال نمی‌کند
+
+## 🐛 رفع خطاهای رایج
+
+### خطای Deserialization
+```
+invalid value: continue signal on byte-three
+```
+**راه‌حل**: ✅ اصلاح شد - از `VersionedTransaction` استفاده می‌شود
+
+### خطای Rate Limit
+```
+Network congested. Endpoint is globally rate limited.
+```
+**راه‌حل**: ✅ اصلاح شد - rate limit افزایش یافت به 3 ثانیه + retry logic
+
+### اگر هنوز rate limit می‌خورید
+- Rate limit را در `main.rs` خط ~686 افزایش دهید (مثلاً 5 ثانیه)
+- یا `max_retries` را کاهش دهید
 
 ## 🔄 مراحل بعدی (اختیاری)
 

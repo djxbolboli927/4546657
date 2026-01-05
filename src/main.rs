@@ -575,11 +575,20 @@ async fn unified_worker_thread(
             }
         };
 
-        // Deserialize Victim Transaction
-        let victim_tx = match bincode::deserialize::<solana_sdk::transaction::Transaction>(&tx_info.raw_transaction) {
+        // Deserialize Victim Transaction (VersionedTransaction!)
+        let victim_versioned_tx = match bincode::deserialize::<VersionedTransaction>(&tx_info.raw_transaction) {
             Ok(tx) => tx,
             Err(e) => {
                 error!("   ❌ Failed to deserialize victim tx: {}", e);
+                continue;
+            }
+        };
+
+        // Convert VersionedTransaction to legacy Transaction for bundle
+        let victim_tx = match victim_versioned_tx.into_legacy_transaction() {
+            Some(tx) => tx,
+            None => {
+                error!("   ❌ Cannot convert versioned tx to legacy (uses address lookup tables)");
                 continue;
             }
         };
@@ -622,37 +631,59 @@ async fn unified_worker_thread(
 
             info!("   📦 Sending bundle to Jito for simulation...");
 
-            match jito_client.simulate_bundle(bundle).await {
-                Ok(sim_result) => {
-                    info!("   ✅ BUNDLE SIMULATION SUCCESS!");
-                    info!("      📊 Summary: {:?}", sim_result.summary);
+            // Retry logic with exponential backoff for rate limiting
+            let mut retry_count = 0;
+            let max_retries = 3;
+            let mut success = false;
 
-                    for (idx, tx_result) in sim_result.transaction_results.iter().enumerate() {
-                        if let Some(err) = &tx_result.err {
-                            error!("      ❌ TX {} FAILED: {:?}", idx, err);
-                            if let Some(logs) = &tx_result.logs {
-                                for log in logs.iter().take(3) {
-                                    info!("         {}", log);
+            while retry_count <= max_retries && !success {
+                match jito_client.simulate_bundle(bundle.clone()).await {
+                    Ok(sim_result) => {
+                        info!("   ✅ BUNDLE SIMULATION SUCCESS!");
+                        info!("      📊 Summary: {:?}", sim_result.summary);
+
+                        for (idx, tx_result) in sim_result.transaction_results.iter().enumerate() {
+                            if let Some(err) = &tx_result.err {
+                                error!("      ❌ TX {} FAILED: {:?}", idx, err);
+                                if let Some(logs) = &tx_result.logs {
+                                    for log in logs.iter().take(3) {
+                                        info!("         {}", log);
+                                    }
+                                }
+                            } else {
+                                info!("      ✅ TX {} SUCCESS", idx);
+                                if let Some(units) = tx_result.units_consumed {
+                                    info!("         ⛽ Units: {}", units);
                                 }
                             }
-                        } else {
-                            info!("      ✅ TX {} SUCCESS", idx);
-                            if let Some(units) = tx_result.units_consumed {
-                                info!("         ⛽ Units: {}", units);
+                        }
+
+                        stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
+                        success = true;
+                    }
+                    Err(e) => {
+                        let error_msg = format!("{}", e);
+                        if error_msg.contains("rate limited") || error_msg.contains("congested") {
+                            retry_count += 1;
+                            if retry_count <= max_retries {
+                                let backoff_secs = 5 * retry_count; // 5s, 10s, 15s
+                                warn!("   ⚠️  Rate limited! Retry {}/{} after {}s...", retry_count, max_retries, backoff_secs);
+                                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                            } else {
+                                error!("   ❌ Bundle Simulation Failed after {} retries: {}", max_retries, e);
+                                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                             }
+                        } else {
+                            error!("   ❌ Bundle Simulation Failed: {}", e);
+                            stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                            break;
                         }
                     }
-
-                    stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    error!("   ❌ Bundle Simulation Failed: {}", e);
-                    stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 }
             }
 
-            // Rate limit: sleep for 1 second
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            // Rate limit: sleep for 3 seconds (Jito is strict!)
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
     info!("Worker {} stopped", worker_id);
