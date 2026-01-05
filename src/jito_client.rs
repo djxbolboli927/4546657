@@ -163,8 +163,7 @@ impl JitoClient {
 
         let response = self.http_client
             .post(&simulation_url)
-            .json(&request)
-            .header("Content-Type", "application/json")
+            .json(&request)  // این خودش Content-Type را اضافه می‌کند
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await

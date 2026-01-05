@@ -555,14 +555,19 @@ async fn unified_worker_thread(
 
         let mint = match Pubkey::from_str(&tx_info.mint) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                debug!("⏭️  Skipped: Invalid mint pubkey: {}", e);
+                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
         };
 
         // Get Latest Blockhash (Must be fast!)
         let blockhash = match tx_builder.get_recent_blockhash().await {
             Ok(bh) => bh,
-            Err(_) => {
-                // Silent error - blockhash fetch failures are common
+            Err(e) => {
+                debug!("⏭️  Skipped: Blockhash fetch failed: {}", e);
+                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         };
@@ -576,12 +581,20 @@ async fn unified_worker_thread(
         };
         let creator_vault = match Pubkey::from_str(creator_vault_str) {
             Ok(cv) => cv,
-            Err(_) => continue,
+            Err(e) => {
+                debug!("⏭️  Skipped: Invalid creator_vault pubkey: {}", e);
+                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
         };
 
         let token_program_id_str = match &tx_info.token_program_id {
             Some(tp) => tp,
-            None => continue,
+            None => {
+                debug!("⏭️  Skipped: Missing token_program_id");
+                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
         };
 
         let token_program_type = if token_program_id_str == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" {
@@ -592,7 +605,11 @@ async fn unified_worker_thread(
 
         let token_program_id_pubkey = match Pubkey::from_str(token_program_id_str) {
             Ok(pk) => pk,
-            Err(_) => continue,
+            Err(e) => {
+                debug!("⏭️  Skipped: Invalid token_program_id pubkey: {}", e);
+                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
         };
 
         let safe_front_run_sol = (simulation.front_run_sol as f64 * 1.70) as u64;
@@ -611,7 +628,8 @@ async fn unified_worker_thread(
         ).await {
             Ok(tx) => tx,
             Err(e) => {
-                error!("   ❌ Front-Run Build Failed: {}", e);
+                debug!("⏭️  Skipped: Front-Run Build Failed: {}", e);
+                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         };
@@ -620,7 +638,8 @@ async fn unified_worker_thread(
         let victim_versioned_tx = match bincode::deserialize::<VersionedTransaction>(&tx_info.raw_transaction) {
             Ok(tx) => tx,
             Err(e) => {
-                error!("   ❌ Failed to deserialize victim tx: {}", e);
+                debug!("⏭️  Skipped: Failed to deserialize victim tx: {}", e);
+                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         };
@@ -629,7 +648,8 @@ async fn unified_worker_thread(
         let victim_tx = match victim_versioned_tx.into_legacy_transaction() {
             Some(tx) => tx,
             None => {
-                error!("   ❌ Cannot convert versioned tx to legacy (uses address lookup tables)");
+                debug!("⏭️  Skipped: Cannot convert versioned tx to legacy (uses address lookup tables)");
+                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         };
@@ -637,7 +657,11 @@ async fn unified_worker_thread(
         // Build Back-Run Transaction
         let jito_tip_account = match Pubkey::from_str(&jito_client.get_tip_account_str()) {
             Ok(pk) => pk,
-            Err(_) => continue,
+            Err(e) => {
+                debug!("⏭️  Skipped: Invalid jito_tip_account pubkey: {}", e);
+                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
         };
 
         let back_tx = match tx_builder.build_back_run_transaction(
@@ -655,7 +679,8 @@ async fn unified_worker_thread(
         ).await {
             Ok(tx) => tx,
             Err(e) => {
-                error!("   ❌ Back-Run Build Failed: {}", e);
+                debug!("⏭️  Skipped: Back-Run Build Failed: {}", e);
+                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         };
@@ -667,6 +692,7 @@ async fn unified_worker_thread(
         if ENABLE_BUNDLE_SIMULATION {
             let bundle = vec![front_tx, victim_tx, back_tx];
 
+            debug!("✅ Bundle built successfully for victim sig: ...{}", &tx_info.signature[tx_info.signature.len()-8..]);
             info!("🧪 Testing Bundle Logic via Jito Simulation...");
 
             match jito_client.simulate_bundle(bundle).await {
