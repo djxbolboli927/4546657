@@ -130,7 +130,7 @@ impl JitoClient {
         JITO_TIP_ACCOUNTS[index]
     }
 
-    /// ✅ شبیه‌سازی باندل با لاگ دقیق خطا
+    /// ✅ شبیه‌سازی باندل با استفاده از ERPC RPC endpoint
     pub async fn simulate_bundle(&self, transactions: Vec<Transaction>) -> Result<SimulateBundleValue> {
         let encoded_txs: Vec<String> = transactions
             .iter()
@@ -141,16 +141,14 @@ impl JitoClient {
             })
             .collect();
 
-        // FIX: مشکل E0382 با استفاده مستقیم از آرایه حل شد
+        // Helius/QuickNode compatible format
         let params_vec = vec![
-            serde_json::json!({
-                "encodedTransactions": encoded_txs
-            }),
+            serde_json::json!(encoded_txs),
             serde_json::json!({
                 "encoding": "base58",
                 "commitment": "processed",
                 "replaceRecentBlockhash": true,
-                "sigVerify": false
+                "skipSigVerify": true
             })
         ];
 
@@ -161,11 +159,11 @@ impl JitoClient {
             "params": params_vec
         });
 
-        // ارسال به Jito Block Engine (Endpoint 0)
-        let jito_url = format!("{}/api/v1/bundles", self.endpoints[0]);
+        // ✅ استفاده از ERPC endpoint (نه Jito Block Engine)
+        let simulation_url = &self.rpc_endpoint;
 
         let response = self.http_client
-            .post(&jito_url)
+            .post(simulation_url)
             .json(&request)
             .timeout(std::time::Duration::from_secs(15))
             .send()

@@ -53,6 +53,9 @@ use pumpfun_instructions::derive_bonding_curve;
 
 mod spl_utils;
 
+mod leader_slot_client;
+use leader_slot_client::LeaderSlotClient;
+
 // ═══════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════
@@ -316,6 +319,76 @@ fn record_buy_activity(address: &str, mint: &str, slot: u64, recent_activity: &R
 fn cleanup_old_activity(recent_activity: &RecentActivity) {
     let cutoff = Instant::now() - Duration::from_secs(MAX_ACTIVITY_AGE_SECS);
     recent_activity.retain(|_, activity| activity.last_activity >= cutoff);
+}
+
+/// ✅ گزارش آماری کامل (هر 30 ثانیه)
+fn print_statistics(stats: &GlobalStats) {
+    let elapsed = stats.start_time.elapsed().as_secs();
+    let elapsed_mins = elapsed / 60;
+
+    let total_tx = stats.total_tx_processed.load(Ordering::Relaxed);
+    let profitable = stats.profitable_count.load(Ordering::Relaxed);
+    let unprofitable = stats.unprofitable_count.load(Ordering::Relaxed);
+    let bundles_sent = stats.bundles_sent.load(Ordering::Relaxed);
+    let bundles_failed = stats.bundles_failed.load(Ordering::Relaxed);
+    let total_profit = stats.total_profit_lamports.load(Ordering::Relaxed);
+
+    // Skipped reasons
+    let skipped_no_pool = stats.skipped_no_pool.load(Ordering::Relaxed);
+    let skipped_low_sol = stats.skipped_low_sol.load(Ordering::Relaxed);
+    let skipped_same_block = stats.skipped_same_block.load(Ordering::Relaxed);
+    let skipped_no_creator = stats.skipped_no_creator.load(Ordering::Relaxed);
+    let skipped_target_confirmed = stats.skipped_target_confirmed.load(Ordering::Relaxed);
+    let skipped_simulation_failed = stats.skipped_simulation_failed.load(Ordering::Relaxed);
+    let skipped_unprofitable = stats.skipped_unprofitable.load(Ordering::Relaxed);
+
+    let total_skipped = skipped_no_pool + skipped_low_sol + skipped_same_block
+        + skipped_no_creator + skipped_target_confirmed + skipped_simulation_failed
+        + skipped_unprofitable;
+
+    let shreds = stats.shreds_received.load(Ordering::Relaxed);
+    let geyser = stats.geyser_updates.load(Ordering::Relaxed);
+
+    let tx_per_min = if elapsed_mins > 0 { total_tx / elapsed_mins as usize } else { 0 };
+    let profit_sol = total_profit as f64 / LAMPORTS_PER_SOL as f64;
+    let success_rate = if bundles_sent + bundles_failed > 0 {
+        (bundles_sent as f64 / (bundles_sent + bundles_failed) as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    info!("═══════════════════════════════════════════════════════════");
+    info!("📊 STATISTICS REPORT (Runtime: {} min {} sec)", elapsed_mins, elapsed % 60);
+    info!("═══════════════════════════════════════════════════════════");
+    info!("");
+    info!("🔍 DATA SOURCES:");
+    info!("   ShredStream Messages: {}", shreds);
+    info!("   Geyser Updates: {}", geyser);
+    info!("");
+    info!("📈 TRANSACTION PROCESSING:");
+    info!("   Total Processed: {} ({} tx/min)", total_tx, tx_per_min);
+    info!("   ✅ Profitable: {} ({:.1}%)", profitable, if total_tx > 0 { profitable as f64 / total_tx as f64 * 100.0 } else { 0.0 });
+    info!("   ❌ Unprofitable: {} ({:.1}%)", unprofitable, if total_tx > 0 { unprofitable as f64 / total_tx as f64 * 100.0 } else { 0.0 });
+    info!("   ⏭️  Total Skipped: {} ({:.1}%)", total_skipped, if total_tx > 0 { total_skipped as f64 / total_tx as f64 * 100.0 } else { 0.0 });
+    info!("");
+    info!("📦 JITO BUNDLE SIMULATION:");
+    info!("   ✅ Successful Simulations: {}", bundles_sent);
+    info!("   ❌ Failed Simulations: {}", bundles_failed);
+    info!("   📊 Success Rate: {:.1}%", success_rate);
+    info!("");
+    info!("⏭️  SKIP BREAKDOWN:");
+    info!("   No Pool Data: {}", skipped_no_pool);
+    info!("   Max SOL Exceeded: {}", skipped_low_sol);
+    info!("   Same Block Activity: {}", skipped_same_block);
+    info!("   No Creator Vault: {}", skipped_no_creator);
+    info!("   Target Already Confirmed: {}", skipped_target_confirmed);
+    info!("   Local Simulation Failed: {}", skipped_simulation_failed);
+    info!("   Unprofitable (after calc): {}", skipped_unprofitable);
+    info!("");
+    info!("💰 ESTIMATED PROFIT:");
+    info!("   Total Profit: {:.6} SOL ({} lamports)", profit_sol, total_profit);
+    info!("═══════════════════════════════════════════════════════════");
+    info!("");
 }
 
 fn calculate_token_out_with_fee(sol_in: u64, sol_reserve: u64, token_reserve: u64) -> u64 {
@@ -904,6 +977,16 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(CLEANUP_INTERVAL_SECS));
         loop { interval.tick().await; cleanup_old_activity(&activity_for_cleanup); }
+    });
+
+    // ✅ Statistics Reporting Thread (هر 30 ثانیه)
+    let stats_for_reporting = stats.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            print_statistics(&stats_for_reporting);
+        }
     });
 
     let geyser_handle = {
