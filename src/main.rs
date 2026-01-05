@@ -35,7 +35,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tonic::transport::ClientTlsConfig;
-use tokio::sync::Semaphore;
 
 mod config;
 use config::{commitment_from_str, Config};
@@ -215,7 +214,6 @@ impl WorkerPool {
         wallet_manager: Arc<WalletManager>,
         tx_builder: Arc<TransactionBuilder>,
         recent_activity: RecentActivity,
-        rate_limiter: Arc<Semaphore>,
     ) -> Self {
         let mut workers = Vec::new();
 
@@ -229,7 +227,6 @@ impl WorkerPool {
             let wallet_clone = wallet_manager.clone();
             let builder_clone = tx_builder.clone();
             let activity_clone = recent_activity.clone();
-            let limiter_clone = rate_limiter.clone();
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
@@ -243,7 +240,6 @@ impl WorkerPool {
                         wallet_clone,
                         builder_clone,
                         activity_clone,
-                        limiter_clone,
                     ).await;
                 });
             });
@@ -452,9 +448,8 @@ async fn unified_worker_thread(
     wallet_manager: Arc<WalletManager>,
     tx_builder: Arc<TransactionBuilder>,
     recent_activity: RecentActivity,
-    rate_limiter: Arc<Semaphore>,
 ) {
-    info!("Worker {} started 🚀 (📦 BUNDLE SIMULATION MODE)", worker_id);
+    info!("Worker {} started 🚀 (📦 NO RATE LIMIT - Full Speed!)", worker_id);
 
     for tx_info in rx.iter() {
         stats.total_tx_processed.fetch_add(1, Ordering::Relaxed);
@@ -620,54 +615,40 @@ async fn unified_worker_thread(
         };
 
         // ═══════════════════════════════════════════════════════════
-        // 🔬 SEND BUNDLE TO JITO FOR SIMULATION (No Waiting!)
+        // 🔬 SEND BUNDLE TO JITO FOR SIMULATION (No Rate Limit!)
         // ═══════════════════════════════════════════════════════════
 
         if ENABLE_BUNDLE_SIMULATION {
-            // Try to acquire rate limit permit (non-blocking)
-            // If not available, skip this transaction entirely
-            match rate_limiter.try_acquire() {
-                Ok(_permit) => {
-                    let bundle = vec![front_tx, victim_tx, back_tx];
+            let bundle = vec![front_tx, victim_tx, back_tx];
 
-                    info!("   📦 Sending bundle to Jito for simulation...");
+            info!("   📦 Sending bundle to Jito for simulation...");
 
-                    match jito_client.simulate_bundle(bundle).await {
-                        Ok(sim_result) => {
-                            info!("   ✅ BUNDLE SIMULATION SUCCESS!");
-                            info!("      📊 Summary: {:?}", sim_result.summary);
+            match jito_client.simulate_bundle(bundle).await {
+                Ok(sim_result) => {
+                    info!("   ✅ BUNDLE SIMULATION SUCCESS!");
+                    info!("      📊 Summary: {:?}", sim_result.summary);
 
-                            for (idx, tx_result) in sim_result.transaction_results.iter().enumerate() {
-                                if let Some(err) = &tx_result.err {
-                                    error!("      ❌ TX {} FAILED: {:?}", idx, err);
-                                    if let Some(logs) = &tx_result.logs {
-                                        for log in logs.iter().take(3) {
-                                            info!("         {}", log);
-                                        }
-                                    }
-                                } else {
-                                    info!("      ✅ TX {} SUCCESS", idx);
-                                    if let Some(units) = tx_result.units_consumed {
-                                        info!("         ⛽ Units: {}", units);
-                                    }
+                    for (idx, tx_result) in sim_result.transaction_results.iter().enumerate() {
+                        if let Some(err) = &tx_result.err {
+                            error!("      ❌ TX {} FAILED: {:?}", idx, err);
+                            if let Some(logs) = &tx_result.logs {
+                                for log in logs.iter().take(3) {
+                                    info!("         {}", log);
                                 }
                             }
-
-                            stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            error!("   ❌ Bundle Simulation Failed: {}", e);
-                            stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            info!("      ✅ TX {} SUCCESS", idx);
+                            if let Some(units) = tx_result.units_consumed {
+                                info!("         ⛽ Units: {}", units);
+                            }
                         }
                     }
 
-                    // Rate limit: sleep for 1 second after successful send
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(_) => {
-                    // Rate limit not available - skip this transaction
-                    debug!("   ⏭️  Skipped: Rate limit active, not waiting");
-                    continue;
+                Err(e) => {
+                    error!("   ❌ Bundle Simulation Failed: {}", e);
+                    stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -906,9 +887,6 @@ async fn main() -> Result<()> {
     let tx_builder = Arc::new(TransactionBuilder::new(&rpc_endpoint));
     let recent_activity = Arc::new(DashMap::new());
 
-    // ✅ Rate Limiter: 1 request per second
-    let rate_limiter = Arc::new(Semaphore::new(1));
-
     let worker_pool = Arc::new(WorkerPool::new(
         WORKER_COUNT,
         pool_tracker.clone(),
@@ -917,7 +895,6 @@ async fn main() -> Result<()> {
         wallet_manager.clone(),
         tx_builder.clone(),
         recent_activity.clone(),
-        rate_limiter.clone(),
     ));
 
     let (shreds_tx, shreds_rx) = unbounded::<ShredsData>();

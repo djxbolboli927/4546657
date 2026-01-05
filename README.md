@@ -16,11 +16,11 @@
    - دریافت نتایج دقیق برای هر تراکنش در باندل
    - لاگ کامل از خطاها و موفقیت‌ها
 
-3. **Rate Limiting (محدودیت نرخ)**
-   - محدودیت ۱ درخواست در ثانیه (دقیقاً 1 req/sec)
-   - استفاده از `tokio::sync::Semaphore` با `try_acquire()` (non-blocking)
-   - **هیچ انتظاری نمی‌کشد**: اگر rate limit فعال باشد، تراکنش skip می‌شود
-   - اطمینان از ارسال فوری تراکنش‌های سودده
+3. **بدون محدودیت نرخ (No Rate Limiting)**
+   - هیچ محدودیتی برای ارسال درخواست‌ها وجود ندارد
+   - تمام تراکنش‌های سودده **بلافاصله** به Jito ارسال می‌شوند
+   - سرعت کامل - بدون delay
+   - خطاهای rate limit از Jito نادیده گرفته می‌شوند (فقط در مرحله تست)
 
 4. **فیلتر سودآوری**
    - فقط تراکنش‌های سودده به Jito ارسال می‌شوند
@@ -61,10 +61,9 @@
    - Back-run: فروش + close account + Jito tip
 
 4. **ارسال برای شبیه‌سازی**
-   - محدودیت ۱ req/sec (non-blocking)
-   - اگر rate limit فعال باشد، تراکنش skip می‌شود (بدون انتظار)
-   - فقط profitable bundles
-   - دریافت نتایج کامل
+   - بدون هیچ محدودیتی - Full Speed! 🚀
+   - تمام profitable bundles بلافاصله ارسال می‌شوند
+   - دریافت نتایج کامل از هر bundle
 
 ## 🚀 اجرا
 
@@ -119,9 +118,9 @@ RUST_LOG=info cargo run --release
 ## ⚠️ نکات مهم
 
 1. **فقط شبیه‌سازی**: این کد فقط باندل‌ها را شبیه‌سازی می‌کند، اجرا نمی‌کند
-2. **Rate Limit**: دقیقاً ۱ req/sec - بدون انتظار (non-blocking)
+2. **No Rate Limit**: هیچ محدودیتی وجود ندارد - Full Speed! 🚀
 3. **Profitable Only**: فقط تراکنش‌های سودده ارسال می‌شوند
-4. **No Queueing**: تراکنش‌ها در صف انتظار قرار نمی‌گیرند - یا فوراً ارسال یا skip
+4. **Immediate Send**: همه profitable bundles بلافاصله ارسال می‌شوند
 
 ## 🐛 رفع خطاهای رایج
 
@@ -146,10 +145,13 @@ let versioned = bincode::deserialize::<VersionedTransaction>(&raw_tx)?;
 let legacy = versioned.into_legacy_transaction()?;
 ```
 
-### نحوه عملکرد Rate Limiting
-- از `try_acquire()` استفاده می‌کند (non-blocking)
-- اگر semaphore available نباشد → تراکنش skip می‌شود
-- **هیچ انتظاری نمی‌کشد** - برای جلوگیری از missed opportunities
+### چرا تراکنش‌های سودده ارسال نمی‌شوند؟
+اگر تراکنش profitable را می‌بینید اما پیام "📦 Sending bundle" نمی‌بینید:
+- احتمالاً `creator_vault` یا `token_program_id` موجود نیست
+- یا `blockhash` fetch نمی‌شود (خطای شبکه)
+- یا تراکنش victim نمی‌تواند به legacy تبدیل شود (از address lookup tables استفاده می‌کند)
+
+تمام این خطاها در لاگ نمایش داده می‌شوند.
 
 ## 🔄 مراحل بعدی (اختیاری)
 
