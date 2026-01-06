@@ -1,0 +1,30 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo lock file (uncomment if this is a library)
+# Cargo.lock is committed for binaries but not for libraries
+
+# Environment variables
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Wallet keys (NEVER commit these!)
+*.json
+!config.json
+
+# Test artifacts
+/tmp/
