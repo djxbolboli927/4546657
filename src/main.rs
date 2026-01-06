@@ -560,6 +560,9 @@ async fn unified_worker_thread(
         // ✅ تراکنش سودده است
         stats.profitable_count.fetch_add(1, Ordering::Relaxed);
 
+        // ✅ نمایش جزئیات کامل شبیه‌سازی سودآوری
+        print_simulation_result(&simulation, worker_id, true);
+
         // ═══════════════════════════════════════════════════════════
         // 🏗️ BUILD COMPLETE BUNDLE (Front + Victim + Back)
         // ═══════════════════════════════════════════════════════════
@@ -715,41 +718,71 @@ async fn unified_worker_thread(
 
             let bundle = vec![front_tx, victim_tx, back_tx];
 
-            debug!("✅ Bundle built successfully for victim sig: ...{}", &tx_info.signature[tx_info.signature.len()-8..]);
-            info!("🧪 Testing Bundle Logic via Jito Simulation...");
+            info!("═══════════════════════════════════════════════════════════");
+            info!("📤 SENDING BUNDLE TO JITO");
+            info!("   Victim Signature: ...{}", &tx_info.signature[tx_info.signature.len()-8..]);
+            info!("   Worker: {}", worker_id);
+            info!("   Expected Profit: {:.6} SOL", simulation.net_profit as f64 / LAMPORTS_PER_SOL as f64);
+            info!("═══════════════════════════════════════════════════════════");
 
             match jito_client.simulate_bundle(bundle).await {
                 Ok(sim_result) => {
+                    info!("✅ JITO RESPONSE RECEIVED");
                     let mut all_passed = true;
 
                     // بررسی تک تک تراکنش‌ها
                     for (i, tx_res) in sim_result.transaction_results.iter().enumerate() {
+                        let tx_name = match i {
+                            0 => "Front-Run",
+                            1 => "Victim",
+                            2 => "Back-Run",
+                            _ => "Unknown",
+                        };
+
                         if let Some(err) = &tx_res.err {
                             all_passed = false;
-                            error!("❌ TX #{} Failed!", i);
+                            error!("❌ TX #{} ({}) FAILED!", i, tx_name);
                             error!("   Error: {:?}", err);
 
                             if let Some(logs) = &tx_res.logs {
+                                error!("   Logs:");
                                 for log in logs {
-                                    error!("      log: {}", log);
+                                    error!("      {}", log);
+                                }
+                            }
+                        } else {
+                            info!("✅ TX #{} ({}) SUCCESS", i, tx_name);
+                            if let Some(logs) = &tx_res.logs {
+                                debug!("   Logs:");
+                                for log in logs {
+                                    debug!("      {}", log);
                                 }
                             }
                         }
                     }
 
                     if all_passed {
-                        info!("🎉 BUNDLE LOGIC IS PERFECT! (Ready for Mainnet execution)");
+                        info!("🎉 BUNDLE SIMULATION SUCCESSFUL!");
+                        info!("   All 3 transactions passed Jito simulation");
+                        info!("   This bundle is ready for mainnet execution");
                         stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
+                        stats.total_profit_lamports.fetch_add(simulation.net_profit as u64, Ordering::Relaxed);
                     } else {
-                        error!("⚠️ Bundle Logic has errors. Do not enable real sending yet.");
+                        error!("⚠️ BUNDLE SIMULATION FAILED");
+                        error!("   One or more transactions failed in Jito simulation");
+                        error!("   Do not send this bundle to mainnet");
                         stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 Err(e) => {
-                    error!("❌ Simulation Request Failed (Network/Format Error): {}", e);
+                    error!("❌ JITO SIMULATION REQUEST FAILED");
+                    error!("   Victim Signature: ...{}", &tx_info.signature[tx_info.signature.len()-8..]);
+                    error!("   Error Type: Network/Format/API Error");
+                    error!("   Error Details: {}", e);
                     stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            info!("═══════════════════════════════════════════════════════════");
         }
     }
     info!("Worker {} stopped", worker_id);
