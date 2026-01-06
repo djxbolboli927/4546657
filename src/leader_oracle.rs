@@ -53,40 +53,60 @@ impl Default for GeoConfig {
 // ساختارهای داده برای ERPC API Response
 // ═══════════════════════════════════════════════════════════════
 
-/// اطلاعات یک اسلات و لیدر آن
+/// اطلاعات ping از یک شهر خاص
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LeaderSlotInfo {
-    /// شماره اسلات
-    pub slot: u64,
-
-    /// کلید عمومی لیدر (validator identity)
+pub struct PingInfo {
+    pub city: String,
+    pub region: String,
+    pub ms: f64, // Latency در میلی‌ثانیه
+    pub from_ip: Option<String>,
+    pub country: String,
     #[serde(default)]
-    pub leader: Option<String>,
-
-    /// نام منطقه یا دیتاسنتر (مثلاً "Europe", "US-East", "Asia-Pacific")
+    pub lat: Option<f64>,
     #[serde(default)]
-    pub region: Option<String>,
-
-    /// کد کشور ISO (مثلاً "DE", "JP", "US")
+    pub lon: Option<f64>,
     #[serde(default)]
-    pub country: Option<String>,
-
-    /// شهر
+    pub org: Option<String>,
     #[serde(default)]
-    pub city: Option<String>,
-
-    /// پینگ اندازه‌گیری شده از فرانکفورت (میلی‌ثانیه)
+    pub postal: Option<String>,
     #[serde(default)]
-    pub ping: Option<u64>,
+    pub timezone: Option<String>,
+}
 
-    /// آدرس IP (اختیاری)
+/// اطلاعات خام یک leader slot از API
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErpcLeaderSlotData {
+    pub identity: String,
+    pub epoch: u64,
+    pub slot: String, // ⚠️ API به صورت String برمی‌گرداند!
     #[serde(default)]
-    pub ip: Option<String>,
+    pub ip_address: Option<String>,
+    #[serde(default)]
+    pub gossip_port: Option<u16>,
+    #[serde(default)]
+    pub tpu_port: Option<u16>,
+    #[serde(default)]
+    pub tpu_quic_port: Option<u16>,
+    #[serde(default)]
+    pub rpc_address: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub feature_set: Option<String>,
+    pub ping_to_leaders: Vec<PingInfo>,
+}
 
-    /// زمان دریافت داده (برای کش)
-    #[serde(skip)]
-    pub fetched_at: Option<Instant>,
+/// ساختار داده result از API
+#[derive(Debug, Deserialize)]
+pub struct ErpcResultData {
+    pub success: bool,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub total: Option<u64>,
+    pub data: Vec<ErpcLeaderSlotData>,
 }
 
 /// پاسخ JSON-RPC از ERPC
@@ -94,10 +114,23 @@ pub struct LeaderSlotInfo {
 pub struct ErpcResponse {
     pub jsonrpc: String,
     #[serde(default)]
-    pub result: Option<Vec<LeaderSlotInfo>>,
+    pub result: Option<ErpcResultData>,
     #[serde(default)]
     pub error: Option<serde_json::Value>,
     pub id: u64,
+}
+
+/// ساختار داده ساده‌شده برای استفاده داخلی
+#[derive(Debug, Clone)]
+pub struct LeaderSlotInfo {
+    pub slot: u64,
+    pub leader: String,
+    pub region: Option<String>,
+    pub country: Option<String>,
+    pub city: Option<String>,
+    pub ping: Option<f64>, // Changed to f64
+    pub ip: Option<String>,
+    pub fetched_at: Option<Instant>,
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -205,7 +238,11 @@ impl LeaderOracle {
         }
 
         // استخراج نتیجه
-        let leader_slots = parsed.result.ok_or_else(|| anyhow!("Empty result from ERPC"))?;
+        let result_data = parsed.result.ok_or_else(|| anyhow!("Empty result from ERPC"))?;
+
+        if !result_data.success {
+            return Err(anyhow!("API returned success=false: {:?}", result_data.message));
+        }
 
         // به‌روزرسانی کش
         let mut cache = self.cache.write().await;
@@ -216,10 +253,32 @@ impl LeaderOracle {
         let mut added_count = 0;
         let now = Instant::now();
 
-        for mut info in leader_slots {
-            // افزودن timestamp برای کش
-            info.fetched_at = Some(now);
-            cache.insert(info.slot, info);
+        // تبدیل داده‌های خام API به ساختار ساده
+        for raw_data in result_data.data {
+            // Parse slot (از String به u64)
+            let slot = match raw_data.slot.parse::<u64>() {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to parse slot '{}': {}", raw_data.slot, e);
+                    continue;
+                }
+            };
+
+            // استخراج اطلاعات ping (اولین مورد از pingToLeaders)
+            let ping_info = raw_data.ping_to_leaders.first();
+
+            let leader_info = LeaderSlotInfo {
+                slot,
+                leader: raw_data.identity.clone(),
+                region: ping_info.map(|p| p.region.clone()),
+                country: ping_info.map(|p| p.country.clone()),
+                city: ping_info.map(|p| p.city.clone()),
+                ping: ping_info.map(|p| p.ms),
+                ip: raw_data.ip_address.clone(),
+                fetched_at: Some(now),
+            };
+
+            cache.insert(slot, leader_info);
             added_count += 1;
         }
 
@@ -252,8 +311,8 @@ impl LeaderOracle {
             // 1️⃣ بررسی PING (بالاترین اولویت)
             //    اگر ping کمتر از حد تعیین شده باشد، موقعیت مکانی مهم نیست
             if let Some(ping) = info.ping {
-                if ping <= self.config.max_latency_ms {
-                    debug!("✅ Slot {}: TRADE ALLOWED (Low Ping: {} ms)", current_slot, ping);
+                if ping <= self.config.max_latency_ms as f64 {
+                    debug!("✅ Slot {}: TRADE ALLOWED (Low Ping: {:.2} ms)", current_slot, ping);
                     return true;
                 }
             }
@@ -286,7 +345,7 @@ impl LeaderOracle {
                 warn!("   Region: {}", region);
             }
             if let Some(ping) = info.ping {
-                warn!("   Ping: {} ms (max: {} ms)", ping, self.config.max_latency_ms);
+                warn!("   Ping: {:.2} ms (max: {} ms)", ping, self.config.max_latency_ms);
             }
 
             return false;
