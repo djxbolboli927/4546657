@@ -737,7 +737,7 @@ async fn unified_worker_thread(
             info!("   Expected Profit: {:.6} SOL", simulation.net_profit as f64 / LAMPORTS_PER_SOL as f64);
             info!("═══════════════════════════════════════════════════════════");
 
-            match jito_client.simulate_bundle(bundle).await {
+            match jito_client.simulate_bundle(bundle.clone()).await {
                 Ok(sim_result) => {
                     info!("✅ JITO RESPONSE RECEIVED");
                     let mut all_passed = true;
@@ -776,9 +776,98 @@ async fn unified_worker_thread(
                     if all_passed {
                         info!("🎉 BUNDLE SIMULATION SUCCESSFUL!");
                         info!("   All 3 transactions passed Jito simulation");
-                        info!("   This bundle is ready for mainnet execution");
-                        stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
-                        stats.total_profit_lamports.fetch_add(simulation.net_profit as u64, Ordering::Relaxed);
+                        info!("   Now sending REAL bundle to Jito...");
+                        info!("═══════════════════════════════════════════════════════════");
+
+                        // ✅ ارسال bundle واقعی به Jito
+                        match jito_client.send_bundle_with_victim(
+                            bundle,
+                            Some(tx_info.signature.clone()),
+                        ).await {
+                            Ok(bundle_id) => {
+                                info!("✅ BUNDLE SENT SUCCESSFULLY!");
+                                info!("   Bundle ID: {}", bundle_id);
+                                info!("   Expected Profit: {:.6} SOL", simulation.net_profit as f64 / LAMPORTS_PER_SOL as f64);
+                                info!("   🔗 Track: https://explorer.jito.wtf/bundle/{}", bundle_id);
+
+                                stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
+                                stats.total_profit_lamports.fetch_add(simulation.net_profit as u64, Ordering::Relaxed);
+
+                                // ✅ پیگیری real-time bundle status
+                                info!("📊 Tracking bundle status...");
+
+                                for attempt in 1..=30 {
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+                                    match jito_client.get_inflight_bundle_statuses(vec![bundle_id.clone()]).await {
+                                        Ok(status_response) => {
+                                            if let Some(value) = status_response.get("result").and_then(|r| r.get("value")) {
+                                                if let Some(statuses) = value.as_array() {
+                                                    if let Some(bundle_status) = statuses.first() {
+                                                        if let Some(status) = bundle_status.get("status") {
+                                                            let status_str = status.as_str().unwrap_or("Unknown");
+
+                                                            match status_str {
+                                                                "Landed" => {
+                                                                    info!("🎉 BUNDLE LANDED!");
+                                                                    info!("   Status: Landed on-chain");
+                                                                    info!("   Attempts: {}", attempt);
+
+                                                                    // دریافت اطلاعات نهایی
+                                                                    if let Ok(final_status) = jito_client.get_bundle_statuses(vec![bundle_id.clone()]).await {
+                                                                        info!("📋 Final Bundle Details:");
+                                                                        info!("{:#?}", final_status);
+                                                                    }
+                                                                    break;
+                                                                }
+                                                                "Failed" => {
+                                                                    error!("❌ BUNDLE FAILED!");
+                                                                    error!("   Status: Failed by Jito");
+                                                                    error!("   Details: {:?}", bundle_status);
+                                                                    stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                                                                    break;
+                                                                }
+                                                                "Invalid" => {
+                                                                    warn!("⚠️ BUNDLE INVALID");
+                                                                    warn!("   Bundle was marked as invalid by Jito");
+                                                                    stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                                                                    break;
+                                                                }
+                                                                "Pending" => {
+                                                                    debug!("⏳ Bundle pending... (attempt {}/30)", attempt);
+                                                                }
+                                                                _ => {
+                                                                    debug!("   Unknown status: {}", status_str);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("⚠️ Failed to check bundle status: {}", e);
+                                        }
+                                    }
+
+                                    if attempt == 30 {
+                                        warn!("⏱️ Bundle tracking timeout (60 seconds)");
+                                        warn!("   Bundle ID: {}", bundle_id);
+                                        warn!("   Check manually: https://explorer.jito.wtf/bundle/{}", bundle_id);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("❌ BUNDLE SEND FAILED!");
+                                error!("   Error: {}", e);
+                                error!("   Possible reasons:");
+                                error!("   - Tip too low (< 1000 lamports)");
+                                error!("   - Rate limit (429)");
+                                error!("   - Bundle too expensive");
+                                error!("   - Target transaction already confirmed");
+                                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                     } else {
                         error!("⚠️ BUNDLE SIMULATION FAILED");
                         error!("   One or more transactions failed in Jito simulation");

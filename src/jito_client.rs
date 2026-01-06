@@ -310,6 +310,9 @@ impl JitoClient {
         transactions: Vec<Transaction>,
         _victim_signature: Option<String>,
     ) -> Result<String> {
+        info!("📤 Sending bundle to Jito Block Engine...");
+        info!("   Bundle size: {} transactions", transactions.len());
+
         let encoded_txs: Vec<String> = transactions
             .iter()
             .map(|tx| {
@@ -318,10 +321,8 @@ impl JitoClient {
             })
             .collect();
 
-        // FIX: مشکل E0382 با ساخت مستقیم آرایه params
         let params_vec = vec![encoded_txs];
 
-        // توجه: برای متد sendBundle معمولاً پارامترها به صورت آرایه‌ای از آرایه رشته‌ها هستند: [ [tx1, tx2] ]
         let request_body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -330,25 +331,108 @@ impl JitoClient {
         });
 
         let url = format!("{}/api/v1/bundles", self.endpoints[0]);
+        debug!("   Endpoint: {}", url);
 
         let response = self.http_client
             .post(&url)
-            .json(&request_body) // استفاده از کل بادی به جای params
+            .json(&request_body)
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
-            .map_err(|e| anyhow!("HTTP error: {}", e))?;
+            .map_err(|e| {
+                error!("❌ Jito HTTP request failed: {}", e);
+                anyhow!("HTTP error: {}", e)
+            })?;
+
+        let status_code = response.status();
+
+        if !status_code.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            error!("❌ Jito rejected bundle!");
+            error!("   HTTP Status: {}", status_code);
+            error!("   Response: {}", error_text);
+
+            // پارس کردن خطاهای Jito
+            if status_code == 429 {
+                return Err(anyhow!("Jito Rate Limit (429): Too many requests"));
+            } else if status_code == 400 {
+                return Err(anyhow!("Jito Bad Request (400): {}", error_text));
+            }
+
+            return Err(anyhow!("Jito error {}: {}", status_code, error_text));
+        }
+
+        let response_text = response.text().await.unwrap_or_default();
+        debug!("   Response body: {}", response_text);
+
+        let result: SendBundleResponse = serde_json::from_str(&response_text)
+            .map_err(|e| {
+                error!("❌ Failed to parse Jito response: {}", e);
+                error!("   Raw response: {}", response_text);
+                anyhow!("Parse error: {}", e)
+            })?;
+
+        let bundle_id = result.result;
+        info!("✅ Bundle accepted by Jito!");
+        info!("   Bundle ID: {}", bundle_id);
+
+        Ok(bundle_id)
+    }
+
+    /// ✅ NEW: پیگیری real-time bundle status (برای bundle های در حال پردازش)
+    pub async fn get_inflight_bundle_statuses(&self, bundle_ids: Vec<String>) -> Result<serde_json::Value> {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getInflightBundleStatuses",
+            "params": [bundle_ids]
+        });
+
+        let url = format!("{}/api/v1/bundles", self.endpoints[0]);
+
+        let response = self.http_client
+            .post(&url)
+            .json(&request)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| anyhow!("Failed to get inflight status: {}", e))?;
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
             return Err(anyhow!("Jito error: {}", error_text));
         }
 
-        let response_text = response.text().await.unwrap_or_default();
-        let result: SendBundleResponse = serde_json::from_str(&response_text)
-            .map_err(|e| anyhow!("Parse error: {}", e))?;
+        let response_json: serde_json::Value = response.json().await?;
+        Ok(response_json)
+    }
 
-        Ok(result.result)
+    /// ✅ NEW: پیگیری bundle status (برای bundle های landed)
+    pub async fn get_bundle_statuses(&self, bundle_ids: Vec<String>) -> Result<serde_json::Value> {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBundleStatuses",
+            "params": [bundle_ids]
+        });
+
+        let url = format!("{}/api/v1/bundles", self.endpoints[0]);
+
+        let response = self.http_client
+            .post(&url)
+            .json(&request)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| anyhow!("Failed to get bundle status: {}", e))?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("Jito error: {}", error_text));
+        }
+
+        let response_json: serde_json::Value = response.json().await?;
+        Ok(response_json)
     }
 }
 
