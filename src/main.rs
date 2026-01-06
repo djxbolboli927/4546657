@@ -179,7 +179,11 @@ struct GlobalStats {
     skipped_no_creator: AtomicUsize,
     skipped_simulation_failed: AtomicUsize,
     skipped_unprofitable: AtomicUsize,
-    skipped_non_europe_leader: AtomicUsize, // ✅ تعداد تراکنش‌هایی که به دلیل leader غیراروپایی رد شدند
+    skipped_non_europe_leader: AtomicUsize,
+    // ✅ آمار دقیق دلایل فیلتر شدن bundle ها
+    skipped_missing_token_program: AtomicUsize,
+    skipped_alt_conversion: AtomicUsize,
+    skipped_blockhash_failed: AtomicUsize,
 }
 
 impl GlobalStats {
@@ -201,6 +205,9 @@ impl GlobalStats {
             skipped_simulation_failed: AtomicUsize::new(0),
             skipped_unprofitable: AtomicUsize::new(0),
             skipped_non_europe_leader: AtomicUsize::new(0),
+            skipped_missing_token_program: AtomicUsize::new(0),
+            skipped_alt_conversion: AtomicUsize::new(0),
+            skipped_blockhash_failed: AtomicUsize::new(0),
         }
     }
 }
@@ -348,6 +355,9 @@ fn print_statistics(stats: &GlobalStats) {
     let skipped_simulation_failed = stats.skipped_simulation_failed.load(Ordering::Relaxed);
     let skipped_unprofitable = stats.skipped_unprofitable.load(Ordering::Relaxed);
     let skipped_non_europe_leader = stats.skipped_non_europe_leader.load(Ordering::Relaxed);
+    let skipped_missing_token_program = stats.skipped_missing_token_program.load(Ordering::Relaxed);
+    let skipped_alt_conversion = stats.skipped_alt_conversion.load(Ordering::Relaxed);
+    let skipped_blockhash_failed = stats.skipped_blockhash_failed.load(Ordering::Relaxed);
 
     let total_skipped = skipped_no_pool + skipped_low_sol + skipped_same_block
         + skipped_no_creator + skipped_simulation_failed + skipped_unprofitable + skipped_non_europe_leader;
@@ -372,11 +382,17 @@ fn print_statistics(stats: &GlobalStats) {
     info!("📈 TRANSACTION PROCESSING:");
     info!("   Total Processed: {} ({} tx/min)", total_tx, tx_per_min);
     info!("   ✅ Profitable (Local Calc): {}", profitable);
-    info!("   ⏭️  Skipped: {} (Non-EU Leader: {})", total_skipped, skipped_non_europe_leader);
+    info!("   ⏭️  Skipped: {}", total_skipped);
     info!("📦 JITO BUNDLE SIMULATION:");
     info!("   ✅ Sent to Simulation: {}", bundles_sent);
     info!("   ❌ Simulation Errors: {}", bundles_failed);
     info!("   📊 Request Success Rate: {:.1}%", success_rate);
+    info!("🔍 BUNDLE SKIP BREAKDOWN:");
+    info!("   🌍 Non-EU Leader: {}", skipped_non_europe_leader);
+    info!("   🔧 Missing Token Program: {}", skipped_missing_token_program);
+    info!("   📊 ALT Conversion Failed: {}", skipped_alt_conversion);
+    info!("   ⏱️  Blockhash Fetch Failed: {}", skipped_blockhash_failed);
+    info!("   📦 Other Build Errors: {}", bundles_failed - skipped_missing_token_program - skipped_alt_conversion - skipped_blockhash_failed);
     info!("💰 POTENTIAL PROFIT (If Executed): {:.6} SOL", profit_sol);
     info!("═══════════════════════════════════════════════════════════");
 }
@@ -581,6 +597,7 @@ async fn unified_worker_thread(
             Ok(bh) => bh,
             Err(e) => {
                 debug!("⏭️  Skipped: Blockhash fetch failed: {}", e);
+                stats.skipped_blockhash_failed.fetch_add(1, Ordering::Relaxed);
                 stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -606,6 +623,7 @@ async fn unified_worker_thread(
             Some(tp) => tp,
             None => {
                 debug!("⏭️  Skipped: Missing token_program_id");
+                stats.skipped_missing_token_program.fetch_add(1, Ordering::Relaxed);
                 stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -663,6 +681,7 @@ async fn unified_worker_thread(
             Some(tx) => tx,
             None => {
                 debug!("⏭️  Skipped: Cannot convert versioned tx to legacy (uses address lookup tables)");
+                stats.skipped_alt_conversion.fetch_add(1, Ordering::Relaxed);
                 stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
