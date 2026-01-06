@@ -13,7 +13,7 @@ use solana_sdk::{
 };
 
 use crate::pumpfun_instructions::{
-    create_buy_instruction, create_sell_instruction, derive_bonding_curve,
+    create_buy_instruction, create_sell_instruction,
 };
 use crate::spl_utils::{
     get_associated_token_address_with_program_id,
@@ -37,55 +37,37 @@ impl TransactionBuilder {
         }
     }
 
-    /// ساخت تراکنش خرید (Front-Run) با ۱۶ اکانت
-    #[allow(clippy::too_many_arguments)]
     pub async fn build_front_run_transaction(
         &self,
         buyer: &Keypair,
         mint: &Pubkey,
-        creator_vault: &Pubkey, // ✅ ورودی حیاتی
+        bonding_curve: &Pubkey,
+        creator_vault: &Pubkey,
         token_amount: u64,
         max_sol_cost: u64,
         priority_fee_microlamports: u64,
         recent_blockhash: Hash,
         token_program_type: TokenProgramType,
+        fee_recipient: &Pubkey,
+        bonding_curve_token_account: &Pubkey,
         token_program_id: &Pubkey,
     ) -> Result<Transaction> {
-
-        // محاسبه آدرس‌ها (PDAs) به صورت محلی برای اطمینان
-        let bonding_curve = derive_bonding_curve(mint);
-
-        let bonding_curve_token_account = get_associated_token_address_with_program_id(
-            &bonding_curve,
-            mint,
-            token_program_id,
-        );
-
         let user_token_account = get_associated_token_address_with_program_id(
             &buyer.pubkey(),
             mint,
             token_program_id,
         );
 
-        // لاگ برای دیباگ
-        let _token_program_name = match token_program_type {
-            TokenProgramType::Token2022Program => "Token-2022",
-            TokenProgramType::TokenProgram => "Token Program",
-        };
-
         let mut instructions = Vec::new();
 
-        // 1. لیمیت
         instructions.push(
-            ComputeBudgetInstruction::set_compute_unit_limit(250_000)
+            ComputeBudgetInstruction::set_compute_unit_limit(200_000)
         );
 
-        // 2. کارمزد اولویت
         instructions.push(
             ComputeBudgetInstruction::set_compute_unit_price(priority_fee_microlamports)
         );
 
-        // 3. ساخت ATA
         let create_ata_ix = create_associated_token_account_with_program_id(
             &buyer.pubkey(),
             &buyer.pubkey(),
@@ -94,18 +76,19 @@ impl TransactionBuilder {
         );
         instructions.push(create_ata_ix);
 
-        // 4. دستور خرید (با ۱۶ اکانت و Creator Vault)
         instructions.push(
             create_buy_instruction(
                 &buyer.pubkey(),
                 mint,
-                &bonding_curve,
-                &bonding_curve_token_account,
+                bonding_curve,
+                creator_vault,
                 &user_token_account,
                 token_amount,
                 max_sol_cost,
+                token_program_type,
+                fee_recipient,
+                bonding_curve_token_account,
                 token_program_id,
-                creator_vault, // ✅ ارسال به جایگاه ۱۰
             )?
         );
 
@@ -121,12 +104,11 @@ impl TransactionBuilder {
         Ok(transaction)
     }
 
-    /// ساخت تراکنش فروش (Back-Run)
-    #[allow(clippy::too_many_arguments)]
     pub async fn build_back_run_transaction(
         &self,
         seller: &Keypair,
         mint: &Pubkey,
+        bonding_curve: &Pubkey,
         creator_vault: &Pubkey,
         token_amount: u64,
         min_sol_output: u64,
@@ -134,15 +116,11 @@ impl TransactionBuilder {
         jito_tip_lamports: u64,
         jito_tip_account: &Pubkey,
         recent_blockhash: Hash,
-        _token_program_type: TokenProgramType,
+        token_program_type: TokenProgramType,
+        fee_recipient: &Pubkey,
+        bonding_curve_token_account: &Pubkey,
         token_program_id: &Pubkey,
     ) -> Result<Transaction> {
-        let bonding_curve = derive_bonding_curve(mint);
-        let bonding_curve_token_account = get_associated_token_address_with_program_id(
-            &bonding_curve,
-            mint,
-            token_program_id,
-        );
         let user_token_account = get_associated_token_address_with_program_id(
             &seller.pubkey(),
             mint,
@@ -163,13 +141,15 @@ impl TransactionBuilder {
             create_sell_instruction(
                 &seller.pubkey(),
                 mint,
-                &bonding_curve,
-                &bonding_curve_token_account,
+                bonding_curve,
+                creator_vault,
                 &user_token_account,
                 token_amount,
                 min_sol_output,
+                token_program_type,
+                fee_recipient,
+                bonding_curve_token_account,
                 token_program_id,
-                creator_vault,
             )?
         );
 

@@ -2,10 +2,14 @@ use anyhow::Result;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
-    // system_program, // REMOVED to fix deprecated warning
-    sysvar,
+    system_program,
 };
 use std::str::FromStr;
+use crate::spl_utils::{
+    get_associated_token_address_with_program_id,
+    TOKEN_PROGRAM_ID,
+    TOKEN_2022_PROGRAM_ID,
+};
 use crate::jito_client::TokenProgramType;
 
 pub const PUMP_FUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
@@ -21,7 +25,7 @@ pub const SELL_DISCRIMINATOR: [u8; 8] = [0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x8
 
 pub fn derive_user_volume_accumulator(user: &Pubkey) -> Pubkey {
     let program_id = Pubkey::from_str(PUMP_FUN_PROGRAM).unwrap();
-    let seeds = &[b"user_volume_accumulator", user.as_ref()];
+    let seeds = &[b"user", user.as_ref()];
     Pubkey::find_program_address(seeds, &program_id).0
 }
 
@@ -35,35 +39,34 @@ pub fn create_buy_instruction(
     buyer: &Pubkey,
     mint: &Pubkey,
     bonding_curve: &Pubkey,
-    bonding_curve_token_account: &Pubkey,
+    creator_vault: &Pubkey,
     user_token_account: &Pubkey,
     token_amount: u64,
     max_sol_cost: u64,
+    token_program_type: TokenProgramType,
+    fee_recipient: &Pubkey,
+    bonding_curve_token_account: &Pubkey,
     token_program_id: &Pubkey,
-    creator_vault: &Pubkey,
 ) -> Result<Instruction> {
+    let user_volume_accumulator = derive_user_volume_accumulator(buyer);
     let global_config = Pubkey::from_str(GLOBAL_CONFIG)?;
-    let fee_recipient = Pubkey::from_str(FEE_RECIPIENT)?;
     let event_authority = Pubkey::from_str(EVENT_AUTHORITY)?;
     let program_id = Pubkey::from_str(PUMP_FUN_PROGRAM)?;
     let global_volume = Pubkey::from_str(GLOBAL_VOLUME_ACCUMULATOR)?;
     let fee_config = Pubkey::from_str(FEE_CONFIG)?;
     let fee_program = Pubkey::from_str(FEE_PROGRAM)?;
 
-    let user_volume_accumulator = derive_user_volume_accumulator(buyer);
-
     let accounts = vec![
         AccountMeta::new_readonly(global_config, false),
-        AccountMeta::new(fee_recipient, false),
+        AccountMeta::new(*fee_recipient, false),
         AccountMeta::new_readonly(*mint, false),
         AccountMeta::new(*bonding_curve, false),
         AccountMeta::new(*bonding_curve_token_account, false),
         AccountMeta::new(*user_token_account, false),
         AccountMeta::new(*buyer, true),
-        // FIXED: Use solana_sdk::system_program::id() explicitly
-        AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        AccountMeta::new_readonly(system_program::ID, false),
         AccountMeta::new_readonly(*token_program_id, false),
-        AccountMeta::new(*creator_vault, false), // Account 10: Creator Vault
+        AccountMeta::new(*creator_vault, false),
         AccountMeta::new_readonly(event_authority, false),
         AccountMeta::new_readonly(program_id, false),
         AccountMeta::new(global_volume, false),
@@ -88,39 +91,34 @@ pub fn create_sell_instruction(
     seller: &Pubkey,
     mint: &Pubkey,
     bonding_curve: &Pubkey,
-    bonding_curve_token_account: &Pubkey,
+    creator_vault: &Pubkey,
     user_token_account: &Pubkey,
     token_amount: u64,
     min_sol_output: u64,
+    token_program_type: TokenProgramType,
+    fee_recipient: &Pubkey,
+    bonding_curve_token_account: &Pubkey,
     token_program_id: &Pubkey,
-    creator_vault: &Pubkey,
 ) -> Result<Instruction> {
     let global_config = Pubkey::from_str(GLOBAL_CONFIG)?;
-    let fee_recipient = Pubkey::from_str(FEE_RECIPIENT)?;
     let event_authority = Pubkey::from_str(EVENT_AUTHORITY)?;
     let program_id = Pubkey::from_str(PUMP_FUN_PROGRAM)?;
-    let global_volume = Pubkey::from_str(GLOBAL_VOLUME_ACCUMULATOR)?;
     let fee_config = Pubkey::from_str(FEE_CONFIG)?;
     let fee_program = Pubkey::from_str(FEE_PROGRAM)?;
 
-    let user_volume_accumulator = derive_user_volume_accumulator(seller);
-
     let accounts = vec![
         AccountMeta::new_readonly(global_config, false),
-        AccountMeta::new(fee_recipient, false),
+        AccountMeta::new(*fee_recipient, false),
         AccountMeta::new_readonly(*mint, false),
         AccountMeta::new(*bonding_curve, false),
         AccountMeta::new(*bonding_curve_token_account, false),
         AccountMeta::new(*user_token_account, false),
         AccountMeta::new(*seller, true),
-        // FIXED: Use solana_sdk::system_program::id() explicitly
-        AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
-        AccountMeta::new_readonly(*token_program_id, false),
+        AccountMeta::new_readonly(system_program::ID, false),
         AccountMeta::new(*creator_vault, false),
+        AccountMeta::new_readonly(*token_program_id, false),
         AccountMeta::new_readonly(event_authority, false),
         AccountMeta::new_readonly(program_id, false),
-        AccountMeta::new(global_volume, false),
-        AccountMeta::new(user_volume_accumulator, false),
         AccountMeta::new_readonly(fee_config, false),
         AccountMeta::new_readonly(fee_program, false),
     ];

@@ -179,11 +179,7 @@ struct GlobalStats {
     skipped_no_creator: AtomicUsize,
     skipped_simulation_failed: AtomicUsize,
     skipped_unprofitable: AtomicUsize,
-    skipped_non_europe_leader: AtomicUsize,
-    // ✅ آمار دقیق دلایل فیلتر شدن bundle ها
-    skipped_missing_token_program: AtomicUsize,
-    skipped_alt_conversion: AtomicUsize,
-    skipped_blockhash_failed: AtomicUsize,
+    skipped_non_europe_leader: AtomicUsize, // ✅ تعداد تراکنش‌هایی که به دلیل leader غیراروپایی رد شدند
 }
 
 impl GlobalStats {
@@ -205,9 +201,6 @@ impl GlobalStats {
             skipped_simulation_failed: AtomicUsize::new(0),
             skipped_unprofitable: AtomicUsize::new(0),
             skipped_non_europe_leader: AtomicUsize::new(0),
-            skipped_missing_token_program: AtomicUsize::new(0),
-            skipped_alt_conversion: AtomicUsize::new(0),
-            skipped_blockhash_failed: AtomicUsize::new(0),
         }
     }
 }
@@ -355,9 +348,6 @@ fn print_statistics(stats: &GlobalStats) {
     let skipped_simulation_failed = stats.skipped_simulation_failed.load(Ordering::Relaxed);
     let skipped_unprofitable = stats.skipped_unprofitable.load(Ordering::Relaxed);
     let skipped_non_europe_leader = stats.skipped_non_europe_leader.load(Ordering::Relaxed);
-    let skipped_missing_token_program = stats.skipped_missing_token_program.load(Ordering::Relaxed);
-    let skipped_alt_conversion = stats.skipped_alt_conversion.load(Ordering::Relaxed);
-    let skipped_blockhash_failed = stats.skipped_blockhash_failed.load(Ordering::Relaxed);
 
     let total_skipped = skipped_no_pool + skipped_low_sol + skipped_same_block
         + skipped_no_creator + skipped_simulation_failed + skipped_unprofitable + skipped_non_europe_leader;
@@ -382,17 +372,11 @@ fn print_statistics(stats: &GlobalStats) {
     info!("📈 TRANSACTION PROCESSING:");
     info!("   Total Processed: {} ({} tx/min)", total_tx, tx_per_min);
     info!("   ✅ Profitable (Local Calc): {}", profitable);
-    info!("   ⏭️  Skipped: {}", total_skipped);
+    info!("   ⏭️  Skipped: {} (Non-EU Leader: {})", total_skipped, skipped_non_europe_leader);
     info!("📦 JITO BUNDLE SIMULATION:");
     info!("   ✅ Sent to Simulation: {}", bundles_sent);
     info!("   ❌ Simulation Errors: {}", bundles_failed);
     info!("   📊 Request Success Rate: {:.1}%", success_rate);
-    info!("🔍 BUNDLE SKIP BREAKDOWN:");
-    info!("   🌍 Non-EU Leader: {}", skipped_non_europe_leader);
-    info!("   🔧 Missing Token Program: {}", skipped_missing_token_program);
-    info!("   📊 ALT Conversion Failed: {}", skipped_alt_conversion);
-    info!("   ⏱️  Blockhash Fetch Failed: {}", skipped_blockhash_failed);
-    info!("   📦 Other Build Errors: {}", bundles_failed - skipped_missing_token_program - skipped_alt_conversion - skipped_blockhash_failed);
     info!("💰 POTENTIAL PROFIT (If Executed): {:.6} SOL", profit_sol);
     info!("═══════════════════════════════════════════════════════════");
 }
@@ -576,9 +560,6 @@ async fn unified_worker_thread(
         // ✅ تراکنش سودده است
         stats.profitable_count.fetch_add(1, Ordering::Relaxed);
 
-        // ✅ نمایش جزئیات کامل شبیه‌سازی سودآوری
-        print_simulation_result(&simulation, worker_id, true);
-
         // ═══════════════════════════════════════════════════════════
         // 🏗️ BUILD COMPLETE BUNDLE (Front + Victim + Back)
         // ═══════════════════════════════════════════════════════════
@@ -597,7 +578,6 @@ async fn unified_worker_thread(
             Ok(bh) => bh,
             Err(e) => {
                 debug!("⏭️  Skipped: Blockhash fetch failed: {}", e);
-                stats.skipped_blockhash_failed.fetch_add(1, Ordering::Relaxed);
                 stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -619,8 +599,14 @@ async fn unified_worker_thread(
             }
         };
 
-        // ✅ token_program_id is now always Some(...) due to fallback strategy
-        let token_program_id_str = tx_info.token_program_id.as_ref().unwrap();
+        let token_program_id_str = match &tx_info.token_program_id {
+            Some(tp) => tp,
+            None => {
+                debug!("⏭️  Skipped: Missing token_program_id");
+                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
 
         let token_program_type = if token_program_id_str == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" {
             TokenProgramType::Token2022Program
@@ -639,16 +625,58 @@ async fn unified_worker_thread(
 
         let safe_front_run_sol = (simulation.front_run_sol as f64 * 1.70) as u64;
 
+        // Derive bonding curve from mint
+        let bonding_curve = derive_bonding_curve(&mint);
+
+        // Extract fee_recipient
+        let fee_recipient_str = match &tx_info.fee_recipient {
+            Some(fr) => fr,
+            None => {
+                debug!("⏭️  Skipped: Missing fee_recipient");
+                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+        let fee_recipient = match Pubkey::from_str(fee_recipient_str) {
+            Ok(pk) => pk,
+            Err(e) => {
+                debug!("⏭️  Skipped: Invalid fee_recipient pubkey: {}", e);
+                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+
+        // Extract bonding_curve_token_account
+        let bonding_curve_token_account_str = match &tx_info.bonding_curve_token_account {
+            Some(bcta) => bcta,
+            None => {
+                debug!("⏭️  Skipped: Missing bonding_curve_token_account");
+                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+        let bonding_curve_token_account = match Pubkey::from_str(bonding_curve_token_account_str) {
+            Ok(pk) => pk,
+            Err(e) => {
+                debug!("⏭️  Skipped: Invalid bonding_curve_token_account pubkey: {}", e);
+                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+
         // Build Front-Run Transaction
         let front_tx = match tx_builder.build_front_run_transaction(
             &wallet_manager.front_runner,
             &mint,
+            &bonding_curve,
             &creator_vault,
             simulation.front_run_tokens,
             safe_front_run_sol,
             50_000,
             blockhash,
             token_program_type,
+            &fee_recipient,
+            &bonding_curve_token_account,
             &token_program_id_pubkey,
         ).await {
             Ok(tx) => tx,
@@ -659,29 +687,8 @@ async fn unified_worker_thread(
             }
         };
 
-        // Deserialize Victim Transaction (VersionedTransaction!)
-        let victim_versioned_tx = match bincode::deserialize::<VersionedTransaction>(&tx_info.raw_transaction) {
-            Ok(tx) => tx,
-            Err(e) => {
-                debug!("⏭️  Skipped: Failed to deserialize victim tx: {}", e);
-                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-        };
-
-        // Convert VersionedTransaction to legacy Transaction for bundle
-        let victim_tx = match victim_versioned_tx.into_legacy_transaction() {
-            Some(tx) => tx,
-            None => {
-                debug!("⏭️  Skipped: Cannot convert versioned tx to legacy (uses address lookup tables)");
-                stats.skipped_alt_conversion.fetch_add(1, Ordering::Relaxed);
-                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-        };
-
         // Build Back-Run Transaction
-        let jito_tip_account = match Pubkey::from_str(&jito_client.get_tip_account_str()) {
+        let jito_tip_account = match Pubkey::from_str(&jito_client.get_tip_account()) {
             Ok(pk) => pk,
             Err(e) => {
                 debug!("⏭️  Skipped: Invalid jito_tip_account pubkey: {}", e);
@@ -693,6 +700,7 @@ async fn unified_worker_thread(
         let back_tx = match tx_builder.build_back_run_transaction(
             &wallet_manager.front_runner,
             &mint,
+            &bonding_curve,
             &creator_vault,
             simulation.front_run_tokens,
             0, // min_sol_output
@@ -701,6 +709,8 @@ async fn unified_worker_thread(
             &jito_tip_account,
             blockhash,
             token_program_type,
+            &fee_recipient,
+            &bonding_curve_token_account,
             &token_program_id_pubkey,
         ).await {
             Ok(tx) => tx,
@@ -712,178 +722,112 @@ async fn unified_worker_thread(
         };
 
         // ═══════════════════════════════════════════════════════════
-        // 🔬 SEND BUNDLE TO JITO FOR SIMULATION (SANITY CHECK)
+        // 🔬 SEND BUNDLE TO JITO (REAL SUBMISSION + TRACKING)
         // ═══════════════════════════════════════════════════════════
 
-        if ENABLE_BUNDLE_SIMULATION {
-            // ✅ چک کنید: آیا leader بعدی در اروپا است؟
-            if ENABLE_LEADER_FILTERING {
-                // باندل ما معمولا در slot + 2 تا 5 اجرا می‌شود
-                let target_slot = tx_info.slot + 2;
+        // ✅ چک کنید: آیا leader بعدی در اروپا است؟
+        if ENABLE_LEADER_FILTERING {
+            let target_slot = tx_info.slot + 2;
 
-                if !leader_slot_client.is_leader_in_region(target_slot, &ALLOWED_REGIONS).await {
+            // Check if optimal slot (Europe region)
+            match leader_slot_client.is_optimal_slot(target_slot, "europe").await {
+                Ok(true) => {
+                    debug!("✅ European leader found in next slots");
+                }
+                Ok(false) => {
                     debug!("⏭️  Skipped: No European leader in next slots from {}", target_slot);
                     stats.skipped_non_europe_leader.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
+                Err(e) => {
+                    debug!("⚠️ Leader check failed: {}", e);
+                    // Continue anyway to avoid blocking on API errors
+                }
             }
+        }
 
-            let bundle = vec![front_tx, victim_tx, back_tx];
+        // ✅ BUILD BUNDLE: فقط Front-Run و Back-Run (بدون Victim!)
+        // Victim transaction ALT دارد و نمی‌تواند در bundle Jito قرار بگیرد
+        let bundle = vec![front_tx, back_tx];
 
-            info!("═══════════════════════════════════════════════════════════");
-            info!("📤 SENDING BUNDLE TO JITO");
-            info!("   Victim Signature: ...{}", &tx_info.signature[tx_info.signature.len()-8..]);
-            info!("   Worker: {}", worker_id);
-            info!("   Expected Profit: {:.6} SOL", simulation.net_profit as f64 / LAMPORTS_PER_SOL as f64);
-            info!("═══════════════════════════════════════════════════════════");
+        debug!("✅ Bundle built successfully (2 transactions)");
+        debug!("   Front-Run + Back-Run (victim excluded due to ALT)");
+        info!("📤 Sending bundle to Jito...");
 
-            match jito_client.simulate_bundle(bundle.clone()).await {
-                Ok(sim_result) => {
-                    info!("✅ JITO RESPONSE RECEIVED");
-                    let mut all_passed = true;
+        // ✅ ارسال مستقیم bundle واقعی به Jito
+        match jito_client.send_bundle_with_victim(
+            bundle,
+            Some(tx_info.signature.clone()),
+        ).await {
+            Ok(bundle_id) => {
+                info!("✅ BUNDLE SENT!");
+                info!("   Bundle ID: {}", bundle_id);
+                info!("   Expected Profit: {:.6} SOL", simulation.net_profit as f64 / LAMPORTS_PER_SOL as f64);
+                info!("   🔗 Track: https://explorer.jito.wtf/bundle/{}", bundle_id);
 
-                    // بررسی تک تک تراکنش‌ها
-                    for (i, tx_res) in sim_result.transaction_results.iter().enumerate() {
-                        let tx_name = match i {
-                            0 => "Front-Run",
-                            1 => "Victim",
-                            2 => "Back-Run",
-                            _ => "Unknown",
-                        };
+                stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
+                stats.total_profit_lamports.fetch_add(simulation.net_profit as u64, Ordering::Relaxed);
 
-                        if let Some(err) = &tx_res.err {
-                            all_passed = false;
-                            error!("❌ TX #{} ({}) FAILED!", i, tx_name);
-                            error!("   Error: {:?}", err);
+                // ✅ Real-time bundle tracking
+                info!("📊 Tracking bundle...");
 
-                            if let Some(logs) = &tx_res.logs {
-                                error!("   Logs:");
-                                for log in logs {
-                                    error!("      {}", log);
-                                }
-                            }
-                        } else {
-                            info!("✅ TX #{} ({}) SUCCESS", i, tx_name);
-                            if let Some(logs) = &tx_res.logs {
-                                debug!("   Logs:");
-                                for log in logs {
-                                    debug!("      {}", log);
-                                }
-                            }
-                        }
-                    }
+                for attempt in 1..=30 {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-                    if all_passed {
-                        info!("🎉 BUNDLE SIMULATION SUCCESSFUL!");
-                        info!("   All 3 transactions passed Jito simulation");
-                        info!("   Now sending REAL bundle to Jito...");
-                        info!("═══════════════════════════════════════════════════════════");
+                    match jito_client.get_inflight_bundle_statuses(vec![bundle_id.clone()]).await {
+                        Ok(status_response) => {
+                            if let Some(value) = status_response.get("result").and_then(|r| r.get("value")) {
+                                if let Some(statuses) = value.as_array() {
+                                    if let Some(bundle_status) = statuses.first() {
+                                        if let Some(status) = bundle_status.get("status") {
+                                            let status_str = status.as_str().unwrap_or("Unknown");
 
-                        // ✅ ارسال bundle واقعی به Jito
-                        match jito_client.send_bundle_with_victim(
-                            bundle,
-                            Some(tx_info.signature.clone()),
-                        ).await {
-                            Ok(bundle_id) => {
-                                info!("✅ BUNDLE SENT SUCCESSFULLY!");
-                                info!("   Bundle ID: {}", bundle_id);
-                                info!("   Expected Profit: {:.6} SOL", simulation.net_profit as f64 / LAMPORTS_PER_SOL as f64);
-                                info!("   🔗 Track: https://explorer.jito.wtf/bundle/{}", bundle_id);
-
-                                stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
-                                stats.total_profit_lamports.fetch_add(simulation.net_profit as u64, Ordering::Relaxed);
-
-                                // ✅ پیگیری real-time bundle status
-                                info!("📊 Tracking bundle status...");
-
-                                for attempt in 1..=30 {
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-                                    match jito_client.get_inflight_bundle_statuses(vec![bundle_id.clone()]).await {
-                                        Ok(status_response) => {
-                                            if let Some(value) = status_response.get("result").and_then(|r| r.get("value")) {
-                                                if let Some(statuses) = value.as_array() {
-                                                    if let Some(bundle_status) = statuses.first() {
-                                                        if let Some(status) = bundle_status.get("status") {
-                                                            let status_str = status.as_str().unwrap_or("Unknown");
-
-                                                            match status_str {
-                                                                "Landed" => {
-                                                                    info!("🎉 BUNDLE LANDED!");
-                                                                    info!("   Status: Landed on-chain");
-                                                                    info!("   Attempts: {}", attempt);
-
-                                                                    // دریافت اطلاعات نهایی
-                                                                    if let Ok(final_status) = jito_client.get_bundle_statuses(vec![bundle_id.clone()]).await {
-                                                                        info!("📋 Final Bundle Details:");
-                                                                        info!("{:#?}", final_status);
-                                                                    }
-                                                                    break;
-                                                                }
-                                                                "Failed" => {
-                                                                    error!("❌ BUNDLE FAILED!");
-                                                                    error!("   Status: Failed by Jito");
-                                                                    error!("   Details: {:?}", bundle_status);
-                                                                    stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
-                                                                    break;
-                                                                }
-                                                                "Invalid" => {
-                                                                    warn!("⚠️ BUNDLE INVALID");
-                                                                    warn!("   Bundle was marked as invalid by Jito");
-                                                                    stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
-                                                                    break;
-                                                                }
-                                                                "Pending" => {
-                                                                    debug!("⏳ Bundle pending... (attempt {}/30)", attempt);
-                                                                }
-                                                                _ => {
-                                                                    debug!("   Unknown status: {}", status_str);
-                                                                }
-                                                            }
-                                                        }
+                                            match status_str {
+                                                "Landed" => {
+                                                    info!("🎉 BUNDLE LANDED!");
+                                                    if let Ok(final_status) = jito_client.get_bundle_statuses(vec![bundle_id.clone()]).await {
+                                                        info!("📋 Final Status: {:#?}", final_status);
                                                     }
+                                                    break;
                                                 }
+                                                "Failed" => {
+                                                    error!("❌ BUNDLE FAILED!");
+                                                    error!("   Details: {:?}", bundle_status);
+                                                    stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                                                    break;
+                                                }
+                                                "Invalid" => {
+                                                    warn!("⚠️ BUNDLE INVALID");
+                                                    stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                                                    break;
+                                                }
+                                                "Pending" => {
+                                                    debug!("⏳ Pending... ({}/30)", attempt);
+                                                }
+                                                _ => {}
                                             }
                                         }
-                                        Err(e) => {
-                                            warn!("⚠️ Failed to check bundle status: {}", e);
-                                        }
-                                    }
-
-                                    if attempt == 30 {
-                                        warn!("⏱️ Bundle tracking timeout (60 seconds)");
-                                        warn!("   Bundle ID: {}", bundle_id);
-                                        warn!("   Check manually: https://explorer.jito.wtf/bundle/{}", bundle_id);
                                     }
                                 }
                             }
-                            Err(e) => {
-                                error!("❌ BUNDLE SEND FAILED!");
-                                error!("   Error: {}", e);
-                                error!("   Possible reasons:");
-                                error!("   - Tip too low (< 1000 lamports)");
-                                error!("   - Rate limit (429)");
-                                error!("   - Bundle too expensive");
-                                error!("   - Target transaction already confirmed");
-                                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
-                            }
                         }
-                    } else {
-                        error!("⚠️ BUNDLE SIMULATION FAILED");
-                        error!("   One or more transactions failed in Jito simulation");
-                        error!("   Do not send this bundle to mainnet");
-                        stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                        Err(e) => warn!("⚠️ Status check failed: {}", e),
+                    }
+
+                    if attempt == 30 {
+                        warn!("⏱️ Tracking timeout");
                     }
                 }
-                Err(e) => {
-                    error!("❌ JITO SIMULATION REQUEST FAILED");
-                    error!("   Victim Signature: ...{}", &tx_info.signature[tx_info.signature.len()-8..]);
-                    error!("   Error Type: Network/Format/API Error");
-                    error!("   Error Details: {}", e);
-                    stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
-                }
             }
-            info!("═══════════════════════════════════════════════════════════");
+            Err(e) => {
+                error!("❌ BUNDLE SEND FAILED!");
+                error!("   Error: {}", e);
+                error!("   Possible reasons:");
+                error!("   - Tip too low");
+                error!("   - Rate limit (429)");
+                error!("   - Target tx already confirmed");
+                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
     info!("Worker {} stopped", worker_id);
@@ -961,37 +905,7 @@ fn extract_transaction_info(tx: VersionedTransaction, pump_fun_program_id: &Pubk
                         let fee_recipient = instruction.accounts.get(1).and_then(|&idx| account_keys.get(idx as usize)).map(|pk| pk.to_string());
                         let bonding_curve = instruction.accounts.get(3).and_then(|&idx| account_keys.get(idx as usize)).map(|pk| pk.to_string());
                         let bonding_curve_token_account = instruction.accounts.get(4).and_then(|&idx| account_keys.get(idx as usize)).map(|pk| pk.to_string());
-
-                        // ✅ Robust token_program_id extraction with fallback
-                        let token_program_id = {
-                            // Known Token Program IDs on Solana
-                            const STANDARD_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-                            const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-
-                            // Strategy 1: Try index 8 (common location for Pump.fun)
-                            if let Some(token_prog) = instruction.accounts.get(8)
-                                .and_then(|&idx| account_keys.get(idx as usize))
-                                .map(|pk| pk.to_string()) {
-                                Some(token_prog)
-                            }
-                            // Strategy 2: Search through all accounts for known Token Program IDs
-                            else {
-                                let found_token_program = instruction.accounts.iter()
-                                    .filter_map(|&idx| account_keys.get(idx as usize))
-                                    .find(|pk| {
-                                        let pk_str = pk.to_string();
-                                        pk_str == STANDARD_TOKEN_PROGRAM || pk_str == TOKEN_2022_PROGRAM
-                                    })
-                                    .map(|pk| pk.to_string());
-
-                                // Strategy 3: Default to Standard Token Program (99% of Pump.fun uses this)
-                                if found_token_program.is_none() {
-                                    debug!("⚠️ Token Program not found in accounts, defaulting to Standard Token Program");
-                                }
-                                Some(found_token_program.unwrap_or_else(|| STANDARD_TOKEN_PROGRAM.to_string()))
-                            }
-                        };
-
+                        let token_program_id = instruction.accounts.get(8).and_then(|&idx| account_keys.get(idx as usize)).map(|pk| pk.to_string());
                         let creator_vault = instruction.accounts.get(9).and_then(|&idx| account_keys.get(idx as usize)).map(|pk| pk.to_string());
                         let priority_fee = get_priority_fee(&tx);
 
