@@ -85,11 +85,8 @@ const PUMP_FUN_DISCRIMINATOR: [u8; 8] = [0x17, 0xb7, 0xf8, 0x37, 0x60, 0xd8, 0xa
 const CLEANUP_INTERVAL_SECS: u64 = 300;
 const MAX_ACTIVITY_AGE_SECS: u64 = 600;
 
-const ENABLE_BUNDLE_SIMULATION: bool = true;
-
-// ✅ Leader Slot Configuration: فقط به لیدرهای اروپایی ارسال کن
 const ENABLE_LEADER_FILTERING: bool = true;
-const ALLOWED_REGIONS: [&str; 4] = ["frankfurt", "germany", "amsterdam", "europe"]; // مناطق مجاز
+const TARGET_REGION: &str = "europe";
 
 // ═══════════════════════════════════════════════════════════════
 // DATA STRUCTURES
@@ -130,7 +127,6 @@ struct ShredsData {
     entries_raw: Vec<u8>,
 }
 
-// ✅ اضافه شده: raw_transaction برای ذخیره تراکنش کامل victim
 #[derive(Debug, Clone)]
 struct TransactionInfo {
     buyer: String,
@@ -146,7 +142,7 @@ struct TransactionInfo {
     fee_recipient: Option<String>,
     bonding_curve_token_account: Option<String>,
     token_program_id: Option<String>,
-    raw_transaction: Vec<u8>, // ✅ Serialized victim transaction
+    raw_transaction: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,9 +173,9 @@ struct GlobalStats {
     skipped_low_sol: AtomicUsize,
     skipped_same_block: AtomicUsize,
     skipped_no_creator: AtomicUsize,
+    skipped_target_confirmed: AtomicUsize,
     skipped_simulation_failed: AtomicUsize,
-    skipped_unprofitable: AtomicUsize,
-    skipped_non_europe_leader: AtomicUsize, // ✅ تعداد تراکنش‌هایی که به دلیل leader غیراروپایی رد شدند
+    skipped_non_europe_leader: AtomicUsize,
 }
 
 impl GlobalStats {
@@ -198,8 +194,8 @@ impl GlobalStats {
             skipped_low_sol: AtomicUsize::new(0),
             skipped_same_block: AtomicUsize::new(0),
             skipped_no_creator: AtomicUsize::new(0),
+            skipped_target_confirmed: AtomicUsize::new(0),
             skipped_simulation_failed: AtomicUsize::new(0),
-            skipped_unprofitable: AtomicUsize::new(0),
             skipped_non_europe_leader: AtomicUsize::new(0),
         }
     }
@@ -221,7 +217,7 @@ impl WorkerPool {
         wallet_manager: Arc<WalletManager>,
         tx_builder: Arc<TransactionBuilder>,
         recent_activity: RecentActivity,
-        leader_slot_client: Arc<LeaderSlotClient>, // ✅ اضافه شد
+        leader_slot_client: Arc<LeaderSlotClient>,
     ) -> Self {
         let mut workers = Vec::new();
 
@@ -235,7 +231,7 @@ impl WorkerPool {
             let wallet_clone = wallet_manager.clone();
             let builder_clone = tx_builder.clone();
             let activity_clone = recent_activity.clone();
-            let leader_clone = leader_slot_client.clone(); // ✅ اضافه شد
+            let leader_clone = leader_slot_client.clone();
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
@@ -249,7 +245,7 @@ impl WorkerPool {
                         wallet_clone,
                         builder_clone,
                         activity_clone,
-                        leader_clone, // ✅ اضافه شد
+                        leader_clone,
                     ).await;
                 });
             });
@@ -326,59 +322,6 @@ fn record_buy_activity(address: &str, mint: &str, slot: u64, recent_activity: &R
 fn cleanup_old_activity(recent_activity: &RecentActivity) {
     let cutoff = Instant::now() - Duration::from_secs(MAX_ACTIVITY_AGE_SECS);
     recent_activity.retain(|_, activity| activity.last_activity >= cutoff);
-}
-
-/// ✅ گزارش آماری کامل (هر 30 ثانیه)
-fn print_statistics(stats: &GlobalStats) {
-    let elapsed = stats.start_time.elapsed().as_secs();
-    let elapsed_mins = elapsed / 60;
-
-    let total_tx = stats.total_tx_processed.load(Ordering::Relaxed);
-    let profitable = stats.profitable_count.load(Ordering::Relaxed);
-    let unprofitable = stats.unprofitable_count.load(Ordering::Relaxed);
-    let bundles_sent = stats.bundles_sent.load(Ordering::Relaxed);
-    let bundles_failed = stats.bundles_failed.load(Ordering::Relaxed);
-    let total_profit = stats.total_profit_lamports.load(Ordering::Relaxed);
-
-    // Skipped reasons
-    let skipped_no_pool = stats.skipped_no_pool.load(Ordering::Relaxed);
-    let skipped_low_sol = stats.skipped_low_sol.load(Ordering::Relaxed);
-    let skipped_same_block = stats.skipped_same_block.load(Ordering::Relaxed);
-    let skipped_no_creator = stats.skipped_no_creator.load(Ordering::Relaxed);
-    let skipped_simulation_failed = stats.skipped_simulation_failed.load(Ordering::Relaxed);
-    let skipped_unprofitable = stats.skipped_unprofitable.load(Ordering::Relaxed);
-    let skipped_non_europe_leader = stats.skipped_non_europe_leader.load(Ordering::Relaxed);
-
-    let total_skipped = skipped_no_pool + skipped_low_sol + skipped_same_block
-        + skipped_no_creator + skipped_simulation_failed + skipped_unprofitable + skipped_non_europe_leader;
-
-    let shreds = stats.shreds_received.load(Ordering::Relaxed);
-    let geyser = stats.geyser_updates.load(Ordering::Relaxed);
-
-    let tx_per_min = if elapsed_mins > 0 { total_tx / elapsed_mins as usize } else { 0 };
-    let profit_sol = total_profit as f64 / LAMPORTS_PER_SOL as f64;
-    let success_rate = if bundles_sent + bundles_failed > 0 {
-        (bundles_sent as f64 / (bundles_sent + bundles_failed) as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    info!("═══════════════════════════════════════════════════════════");
-    info!("📊 STATISTICS REPORT (Runtime: {} min {} sec)", elapsed_mins, elapsed % 60);
-    info!("═══════════════════════════════════════════════════════════");
-    info!("🔍 DATA SOURCES:");
-    info!("   ShredStream Messages: {}", shreds);
-    info!("   Geyser Updates: {}", geyser);
-    info!("📈 TRANSACTION PROCESSING:");
-    info!("   Total Processed: {} ({} tx/min)", total_tx, tx_per_min);
-    info!("   ✅ Profitable (Local Calc): {}", profitable);
-    info!("   ⏭️  Skipped: {} (Non-EU Leader: {})", total_skipped, skipped_non_europe_leader);
-    info!("📦 JITO BUNDLE SIMULATION:");
-    info!("   ✅ Sent to Simulation: {}", bundles_sent);
-    info!("   ❌ Simulation Errors: {}", bundles_failed);
-    info!("   📊 Request Success Rate: {:.1}%", success_rate);
-    info!("💰 POTENTIAL PROFIT (If Executed): {:.6} SOL", profit_sol);
-    info!("═══════════════════════════════════════════════════════════");
 }
 
 fn calculate_token_out_with_fee(sol_in: u64, sol_reserve: u64, token_reserve: u64) -> u64 {
@@ -499,7 +442,7 @@ fn print_simulation_result(sim: &SandwichSimulation, worker_id: usize, profitabl
 }
 
 // ═══════════════════════════════════════════════════════════
-// ✅ WORKER THREAD: BUNDLE SIMULATION MODE
+// WORKER THREAD (SANDWICH BUNDLE TO JITO)
 // ═══════════════════════════════════════════════════════════
 
 async fn unified_worker_thread(
@@ -511,9 +454,9 @@ async fn unified_worker_thread(
     wallet_manager: Arc<WalletManager>,
     tx_builder: Arc<TransactionBuilder>,
     recent_activity: RecentActivity,
-    leader_slot_client: Arc<LeaderSlotClient>, // ✅ اضافه شد
+    leader_slot_client: Arc<LeaderSlotClient>,
 ) {
-    info!("Worker {} started 🚀", worker_id);
+    info!("Worker {} started 🚀 (SANDWICH BUNDLE MODE)", worker_id);
 
     for tx_info in rx.iter() {
         stats.total_tx_processed.fetch_add(1, Ordering::Relaxed);
@@ -539,10 +482,16 @@ async fn unified_worker_thread(
             continue;
         }
 
-        // ⚠️ REMOVED: check_target_transaction_status (Too slow, relies on RPC)
-        // We assume fresh data from ShredStream. If target is gone, Jito will fail atomically.
+        // 4. Check Target Status
+        match jito_client.check_target_transaction_status(&tx_info.signature).await {
+            Ok(TargetTxStatus::AlreadyConfirmed) => {
+                stats.skipped_target_confirmed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            _ => {}
+        }
 
-        // 4. Local Simulation
+        // 5. Local Simulation
         let simulation = simulate_sandwich_attack(&tx_info, &pool_state);
 
         if simulation.front_run_sol == 0 || simulation.front_run_tokens == 0 {
@@ -550,34 +499,30 @@ async fn unified_worker_thread(
             continue;
         }
 
-        // 5. Check Profitability
+        // 6. Check Profitability
         if !simulation.is_profitable {
-            stats.skipped_unprofitable.fetch_add(1, Ordering::Relaxed);
             stats.unprofitable_count.fetch_add(1, Ordering::Relaxed);
             continue;
         }
 
-        // ✅ تراکنش سودده است
         stats.profitable_count.fetch_add(1, Ordering::Relaxed);
+        print_simulation_result(&simulation, worker_id, true);
 
         // ═══════════════════════════════════════════════════════════
-        // 🏗️ BUILD COMPLETE BUNDLE (Front + Victim + Back)
+        // 🏗️ BUILD SANDWICH BUNDLE (Front + Victim + Back)
         // ═══════════════════════════════════════════════════════════
 
         let mint = match Pubkey::from_str(&tx_info.mint) {
             Ok(m) => m,
-            Err(e) => {
-                debug!("⏭️  Skipped: Invalid mint pubkey: {}", e);
+            Err(_) => {
                 stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         };
 
-        // Get Latest Blockhash (Must be fast!)
         let blockhash = match tx_builder.get_recent_blockhash().await {
             Ok(bh) => bh,
-            Err(e) => {
-                debug!("⏭️  Skipped: Blockhash fetch failed: {}", e);
+            Err(_) => {
                 stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -592,8 +537,7 @@ async fn unified_worker_thread(
         };
         let creator_vault = match Pubkey::from_str(creator_vault_str) {
             Ok(cv) => cv,
-            Err(e) => {
-                debug!("⏭️  Skipped: Invalid creator_vault pubkey: {}", e);
+            Err(_) => {
                 stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -602,7 +546,6 @@ async fn unified_worker_thread(
         let token_program_id_str = match &tx_info.token_program_id {
             Some(tp) => tp,
             None => {
-                debug!("⏭️  Skipped: Missing token_program_id");
                 stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -616,8 +559,7 @@ async fn unified_worker_thread(
 
         let token_program_id_pubkey = match Pubkey::from_str(token_program_id_str) {
             Ok(pk) => pk,
-            Err(e) => {
-                debug!("⏭️  Skipped: Invalid token_program_id pubkey: {}", e);
+            Err(_) => {
                 stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -625,58 +567,16 @@ async fn unified_worker_thread(
 
         let safe_front_run_sol = (simulation.front_run_sol as f64 * 1.70) as u64;
 
-        // Derive bonding curve from mint
-        let bonding_curve = derive_bonding_curve(&mint);
-
-        // Extract fee_recipient
-        let fee_recipient_str = match &tx_info.fee_recipient {
-            Some(fr) => fr,
-            None => {
-                debug!("⏭️  Skipped: Missing fee_recipient");
-                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-        };
-        let fee_recipient = match Pubkey::from_str(fee_recipient_str) {
-            Ok(pk) => pk,
-            Err(e) => {
-                debug!("⏭️  Skipped: Invalid fee_recipient pubkey: {}", e);
-                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-        };
-
-        // Extract bonding_curve_token_account
-        let bonding_curve_token_account_str = match &tx_info.bonding_curve_token_account {
-            Some(bcta) => bcta,
-            None => {
-                debug!("⏭️  Skipped: Missing bonding_curve_token_account");
-                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-        };
-        let bonding_curve_token_account = match Pubkey::from_str(bonding_curve_token_account_str) {
-            Ok(pk) => pk,
-            Err(e) => {
-                debug!("⏭️  Skipped: Invalid bonding_curve_token_account pubkey: {}", e);
-                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-        };
-
         // Build Front-Run Transaction
         let front_tx = match tx_builder.build_front_run_transaction(
             &wallet_manager.front_runner,
             &mint,
-            &bonding_curve,
             &creator_vault,
             simulation.front_run_tokens,
             safe_front_run_sol,
             50_000,
             blockhash,
             token_program_type,
-            &fee_recipient,
-            &bonding_curve_token_account,
             &token_program_id_pubkey,
         ).await {
             Ok(tx) => tx,
@@ -687,8 +587,18 @@ async fn unified_worker_thread(
             }
         };
 
+        // ✅ Deserialize Victim Transaction (VersionedTransaction!)
+        let victim_tx = match bincode::deserialize::<VersionedTransaction>(&tx_info.raw_transaction) {
+            Ok(tx) => tx,
+            Err(e) => {
+                debug!("⏭️  Skipped: Failed to deserialize victim tx: {}", e);
+                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+
         // Build Back-Run Transaction
-        let jito_tip_account = match Pubkey::from_str(&jito_client.get_tip_account()) {
+        let jito_tip_account = match Pubkey::from_str(&jito_client.get_tip_account_str()) {
             Ok(pk) => pk,
             Err(e) => {
                 debug!("⏭️  Skipped: Invalid jito_tip_account pubkey: {}", e);
@@ -700,17 +610,14 @@ async fn unified_worker_thread(
         let back_tx = match tx_builder.build_back_run_transaction(
             &wallet_manager.front_runner,
             &mint,
-            &bonding_curve,
             &creator_vault,
             simulation.front_run_tokens,
-            0, // min_sol_output
+            0,
             50_000,
             JITO_TIP_LAMPORTS,
             &jito_tip_account,
             blockhash,
             token_program_type,
-            &fee_recipient,
-            &bonding_curve_token_account,
             &token_program_id_pubkey,
         ).await {
             Ok(tx) => tx,
@@ -722,43 +629,33 @@ async fn unified_worker_thread(
         };
 
         // ═══════════════════════════════════════════════════════════
-        // 🔬 SEND BUNDLE TO JITO (REAL SUBMISSION + TRACKING)
+        // 🔬 SEND SANDWICH BUNDLE TO JITO
         // ═══════════════════════════════════════════════════════════
 
-        // ✅ چک کنید: آیا leader بعدی در اروپا است؟
+        // ✅ Check leader region (optional)
         if ENABLE_LEADER_FILTERING {
             let target_slot = tx_info.slot + 2;
 
-            // Check if optimal slot (Europe region)
-            match leader_slot_client.is_optimal_slot(target_slot, "europe").await {
+            match leader_slot_client.is_optimal_slot(target_slot, TARGET_REGION).await {
                 Ok(true) => {
-                    debug!("✅ European leader found in next slots");
+                    debug!("✅ Optimal leader found in {}", TARGET_REGION);
                 }
                 Ok(false) => {
-                    debug!("⏭️  Skipped: No European leader in next slots from {}", target_slot);
+                    debug!("⏭️  Skipped: No {} leader in next slots from {}", TARGET_REGION, target_slot);
                     stats.skipped_non_europe_leader.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 Err(e) => {
-                    debug!("⚠️ Leader check failed: {}", e);
-                    // Continue anyway to avoid blocking on API errors
+                    debug!("⚠️ Leader check failed: {} (continuing anyway)", e);
                 }
             }
         }
 
-        // ✅ BUILD BUNDLE: فقط Front-Run و Back-Run (بدون Victim!)
-        // Victim transaction ALT دارد و نمی‌تواند در bundle Jito قرار بگیرد
-        let bundle = vec![front_tx, back_tx];
+        debug!("✅ Bundle ready: Front-Run + Victim + Back-Run (3 txs)");
+        info!("📤 Sending sandwich bundle to Jito...");
 
-        debug!("✅ Bundle built successfully (2 transactions)");
-        debug!("   Front-Run + Back-Run (victim excluded due to ALT)");
-        info!("📤 Sending bundle to Jito...");
-
-        // ✅ ارسال مستقیم bundle واقعی به Jito
-        match jito_client.send_bundle_with_victim(
-            bundle,
-            Some(tx_info.signature.clone()),
-        ).await {
+        // ✅ ارسال bundle واقعی به Jito
+        match jito_client.send_bundle_mixed(front_tx, victim_tx, back_tx).await {
             Ok(bundle_id) => {
                 info!("✅ BUNDLE SENT!");
                 info!("   Bundle ID: {}", bundle_id);
@@ -769,7 +666,7 @@ async fn unified_worker_thread(
                 stats.total_profit_lamports.fetch_add(simulation.net_profit as u64, Ordering::Relaxed);
 
                 // ✅ Real-time bundle tracking
-                info!("📊 Tracking bundle...");
+                info!("📊 Tracking bundle for 60 seconds...");
 
                 for attempt in 1..=30 {
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -798,13 +695,16 @@ async fn unified_worker_thread(
                                                 }
                                                 "Invalid" => {
                                                     warn!("⚠️ BUNDLE INVALID");
+                                                    warn!("   Details: {:?}", bundle_status);
                                                     stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                                                     break;
                                                 }
                                                 "Pending" => {
                                                     debug!("⏳ Pending... ({}/30)", attempt);
                                                 }
-                                                _ => {}
+                                                _ => {
+                                                    debug!("❓ Unknown status: {}", status_str);
+                                                }
                                             }
                                         }
                                     }
@@ -815,7 +715,7 @@ async fn unified_worker_thread(
                     }
 
                     if attempt == 30 {
-                        warn!("⏱️ Tracking timeout");
+                        warn!("⏱️ Tracking timeout (60s)");
                     }
                 }
             }
@@ -823,9 +723,10 @@ async fn unified_worker_thread(
                 error!("❌ BUNDLE SEND FAILED!");
                 error!("   Error: {}", e);
                 error!("   Possible reasons:");
-                error!("   - Tip too low");
-                error!("   - Rate limit (429)");
+                error!("   - Tip too low (current: {} lamports)", JITO_TIP_LAMPORTS);
+                error!("   - Rate limit (HTTP 429)");
                 error!("   - Target tx already confirmed");
+                error!("   - Bundle validation failed");
                 stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -885,13 +786,13 @@ fn get_priority_fee(tx: &VersionedTransaction) -> u64 {
     0
 }
 
-// ✅ آپدیت شده: ذخیره raw_transaction
+// ✅ اضافه شده: ذخیره raw_transaction
 fn extract_transaction_info(tx: VersionedTransaction, pump_fun_program_id: &Pubkey, buy_discriminator: &[u8], current_slot: u64) -> Option<TransactionInfo> {
     let account_keys = tx.message.static_account_keys();
 
-    // ✅ Serialize transaction to save as raw_transaction
+    // ✅ Serialize transaction برای ذخیره به عنوان raw_transaction
     let raw_transaction = match bincode::serialize(&tx) {
-        Ok(data) => data,
+        Ok(bytes) => bytes,
         Err(_) => return None,
     };
 
@@ -915,7 +816,7 @@ fn extract_transaction_info(tx: VersionedTransaction, pump_fun_program_id: &Pubk
                                 max_sol: args.max_sol_cost, token_amount: args.token_amount, priority_fee,
                                 signature: bs58::encode(&tx.signatures[0]).into_string(), timestamp: Instant::now(),
                                 slot: current_slot, creator_vault, fee_recipient, bonding_curve_token_account, token_program_id,
-                                raw_transaction, // ✅ ذخیره تراکنش کامل
+                                raw_transaction,
                             });
                         }
                     }
@@ -1021,19 +922,10 @@ async fn run_geyser_task(grpc_endpoint: String, x_token: Option<String>, request
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
-
-    // ✅ فیلتر لاگ: فقط لاگ‌های mev_bot را نمایش بده، h2/hyper را مخفی کن
-    env_logger::Builder::from_default_env()
-        .filter_module("h2", log::LevelFilter::Off)
-        .filter_module("hyper", log::LevelFilter::Off)
-        .filter_module("tonic", log::LevelFilter::Warn)
-        .filter_module("tower", log::LevelFilter::Warn)
-        .filter_module("reqwest", log::LevelFilter::Warn)
-        .filter_module("mev_bot_unified", log::LevelFilter::Debug)
-        .init();
+    env_logger::init();
 
     info!("═══════════════════════════════════════════════════════════");
-    info!("📦 BUNDLE SIMULATION MODE: Jito Atomic Check 📦");
+    info!("🥪 SANDWICH BOT - JITO BUNDLE MODE 🥪");
     info!("═══════════════════════════════════════════════════════════");
 
     let wallet_manager = Arc::new(WalletManager::new(
@@ -1048,6 +940,7 @@ async fn main() -> Result<()> {
     let shred_endpoint = env::var("SHRED_ENDPOINT").context("SHRED_ENDPOINT missing")?;
     let grpc_endpoint = env::var("GRPC_ENDPOINT").context("GRPC_ENDPOINT missing")?;
     let rpc_endpoint = env::var("SOLANA_RPC_ENDPOINT").context("SOLANA_RPC_ENDPOINT missing")?;
+    let erpc_endpoint = env::var("ERPC_ENDPOINT").context("ERPC_ENDPOINT missing")?;
     let x_token = env::var("X_TOKEN").ok();
 
     let config_content = fs::read_to_string("config.json")?;
@@ -1072,16 +965,12 @@ async fn main() -> Result<()> {
     let jito_client = Arc::new(JitoClient::new(rpc_endpoint.clone()));
     let tx_builder = Arc::new(TransactionBuilder::new(&rpc_endpoint));
     let recent_activity = Arc::new(DashMap::new());
-
-    // ✅ Leader Slot Client: برای شناسایی لیدرهای اروپایی
-    let erpc_endpoint = env::var("ERPC_ENDPOINT").context("ERPC_ENDPOINT missing")?;
     let leader_slot_client = Arc::new(LeaderSlotClient::new(erpc_endpoint));
 
-    if ENABLE_LEADER_FILTERING {
-        info!("🌍 Leader Filtering ENABLED: Only {:?} leaders", ALLOWED_REGIONS);
-    } else {
-        info!("🌍 Leader Filtering DISABLED: All leaders accepted");
-    }
+    info!("🌍 Leader Filtering: {} (target: {})",
+        if ENABLE_LEADER_FILTERING { "ENABLED" } else { "DISABLED" },
+        TARGET_REGION
+    );
 
     let worker_pool = Arc::new(WorkerPool::new(
         WORKER_COUNT,
@@ -1091,7 +980,7 @@ async fn main() -> Result<()> {
         wallet_manager.clone(),
         tx_builder.clone(),
         recent_activity.clone(),
-        leader_slot_client.clone(), // ✅ اضافه شد
+        leader_slot_client.clone(),
     ));
 
     let (shreds_tx, shreds_rx) = unbounded::<ShredsData>();
@@ -1101,16 +990,6 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(CLEANUP_INTERVAL_SECS));
         loop { interval.tick().await; cleanup_old_activity(&activity_for_cleanup); }
-    });
-
-    // ✅ Statistics Reporting Thread (هر 30 ثانیه)
-    let stats_for_reporting = stats.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            print_statistics(&stats_for_reporting);
-        }
     });
 
     let geyser_handle = {

@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use solana_sdk::transaction::Transaction;
+use solana_sdk::{transaction::Transaction, transaction::VersionedTransaction};
 use log::{info, warn, error, debug};
 use std::time::Duration;
 
@@ -16,17 +16,62 @@ const JITO_TIP_ACCOUNTS: [&str; 8] = [
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 ];
 
-#[derive(Serialize)]
-struct SendBundleRequest {
-    jsonrpc: String,
-    id: u64,
-    method: String,
-    params: Vec<serde_json::Value>,
-}
-
 #[derive(Deserialize, Debug)]
 struct SendBundleResponse {
     result: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SimulateBundleResponse {
+    jsonrpc: String,
+    #[serde(default)]
+    result: Option<SimulateBundleResult>,
+    #[serde(default)]
+    error: Option<serde_json::Value>,
+    id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SimulateBundleResult {
+    context: SimulationContext,
+    value: SimulateBundleValue,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimulateBundleValue {
+    pub summary: serde_json::Value,
+    pub transaction_results: Vec<SimulationValue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SimulateTransactionResponse {
+    jsonrpc: String,
+    #[serde(default)]
+    result: Option<SimulateTransactionResult>,
+    #[serde(default)]
+    error: Option<serde_json::Value>,
+    id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SimulateTransactionResult {
+    context: SimulationContext,
+    value: SimulationValue,
+}
+
+#[derive(Debug, Deserialize)]
+struct SimulationContext {
+    slot: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SimulationValue {
+    pub err: Option<serde_json::Value>,
+    pub logs: Option<Vec<String>>,
+    pub units_consumed: Option<u64>,
+    pub accounts: Option<Vec<serde_json::Value>>,
 }
 
 pub struct JitoClient {
@@ -48,11 +93,11 @@ impl JitoClient {
         let endpoints = vec![
             "https://frankfurt.mainnet.block-engine.jito.wtf".to_string(),
             "https://amsterdam.mainnet.block-engine.jito.wtf".to_string(),
+            "https://ny.mainnet.block-engine.jito.wtf".to_string(),
+            "https://tokyo.mainnet.block-engine.jito.wtf".to_string(),
         ];
 
         info!("🌐 Jito Client initialized");
-        info!("   Jito Primary: Frankfurt 🇩🇪");
-        info!("   Jito Fallback: Amsterdam 🇳🇱");
         info!("   RPC Endpoint: {}", rpc_endpoint);
 
         Self {
@@ -69,21 +114,29 @@ impl JitoClient {
         JITO_TIP_ACCOUNTS[index]
     }
 
-    pub async fn send_bundle_with_victim(
+    /// ✅ ارسال bundle به Jito (پشتیبانی از Legacy + Versioned Transactions)
+    pub async fn send_bundle_mixed(
         &self,
-        transactions: Vec<Transaction>,
-        _victim_signature: Option<String>,
+        front_tx: Transaction,
+        victim_tx: VersionedTransaction,
+        back_tx: Transaction,
     ) -> Result<String> {
         info!("📤 Sending bundle to Jito Block Engine...");
-        info!("   Bundle size: {} transactions", transactions.len());
+        info!("   Bundle: Front-Run + Victim + Back-Run (3 txs)");
 
-        let encoded_txs: Vec<String> = transactions
-            .iter()
-            .map(|tx| {
-                let serialized = bincode::serialize(tx).unwrap();
-                bs58::encode(&serialized).into_string()
-            })
-            .collect();
+        // Serialize هر تراکنش
+        let front_serialized = bincode::serialize(&front_tx)
+            .map_err(|e| anyhow!("Failed to serialize front tx: {}", e))?;
+        let victim_serialized = bincode::serialize(&victim_tx)
+            .map_err(|e| anyhow!("Failed to serialize victim tx: {}", e))?;
+        let back_serialized = bincode::serialize(&back_tx)
+            .map_err(|e| anyhow!("Failed to serialize back tx: {}", e))?;
+
+        let encoded_txs = vec![
+            bs58::encode(&front_serialized).into_string(),
+            bs58::encode(&victim_serialized).into_string(),
+            bs58::encode(&back_serialized).into_string(),
+        ];
 
         let params_vec = vec![encoded_txs];
 
@@ -95,7 +148,6 @@ impl JitoClient {
         });
 
         let url = format!("{}/api/v1/bundles", self.endpoints[0]);
-        debug!("   Endpoint: {}", url);
 
         let response = self.http_client
             .post(&url)
@@ -126,12 +178,9 @@ impl JitoClient {
         }
 
         let response_text = response.text().await.unwrap_or_default();
-        debug!("   Response body: {}", response_text);
-
         let result: SendBundleResponse = serde_json::from_str(&response_text)
             .map_err(|e| {
                 error!("❌ Failed to parse Jito response: {}", e);
-                error!("   Raw response: {}", response_text);
                 anyhow!("Parse error: {}", e)
             })?;
 
@@ -142,6 +191,7 @@ impl JitoClient {
         Ok(bundle_id)
     }
 
+    /// ✅ دریافت وضعیت real-time bundle
     pub async fn get_inflight_bundle_statuses(&self, bundle_ids: Vec<String>) -> Result<serde_json::Value> {
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -158,17 +208,17 @@ impl JitoClient {
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
-            .map_err(|e| anyhow!("Failed to get inflight status: {}", e))?;
+            .map_err(|e| anyhow!("Failed to get bundle status: {}", e))?;
 
         if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("Jito error: {}", error_text));
+            return Err(anyhow!("HTTP error: {}", response.status()));
         }
 
         let response_json: serde_json::Value = response.json().await?;
         Ok(response_json)
     }
 
+    /// ✅ دریافت وضعیت نهایی bundle بعد از landing
     pub async fn get_bundle_statuses(&self, bundle_ids: Vec<String>) -> Result<serde_json::Value> {
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -185,15 +235,183 @@ impl JitoClient {
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
-            .map_err(|e| anyhow!("Failed to get bundle status: {}", e))?;
+            .map_err(|e| anyhow!("Failed to get bundle statuses: {}", e))?;
 
         if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("Jito error: {}", error_text));
+            return Err(anyhow!("HTTP error: {}", response.status()));
         }
 
         let response_json: serde_json::Value = response.json().await?;
         Ok(response_json)
+    }
+
+    /// شبیه‌سازی bundle (برای تست قبل از ارسال)
+    pub async fn simulate_bundle(&self, transactions: Vec<Transaction>) -> Result<SimulateBundleValue> {
+        let encoded_txs: Vec<String> = transactions
+            .iter()
+            .map(|tx| {
+                let serialized = bincode::serialize(tx)
+                    .expect("Failed to serialize transaction");
+                bs58::encode(&serialized).into_string()
+            })
+            .collect();
+
+        let params_vec = vec![
+            serde_json::json!({
+                "encodedTransactions": encoded_txs
+            }),
+            serde_json::json!({
+                "encoding": "base58",
+                "commitment": "processed",
+                "replaceRecentBlockhash": true,
+                "sigVerify": false
+            })
+        ];
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "simulateBundle",
+            "params": params_vec
+        });
+
+        let jito_url = format!("{}/api/v1/bundles", self.endpoints[0]);
+
+        let response = self.http_client
+            .post(&jito_url)
+            .json(&request)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| anyhow!("Bundle simulation network error: {}", e))?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("Jito HTTP error: {}", error_text));
+        }
+
+        let response_text = response.text().await.unwrap_or_default();
+
+        let sim_response: SimulateBundleResponse = match serde_json::from_str(&response_text) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("❌ Failed to parse Jito response!");
+                error!("   Raw Response: {}", response_text);
+                return Err(anyhow!("Parse error: {}", e));
+            }
+        };
+
+        if let Some(err) = sim_response.error {
+            return Err(anyhow!("Jito API Error: {:?}", err));
+        }
+
+        if let Some(result) = sim_response.result {
+            Ok(result.value)
+        } else {
+            Err(anyhow!("Empty result from Jito simulation"))
+        }
+    }
+
+    /// شبیه‌سازی تکی
+    pub async fn simulate_transaction(&self, transaction: &Transaction) -> Result<SimulationValue> {
+        let serialized = bincode::serialize(transaction)
+            .map_err(|e| anyhow!("Failed to serialize transaction: {}", e))?;
+        let encoded = bs58::encode(&serialized).into_string();
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "simulateTransaction",
+            "params": [
+                encoded,
+                {
+                    "encoding": "base58",
+                    "commitment": "processed",
+                    "replaceRecentBlockhash": true,
+                    "sigVerify": false,
+                }
+            ]
+        });
+
+        let response = self.http_client
+            .post(&self.rpc_endpoint)
+            .json(&request)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| anyhow!("RPC simulation error: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("RPC HTTP error"));
+        }
+
+        let response_text = response.text().await.unwrap_or_default();
+
+        let sim_response: SimulateTransactionResponse = serde_json::from_str(&response_text)
+            .map_err(|e| anyhow!("Failed to parse simulation response: {}", e))?;
+
+        if let Some(err) = sim_response.error {
+            return Err(anyhow!("RPC API Error: {:?}", err));
+        }
+
+        if let Some(result) = sim_response.result {
+            Ok(result.value)
+        } else {
+            Err(anyhow!("Empty result from RPC simulation"))
+        }
+    }
+
+    pub async fn check_target_transaction_status(&self, signature: &str) -> Result<TargetTxStatus> {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignatureStatuses",
+            "params": [
+                [signature],
+                {
+                    "searchTransactionHistory": true
+                }
+            ]
+        });
+
+        let response = self.http_client
+            .post(&self.rpc_endpoint)
+            .json(&request)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| anyhow!("Failed to check tx status: {}", e))?;
+
+        if !response.status().is_success() {
+            return Ok(TargetTxStatus::Unknown);
+        }
+
+        let response_json: serde_json::Value = response.json().await?;
+
+        if let Some(result) = response_json.get("result") {
+            if let Some(value) = result.get("value") {
+                if let Some(arr) = value.as_array() {
+                    if let Some(status) = arr.get(0) {
+                        if !status.is_null() {
+                            if let Some(confirmation_status) = status.get("confirmationStatus") {
+                                let status_str = confirmation_status.as_str().unwrap_or("");
+                                match status_str {
+                                    "confirmed" | "finalized" => return Ok(TargetTxStatus::AlreadyConfirmed),
+                                    "processed" => return Ok(TargetTxStatus::InMempool),
+                                    _ => return Ok(TargetTxStatus::InMempool),
+                                }
+                            }
+                            return Ok(TargetTxStatus::InMempool);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(TargetTxStatus::NotFound)
+    }
+
+    pub fn get_tip_account_str(&self) -> String {
+        self.get_tip_account().to_string()
     }
 }
 
