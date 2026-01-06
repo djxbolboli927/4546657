@@ -619,15 +619,8 @@ async fn unified_worker_thread(
             }
         };
 
-        let token_program_id_str = match &tx_info.token_program_id {
-            Some(tp) => tp,
-            None => {
-                debug!("⏭️  Skipped: Missing token_program_id");
-                stats.skipped_missing_token_program.fetch_add(1, Ordering::Relaxed);
-                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-        };
+        // ✅ token_program_id is now always Some(...) due to fallback strategy
+        let token_program_id_str = tx_info.token_program_id.as_ref().unwrap();
 
         let token_program_type = if token_program_id_str == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" {
             TokenProgramType::Token2022Program
@@ -879,7 +872,37 @@ fn extract_transaction_info(tx: VersionedTransaction, pump_fun_program_id: &Pubk
                         let fee_recipient = instruction.accounts.get(1).and_then(|&idx| account_keys.get(idx as usize)).map(|pk| pk.to_string());
                         let bonding_curve = instruction.accounts.get(3).and_then(|&idx| account_keys.get(idx as usize)).map(|pk| pk.to_string());
                         let bonding_curve_token_account = instruction.accounts.get(4).and_then(|&idx| account_keys.get(idx as usize)).map(|pk| pk.to_string());
-                        let token_program_id = instruction.accounts.get(8).and_then(|&idx| account_keys.get(idx as usize)).map(|pk| pk.to_string());
+
+                        // ✅ Robust token_program_id extraction with fallback
+                        let token_program_id = {
+                            // Known Token Program IDs on Solana
+                            const STANDARD_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+                            const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+                            // Strategy 1: Try index 8 (common location for Pump.fun)
+                            if let Some(token_prog) = instruction.accounts.get(8)
+                                .and_then(|&idx| account_keys.get(idx as usize))
+                                .map(|pk| pk.to_string()) {
+                                Some(token_prog)
+                            }
+                            // Strategy 2: Search through all accounts for known Token Program IDs
+                            else {
+                                let found_token_program = instruction.accounts.iter()
+                                    .filter_map(|&idx| account_keys.get(idx as usize))
+                                    .find(|pk| {
+                                        let pk_str = pk.to_string();
+                                        pk_str == STANDARD_TOKEN_PROGRAM || pk_str == TOKEN_2022_PROGRAM
+                                    })
+                                    .map(|pk| pk.to_string());
+
+                                // Strategy 3: Default to Standard Token Program (99% of Pump.fun uses this)
+                                if found_token_program.is_none() {
+                                    debug!("⚠️ Token Program not found in accounts, defaulting to Standard Token Program");
+                                }
+                                Some(found_token_program.unwrap_or_else(|| STANDARD_TOKEN_PROGRAM.to_string()))
+                            }
+                        };
+
                         let creator_vault = instruction.accounts.get(9).and_then(|&idx| account_keys.get(idx as usize)).map(|pk| pk.to_string());
                         let priority_fee = get_priority_fee(&tx);
 
