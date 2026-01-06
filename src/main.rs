@@ -736,11 +736,19 @@ fn start_processing_thread(rx: Receiver<ShredsData>, worker_pool: Arc<WorkerPool
     });
 }
 
-async fn handle_account_update(msg: &GeyserSubscribeUpdate, pool_tracker: &PoolTracker, stats: &Arc<GlobalStats>) {
+async fn handle_account_update(
+    msg: &GeyserSubscribeUpdate,
+    pool_tracker: &PoolTracker,
+    stats: &Arc<GlobalStats>,
+    slot_tx: &tokio::sync::watch::Sender<u64>,
+) {
     if let Some(GeyserUpdateOneof::Account(account_info)) = &msg.update_oneof {
         if let Some(account) = &account_info.account {
             stats.geyser_updates.fetch_add(1, Ordering::Relaxed);
             let account_pubkey = bs58::encode(&account.pubkey).into_string();
+
+            // 🌍 Update current slot for Leader Oracle
+            let _ = slot_tx.send(account_info.slot);
 
             if let Some((mut pool_state, _)) = parse_pool_data(&account.data) {
                 if pool_state.sol_amount < MIN_POOL_SOL { return; }
@@ -769,7 +777,14 @@ async fn run_shreds_task(endpoint: String, tx: Sender<ShredsData>) -> Result<()>
     Ok(())
 }
 
-async fn run_geyser_task(grpc_endpoint: String, x_token: Option<String>, request: GeyserSubscribeRequest, pool_tracker: PoolTracker, stats: Arc<GlobalStats>) -> Result<()> {
+async fn run_geyser_task(
+    grpc_endpoint: String,
+    x_token: Option<String>,
+    request: GeyserSubscribeRequest,
+    pool_tracker: PoolTracker,
+    stats: Arc<GlobalStats>,
+    slot_tx: tokio::sync::watch::Sender<u64>,
+) -> Result<()> {
     let mut reconnect_count = 0;
     loop {
         let result: Result<()> = async {
@@ -789,7 +804,7 @@ async fn run_geyser_task(grpc_endpoint: String, x_token: Option<String>, request
             reconnect_count = 0;
             while let Some(message) = stream.next().await {
                 match message {
-                    Ok(msg) => handle_account_update(&msg, &pool_tracker, &stats).await,
+                    Ok(msg) => handle_account_update(&msg, &pool_tracker, &stats, &slot_tx).await,
                     Err(e) => { error!("Stream error: {:?}", e); break; }
                 }
             }
@@ -901,6 +916,22 @@ async fn main() -> Result<()> {
     let tx_builder = Arc::new(TransactionBuilder::new(&rpc_endpoint));
     let recent_activity = Arc::new(DashMap::new());
 
+    // 🌍 Get current slot from RPC to initialize Leader Oracle
+    info!("🔍 Fetching current slot from RPC...");
+    let initial_slot = match tx_builder.rpc_client.get_slot() {
+        Ok(slot) => {
+            info!("✅ Current slot: {}", slot);
+            slot
+        }
+        Err(e) => {
+            warn!("⚠️  Failed to get current slot: {}, using 0", e);
+            0
+        }
+    };
+
+    // Send initial slot to Leader Oracle updater
+    let _ = slot_tx.send(initial_slot);
+
     // ═══════════════════════════════════════════════════════════
     // INITIALIZE WORKER POOL (with Leader Oracle)
     // ═══════════════════════════════════════════════════════════
@@ -927,8 +958,9 @@ async fn main() -> Result<()> {
     let geyser_handle = {
         let pool_tracker = pool_tracker.clone();
         let stats = stats.clone();
+        let slot_tx_clone = slot_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_geyser_task(grpc_endpoint, x_token, request, pool_tracker, stats).await {
+            if let Err(e) = run_geyser_task(grpc_endpoint, x_token, request, pool_tracker, stats, slot_tx_clone).await {
                 error!("Geyser error: {:?}", e);
             }
         })
