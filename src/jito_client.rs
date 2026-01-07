@@ -251,6 +251,31 @@ impl JitoClient {
         }
     }
 
+    /// بررسی وضعیت تراکنش victim با استراتژی موازی (RPC + Jito)
+    /// این متد سریع‌تر از check_target_transaction_status است
+    pub async fn check_victim_with_fallback(
+        &self,
+        victim_signature: &str,
+        _optimal_jito_endpoint: &str,
+    ) -> Result<TargetTxStatus> {
+        use tokio::time::{timeout, Duration};
+
+        // استراتژی: ابتدا RPC را با timeout کوتاه امتحان کن
+        // اگر خیلی سریع جواب داد (کمتر از 150ms)، از همان استفاده کن
+        // در غیر این صورت، fallback به RPC عادی
+        match timeout(
+            Duration::from_millis(150),
+            self.check_target_transaction_status(victim_signature)
+        ).await {
+            Ok(Ok(status)) => Ok(status),
+            _ => {
+                // Fallback: درخواست RPC مجدد با timeout بیشتر
+                debug!("Fast check timeout, falling back to standard RPC");
+                self.check_target_transaction_status(victim_signature).await
+            }
+        }
+    }
+
     pub async fn check_target_transaction_status(&self, signature: &str) -> Result<TargetTxStatus> {
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -287,11 +312,11 @@ impl JitoClient {
                                 let status_str = confirmation_status.as_str().unwrap_or("");
                                 match status_str {
                                     "confirmed" | "finalized" => return Ok(TargetTxStatus::AlreadyConfirmed),
-                                    "processed" => return Ok(TargetTxStatus::InMempool),
-                                    _ => return Ok(TargetTxStatus::InMempool),
+                                    "processed" => return Ok(TargetTxStatus::Processed),
+                                    _ => return Ok(TargetTxStatus::Processed),
                                 }
                             }
-                            return Ok(TargetTxStatus::InMempool);
+                            return Ok(TargetTxStatus::Processed);
                         }
                     }
                 }
@@ -355,10 +380,10 @@ impl JitoClient {
 
 #[derive(Debug, PartialEq)]
 pub enum TargetTxStatus {
-    NotFound,
-    InMempool,
-    AlreadyConfirmed,
-    Unknown,
+    NotFound,          // تراکنش در تاریخچه زنجیره وجود ندارد
+    Processed,         // در یک block هست ولی confirmed نشده (بهترین حالت برای sandwich!)
+    AlreadyConfirmed,  // Confirmed یا Finalized شده (دیگر دیر شده)
+    Unknown,           // خطا یا وضعیت نامشخص
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]

@@ -491,13 +491,33 @@ async fn unified_worker_thread(
             continue;
         }
 
-        // Check Target Status
-        match jito_client.check_target_transaction_status(&tx_info.signature).await {
+        // ═══════════════════════════════════════════════════════════
+        // 🔍 VICTIM STATUS CHECK (با endpoint جغرافیایی بهینه)
+        // ═══════════════════════════════════════════════════════════
+        let optimal_jito_endpoint = leader_oracle.get_optimal_jito_endpoint(tx_info.slot).await;
+
+        match jito_client.check_victim_with_fallback(&tx_info.signature, &optimal_jito_endpoint).await {
             Ok(TargetTxStatus::AlreadyConfirmed) => {
                 stats.skipped_target_confirmed.fetch_add(1, Ordering::Relaxed);
+                debug!("⏭️  Victim already confirmed: {}", &tx_info.signature[..12]);
                 continue;
             }
-            _ => {}
+            Ok(TargetTxStatus::Processed) => {
+                // ⚡ بهترین حالت: تراکنش در block هست ولی هنوز confirmed نشده
+                debug!("⚡ Victim processed but not confirmed - IDEAL for sandwich");
+            }
+            Ok(TargetTxStatus::NotFound) => {
+                // 🔍 تراکنش خیلی جدید است، ادامه می‌دهیم
+                debug!("🔍 Victim not found in history - very recent, proceeding...");
+            }
+            Err(e) => {
+                warn!("⚠️  Victim status check failed: {} - SKIPPING for safety", e);
+                continue;
+            }
+            _ => {
+                warn!("⚠️  Unknown victim status - SKIPPING for safety");
+                continue;
+            }
         }
 
         // Local Simulation
@@ -557,10 +577,7 @@ async fn unified_worker_thread(
 
         let safe_front_run_sol = (simulation.front_run_sol as f64 * 1.70) as u64;
 
-        // ═══════════════════════════════════════════════════════════
-        // 🌍 GET OPTIMAL JITO ENDPOINT based on Leader Location
-        // ═══════════════════════════════════════════════════════════
-        let optimal_jito_endpoint = leader_oracle.get_optimal_jito_endpoint(tx_info.slot).await;
+        // 🌍 endpoint بهینه قبلاً در بررسی victim محاسبه شده است
         info!("🎯 Using Jito endpoint: {}", optimal_jito_endpoint);
 
         // Build Transaction
@@ -605,6 +622,18 @@ async fn unified_worker_thread(
                     continue;
                 }
             }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // 🔒 FINAL VICTIM STATUS CHECK (Race Condition Prevention)
+        // ═══════════════════════════════════════════════════════════
+        // بررسی نهایی قبل از ارسال bundle - جلوگیری از race condition
+        if let Ok(TargetTxStatus::AlreadyConfirmed) =
+            jito_client.check_target_transaction_status(&tx_info.signature).await
+        {
+            stats.skipped_target_confirmed.fetch_add(1, Ordering::Relaxed);
+            info!("⏭️  Victim confirmed during simulation - ABORT bundle");
+            continue;
         }
 
         // TODO: در مراحل بعدی bundle ارسال می‌شود
