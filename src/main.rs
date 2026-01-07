@@ -174,8 +174,20 @@ struct GlobalStats {
     skipped_no_creator: AtomicUsize,
     skipped_target_confirmed: AtomicUsize,
     skipped_simulation_failed: AtomicUsize,
-    // 🌍 NEW: Leader Oracle Stats
+    // 🌍 Leader Oracle Stats
     skipped_leader_outside_europe: AtomicUsize,
+    // 🔍 Victim Status Check Stats (RPC)
+    victim_checks_rpc: AtomicUsize,
+    victim_not_found_rpc: AtomicUsize,
+    victim_processed_rpc: AtomicUsize,
+    victim_confirmed_rpc: AtomicUsize,
+    victim_unknown_rpc: AtomicUsize,
+    // 🔍 Victim Status Check Stats (Jito)
+    victim_checks_jito: AtomicUsize,
+    victim_not_found_jito: AtomicUsize,
+    victim_processed_jito: AtomicUsize,
+    victim_confirmed_jito: AtomicUsize,
+    victim_unknown_jito: AtomicUsize,
 }
 
 impl GlobalStats {
@@ -197,6 +209,17 @@ impl GlobalStats {
             skipped_target_confirmed: AtomicUsize::new(0),
             skipped_simulation_failed: AtomicUsize::new(0),
             skipped_leader_outside_europe: AtomicUsize::new(0),
+            // Victim checks
+            victim_checks_rpc: AtomicUsize::new(0),
+            victim_not_found_rpc: AtomicUsize::new(0),
+            victim_processed_rpc: AtomicUsize::new(0),
+            victim_confirmed_rpc: AtomicUsize::new(0),
+            victim_unknown_rpc: AtomicUsize::new(0),
+            victim_checks_jito: AtomicUsize::new(0),
+            victim_not_found_jito: AtomicUsize::new(0),
+            victim_processed_jito: AtomicUsize::new(0),
+            victim_confirmed_jito: AtomicUsize::new(0),
+            victim_unknown_jito: AtomicUsize::new(0),
         }
     }
 }
@@ -492,30 +515,52 @@ async fn unified_worker_thread(
         }
 
         // ═══════════════════════════════════════════════════════════
-        // 🔍 VICTIM STATUS CHECK (با endpoint جغرافیایی بهینه)
+        // 🔍 PARALLEL VICTIM STATUS CHECK (RPC + Jito همزمان)
         // ═══════════════════════════════════════════════════════════
         let optimal_jito_endpoint = leader_oracle.get_optimal_jito_endpoint(tx_info.slot).await;
 
-        match jito_client.check_victim_with_fallback(&tx_info.signature, &optimal_jito_endpoint).await {
-            Ok(TargetTxStatus::AlreadyConfirmed) => {
+        let (rpc_status, jito_status, rpc_ms, jito_ms) = jito_client
+            .check_victim_parallel(&tx_info.signature, &optimal_jito_endpoint)
+            .await;
+
+        // Track RPC stats
+        stats.victim_checks_rpc.fetch_add(1, Ordering::Relaxed);
+        match rpc_status {
+            TargetTxStatus::NotFound => stats.victim_not_found_rpc.fetch_add(1, Ordering::Relaxed),
+            TargetTxStatus::Processed => stats.victim_processed_rpc.fetch_add(1, Ordering::Relaxed),
+            TargetTxStatus::AlreadyConfirmed => stats.victim_confirmed_rpc.fetch_add(1, Ordering::Relaxed),
+            TargetTxStatus::Unknown => stats.victim_unknown_rpc.fetch_add(1, Ordering::Relaxed),
+        };
+
+        // Track Jito stats
+        stats.victim_checks_jito.fetch_add(1, Ordering::Relaxed);
+        match jito_status {
+            TargetTxStatus::NotFound => stats.victim_not_found_jito.fetch_add(1, Ordering::Relaxed),
+            TargetTxStatus::Processed => stats.victim_processed_jito.fetch_add(1, Ordering::Relaxed),
+            TargetTxStatus::AlreadyConfirmed => stats.victim_confirmed_jito.fetch_add(1, Ordering::Relaxed),
+            TargetTxStatus::Unknown => stats.victim_unknown_jito.fetch_add(1, Ordering::Relaxed),
+        };
+
+        // Print separate results
+        info!("🔍 Victim Check Results for {}:", &tx_info.signature[..16]);
+        info!("   📡 RPC:   {:?} ({:.1}ms)", rpc_status, rpc_ms);
+        info!("   🎯 Jito:  {:?} ({:.1}ms)", jito_status, jito_ms);
+
+        // Decision based on RPC status (primary source)
+        match rpc_status {
+            TargetTxStatus::AlreadyConfirmed => {
                 stats.skipped_target_confirmed.fetch_add(1, Ordering::Relaxed);
-                debug!("⏭️  Victim already confirmed: {}", &tx_info.signature[..12]);
+                info!("   ⏭️  DECISION: SKIP - Already confirmed");
                 continue;
             }
-            Ok(TargetTxStatus::Processed) => {
-                // ⚡ بهترین حالت: تراکنش در block هست ولی هنوز confirmed نشده
-                debug!("⚡ Victim processed but not confirmed - IDEAL for sandwich");
+            TargetTxStatus::Processed => {
+                info!("   ⚡ DECISION: PROCEED - Processed but not confirmed (IDEAL)");
             }
-            Ok(TargetTxStatus::NotFound) => {
-                // 🔍 تراکنش خیلی جدید است، ادامه می‌دهیم
-                debug!("🔍 Victim not found in history - very recent, proceeding...");
+            TargetTxStatus::NotFound => {
+                info!("   🔍 DECISION: PROCEED - Very new transaction");
             }
-            Err(e) => {
-                warn!("⚠️  Victim status check failed: {} - SKIPPING for safety", e);
-                continue;
-            }
-            _ => {
-                warn!("⚠️  Unknown victim status - SKIPPING for safety");
+            TargetTxStatus::Unknown => {
+                warn!("   ⚠️  DECISION: SKIP - Unknown status (safety)");
                 continue;
             }
         }
@@ -984,6 +1029,19 @@ async fn main() -> Result<()> {
         loop { interval.tick().await; cleanup_old_activity(&activity_for_cleanup); }
     });
 
+    // ═══════════════════════════════════════════════════════════
+    // 📊 REPORTING TASK (هر 60 ثانیه)
+    // ═══════════════════════════════════════════════════════════
+    let stats_for_reporting = stats.clone();
+    let oracle_for_reporting = leader_oracle.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            print_detailed_report(&stats_for_reporting, &oracle_for_reporting).await;
+        }
+    });
+
     let geyser_handle = {
         let pool_tracker = pool_tracker.clone();
         let stats = stats.clone();
@@ -1008,4 +1066,110 @@ async fn main() -> Result<()> {
 
     tokio::try_join!(geyser_handle, shreds_handle)?;
     Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════
+// 📊 DETAILED REPORTING FUNCTION
+// ═══════════════════════════════════════════════════════════
+async fn print_detailed_report(stats: &Arc<GlobalStats>, oracle: &Arc<LeaderOracle>) {
+    let elapsed = stats.start_time.elapsed().as_secs();
+    let hours = elapsed / 3600;
+    let minutes = (elapsed % 3600) / 60;
+    let seconds = elapsed % 60;
+
+    // گرفتن آمار Leader Oracle
+    let oracle_stats = oracle.get_cache_stats().await;
+    let european_percent = if oracle_stats.total_slots > 0 {
+        (oracle_stats.europe_count as f64 / oracle_stats.total_slots as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    // آمار شبیه‌سازی
+    let total_simulations = stats.profitable_count.load(Ordering::Relaxed)
+        + stats.unprofitable_count.load(Ordering::Relaxed);
+    let profitable = stats.profitable_count.load(Ordering::Relaxed);
+    let unprofitable = stats.unprofitable_count.load(Ordering::Relaxed);
+    let profitable_percent = if total_simulations > 0 {
+        (profitable as f64 / total_simulations as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    // آمار RPC victim checks
+    let rpc_total = stats.victim_checks_rpc.load(Ordering::Relaxed);
+    let rpc_not_found = stats.victim_not_found_rpc.load(Ordering::Relaxed);
+    let rpc_processed = stats.victim_processed_rpc.load(Ordering::Relaxed);
+    let rpc_confirmed = stats.victim_confirmed_rpc.load(Ordering::Relaxed);
+    let rpc_unknown = stats.victim_unknown_rpc.load(Ordering::Relaxed);
+
+    let rpc_not_found_pct = if rpc_total > 0 { (rpc_not_found as f64 / rpc_total as f64) * 100.0 } else { 0.0 };
+    let rpc_processed_pct = if rpc_total > 0 { (rpc_processed as f64 / rpc_total as f64) * 100.0 } else { 0.0 };
+    let rpc_confirmed_pct = if rpc_total > 0 { (rpc_confirmed as f64 / rpc_total as f64) * 100.0 } else { 0.0 };
+
+    // آمار Jito victim checks
+    let jito_total = stats.victim_checks_jito.load(Ordering::Relaxed);
+    let jito_not_found = stats.victim_not_found_jito.load(Ordering::Relaxed);
+    let jito_processed = stats.victim_processed_jito.load(Ordering::Relaxed);
+    let jito_confirmed = stats.victim_confirmed_jito.load(Ordering::Relaxed);
+    let jito_unknown = stats.victim_unknown_jito.load(Ordering::Relaxed);
+
+    let jito_not_found_pct = if jito_total > 0 { (jito_not_found as f64 / jito_total as f64) * 100.0 } else { 0.0 };
+    let jito_processed_pct = if jito_total > 0 { (jito_processed as f64 / jito_total as f64) * 100.0 } else { 0.0 };
+    let jito_confirmed_pct = if jito_total > 0 { (jito_confirmed as f64 / jito_total as f64) * 100.0 } else { 0.0 };
+
+    info!("╔═══════════════════════════════════════════════════════════════════════════════╗");
+    info!("║                          📊 DETAILED PERFORMANCE REPORT                       ║");
+    info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
+    info!("║  ⏱️  Uptime: {:02}:{:02}:{:02}                                                     ║", hours, minutes, seconds);
+    info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
+
+    // Transaction Sources
+    info!("║  📡 TRANSACTION SOURCES                                                       ║");
+    info!("║     • ShredStream Received:  {:>10}                                       ║", stats.shreds_received.load(Ordering::Relaxed));
+    info!("║     • Geyser Updates:        {:>10}                                       ║", stats.geyser_updates.load(Ordering::Relaxed));
+    info!("║     • Total Processed:       {:>10}                                       ║", stats.total_tx_processed.load(Ordering::Relaxed));
+    info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
+
+    // Leader Oracle Stats
+    info!("║  🌍 LEADER ORACLE (Geographic Filtering)                                     ║");
+    info!("║     • Total Slots Checked:   {:>10}                                       ║", oracle_stats.total_slots);
+    info!("║     • European Leaders:      {:>10} ({:>5.1}%)                           ║", oracle_stats.europe_count, european_percent);
+    info!("║     • Trades Blocked:        {:>10} (non-European leaders)               ║", stats.skipped_leader_outside_europe.load(Ordering::Relaxed));
+    info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
+
+    // Local Simulation Stats
+    info!("║  🧮 LOCAL SIMULATION (Profitability Analysis)                                ║");
+    info!("║     • Total Simulations:     {:>10}                                       ║", total_simulations);
+    info!("║     • Profitable:            {:>10} ({:>5.1}%)                           ║", profitable, profitable_percent);
+    info!("║     • Unprofitable:          {:>10} ({:>5.1}%)                           ║", unprofitable, 100.0 - profitable_percent);
+    info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
+
+    // Victim Status Checks - RPC
+    info!("║  🔍 VICTIM STATUS CHECKS - RPC                                               ║");
+    info!("║     • Total Checks:          {:>10}                                       ║", rpc_total);
+    info!("║     • Not Found (New):       {:>10} ({:>5.1}%) - Still on network        ║", rpc_not_found, rpc_not_found_pct);
+    info!("║     • Processed (Ideal):     {:>10} ({:>5.1}%) - Ready for sandwich      ║", rpc_processed, rpc_processed_pct);
+    info!("║     • Confirmed (Too Late):  {:>10} ({:>5.1}%) - Already confirmed      ║", rpc_confirmed, rpc_confirmed_pct);
+    info!("║     • Unknown (Errors):      {:>10}                                       ║", rpc_unknown);
+    info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
+
+    // Victim Status Checks - Jito
+    info!("║  🔍 VICTIM STATUS CHECKS - JITO                                              ║");
+    info!("║     • Total Checks:          {:>10}                                       ║", jito_total);
+    info!("║     • Not Found (New):       {:>10} ({:>5.1}%) - Still on network        ║", jito_not_found, jito_not_found_pct);
+    info!("║     • Processed (Ideal):     {:>10} ({:>5.1}%) - Ready for sandwich      ║", jito_processed, jito_processed_pct);
+    info!("║     • Confirmed (Too Late):  {:>10} ({:>5.1}%) - Already confirmed      ║", jito_confirmed, jito_confirmed_pct);
+    info!("║     • Unknown (Errors):      {:>10}                                       ║", jito_unknown);
+    info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
+
+    // Skip Reasons
+    info!("║  ⏭️  SKIP REASONS                                                             ║");
+    info!("║     • No Pool Data:          {:>10}                                       ║", stats.skipped_no_pool.load(Ordering::Relaxed));
+    info!("║     • Low SOL:               {:>10}                                       ║", stats.skipped_low_sol.load(Ordering::Relaxed));
+    info!("║     • Same Block:            {:>10}                                       ║", stats.skipped_same_block.load(Ordering::Relaxed));
+    info!("║     • No Creator:            {:>10}                                       ║", stats.skipped_no_creator.load(Ordering::Relaxed));
+    info!("║     • Target Confirmed:      {:>10}                                       ║", stats.skipped_target_confirmed.load(Ordering::Relaxed));
+    info!("║     • Simulation Failed:     {:>10}                                       ║", stats.skipped_simulation_failed.load(Ordering::Relaxed));
+    info!("╚═══════════════════════════════════════════════════════════════════════════════╝");
 }

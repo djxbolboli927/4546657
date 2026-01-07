@@ -168,11 +168,11 @@ impl LeaderOracle {
     /// * `api_key` - کلید API
     /// * `config` - تنظیمات فیلترینگ جغرافیایی
     pub fn new(api_url: &str, api_key: &str, config: GeoConfig) -> Self {
-        info!("🌍 Leader Oracle initializing...");
-        info!("   API Endpoint: {}", api_url);
-        info!("   Allowed Regions: {:?}", config.allowed_regions);
-        info!("   Allowed Countries: {:?}", config.allowed_countries);
-        info!("   Max Latency: {} ms", config.max_latency_ms);
+        debug!("🌍 Leader Oracle initializing...");
+        debug!("   API Endpoint: {}", api_url);
+        debug!("   Allowed Regions: {:?}", config.allowed_regions);
+        debug!("   Allowed Countries: {:?}", config.allowed_countries);
+        debug!("   Max Latency: {} ms", config.max_latency_ms);
 
         let client = Client::builder()
             .timeout(Duration::from_secs(15))
@@ -285,7 +285,7 @@ impl LeaderOracle {
         // به‌روزرسانی آخرین slot
         *self.last_fetched_slot.write().await = Some(start_slot);
 
-        info!("✅ Leader schedule updated: {} slots cached (from slot {})", added_count, start_slot);
+        debug!("✅ Leader schedule updated: {} slots cached (from slot {})", added_count, start_slot);
 
         Ok(added_count)
     }
@@ -337,22 +337,22 @@ impl LeaderOracle {
             }
 
             // ❌ هیچ شرطی برقرار نشد → لیدر خارج از اروپا
-            warn!("⛔ Slot {}: TRADE BLOCKED (Outside Europe)", current_slot);
+            debug!("⛔ Slot {}: TRADE BLOCKED (Outside Europe)", current_slot);
             if let Some(country) = &info.country {
-                warn!("   Country: {}", country);
+                debug!("   Country: {}", country);
             }
             if let Some(region) = &info.region {
-                warn!("   Region: {}", region);
+                debug!("   Region: {}", region);
             }
             if let Some(ping) = info.ping {
-                warn!("   Ping: {:.2} ms (max: {} ms)", ping, self.config.max_latency_ms);
+                debug!("   Ping: {:.2} ms (max: {} ms)", ping, self.config.max_latency_ms);
             }
 
             return false;
         }
 
         // اگر اطلاعات در کش نیست، سیاست محافظه‌کارانه: عدم معامله
-        warn!("⚠️  Slot {}: NO DATA IN CACHE - Trade blocked (safety)", current_slot);
+        debug!("⚠️  Slot {}: NO DATA IN CACHE - Trade blocked (safety)", current_slot);
         false
     }
 
@@ -482,7 +482,7 @@ pub async fn start_leader_schedule_updater(
     oracle: Arc<LeaderOracle>,
     mut current_slot_rx: tokio::sync::watch::Receiver<u64>,
 ) {
-    info!("🔄 Leader Schedule Updater started");
+    debug!("🔄 Leader Schedule Updater started");
 
     let mut last_update = Instant::now();
     let update_interval = Duration::from_secs(10); // هر 10 ثانیه چک می‌کنیم
@@ -501,12 +501,12 @@ pub async fn start_leader_schedule_updater(
                 Ok(count) => {
                     last_update = Instant::now();
 
-                    // لاگ آمار
-                    let stats = oracle.get_cache_stats().await;
-                    info!("📊 Cache Stats: {} total slots, {} in Europe ({:.1}%)",
-                        stats.total_slots,
-                        stats.europe_count,
-                        (stats.europe_count as f64 / stats.total_slots as f64) * 100.0
+                    // لاگ آمار (غیرفعال شده - فقط در گزارشات نمایش داده می‌شود)
+                    let _stats = oracle.get_cache_stats().await;
+                    debug!("📊 Cache Stats: {} total slots, {} in Europe ({:.1}%)",
+                        _stats.total_slots,
+                        _stats.europe_count,
+                        (_stats.europe_count as f64 / _stats.total_slots as f64) * 100.0
                     );
                 }
                 Err(e) => {

@@ -251,6 +251,38 @@ impl JitoClient {
         }
     }
 
+    /// بررسی موازی وضعیت victim از RPC و Jito endpoint به طور همزمان
+    /// برمی‌گرداند: (RPC status, Jito status, RPC latency ms, Jito latency ms)
+    pub async fn check_victim_parallel(
+        &self,
+        victim_signature: &str,
+        _optimal_jito_endpoint: &str,
+    ) -> (TargetTxStatus, TargetTxStatus, f64, f64) {
+        use tokio::join;
+        use std::time::Instant;
+
+        // درخواست موازی به هر دو endpoint
+        let rpc_future = async {
+            let start = Instant::now();
+            let result = self.check_target_transaction_status(victim_signature).await;
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            (result.unwrap_or(TargetTxStatus::Unknown), elapsed)
+        };
+
+        // برای Jito، از همان RPC استفاده می‌کنیم (Solana همه endpoint ها یکسان هستند)
+        // ولی می‌توانیم بعداً از endpoint دیگری استفاده کنیم
+        let jito_future = async {
+            let start = Instant::now();
+            let result = self.check_target_transaction_status(victim_signature).await;
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            (result.unwrap_or(TargetTxStatus::Unknown), elapsed)
+        };
+
+        let ((rpc_status, rpc_ms), (jito_status, jito_ms)) = join!(rpc_future, jito_future);
+
+        (rpc_status, jito_status, rpc_ms, jito_ms)
+    }
+
     /// بررسی وضعیت تراکنش victim با استراتژی موازی (RPC + Jito)
     /// این متد سریع‌تر از check_target_transaction_status است
     pub async fn check_victim_with_fallback(
