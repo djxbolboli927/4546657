@@ -142,6 +142,8 @@ struct TransactionInfo {
     fee_recipient: Option<String>,
     bonding_curve_token_account: Option<String>,
     token_program_id: Option<String>,
+    // ✅ NEW: ذخیره کل تراکنش برای شبیه‌سازی victim
+    full_transaction: VersionedTransaction,
 }
 
 #[derive(Debug, Clone)]
@@ -515,54 +517,49 @@ async fn unified_worker_thread(
         }
 
         // ═══════════════════════════════════════════════════════════
-        // 🔍 PARALLEL VICTIM STATUS CHECK (RPC + Jito همزمان)
+        // 🔍 SIMULATE VICTIM TRANSACTION (بجای signature check)
         // ═══════════════════════════════════════════════════════════
         let optimal_jito_endpoint = leader_oracle.get_optimal_jito_endpoint(tx_info.slot).await;
 
-        let (rpc_status, jito_status, rpc_ms, jito_ms) = jito_client
-            .check_victim_parallel(&tx_info.signature, &optimal_jito_endpoint)
-            .await;
+        use std::time::Instant;
+        let sim_start = Instant::now();
 
-        // Track RPC stats
+        let victim_sim_result = match jito_client
+            .simulate_victim_transaction(&tx_info.full_transaction)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                warn!("   ⚠️  Victim simulation failed: {} - SKIPPING", e);
+                stats.victim_unknown_rpc.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+
+        let sim_elapsed_ms = sim_start.elapsed().as_secs_f64() * 1000.0;
         stats.victim_checks_rpc.fetch_add(1, Ordering::Relaxed);
-        match rpc_status {
-            TargetTxStatus::NotFound => stats.victim_not_found_rpc.fetch_add(1, Ordering::Relaxed),
-            TargetTxStatus::Processed => stats.victim_processed_rpc.fetch_add(1, Ordering::Relaxed),
-            TargetTxStatus::AlreadyConfirmed => stats.victim_confirmed_rpc.fetch_add(1, Ordering::Relaxed),
-            TargetTxStatus::Unknown => stats.victim_unknown_rpc.fetch_add(1, Ordering::Relaxed),
-        };
 
-        // Track Jito stats
-        stats.victim_checks_jito.fetch_add(1, Ordering::Relaxed);
-        match jito_status {
-            TargetTxStatus::NotFound => stats.victim_not_found_jito.fetch_add(1, Ordering::Relaxed),
-            TargetTxStatus::Processed => stats.victim_processed_jito.fetch_add(1, Ordering::Relaxed),
-            TargetTxStatus::AlreadyConfirmed => stats.victim_confirmed_jito.fetch_add(1, Ordering::Relaxed),
-            TargetTxStatus::Unknown => stats.victim_unknown_jito.fetch_add(1, Ordering::Relaxed),
-        };
+        info!("🔍 Victim Simulation for {}:", &tx_info.signature[..16]);
+        info!("   ⏱️  Latency: {:.1}ms", sim_elapsed_ms);
 
-        // Print separate results
-        info!("🔍 Victim Check Results for {}:", &tx_info.signature[..16]);
-        info!("   📡 RPC:   {:?} ({:.1}ms)", rpc_status, rpc_ms);
-        info!("   🎯 Jito:  {:?} ({:.1}ms)", jito_status, jito_ms);
+        if !victim_sim_result.will_succeed {
+            stats.victim_confirmed_rpc.fetch_add(1, Ordering::Relaxed);
+            info!("   ⏭️  DECISION: SKIP - Victim tx will FAIL");
+            if let Some(err) = &victim_sim_result.error {
+                info!("      ❌ Error: {:?}", err);
+            }
+            if let Some(logs) = &victim_sim_result.logs {
+                for log in logs.iter().take(3) {
+                    info!("         {}", log);
+                }
+            }
+            continue;
+        }
 
-        // Decision based on RPC status (primary source)
-        match rpc_status {
-            TargetTxStatus::AlreadyConfirmed => {
-                stats.skipped_target_confirmed.fetch_add(1, Ordering::Relaxed);
-                info!("   ⏭️  DECISION: SKIP - Already confirmed");
-                continue;
-            }
-            TargetTxStatus::Processed => {
-                info!("   ⚡ DECISION: PROCEED - Processed but not confirmed (IDEAL)");
-            }
-            TargetTxStatus::NotFound => {
-                info!("   🔍 DECISION: PROCEED - Very new transaction");
-            }
-            TargetTxStatus::Unknown => {
-                warn!("   ⚠️  DECISION: SKIP - Unknown status (safety)");
-                continue;
-            }
+        stats.victim_processed_rpc.fetch_add(1, Ordering::Relaxed);
+        info!("   ✅ DECISION: PROCEED - Victim tx will SUCCEED!");
+        if let Some(units) = victim_sim_result.units_consumed {
+            info!("      ⛽ Victim will consume {} compute units", units);
         }
 
         // Local Simulation
@@ -774,6 +771,7 @@ fn extract_transaction_info(tx: VersionedTransaction, pump_fun_program_id: &Pubk
                                 max_sol: args.max_sol, token_amount: args.token_amount, priority_fee,
                                 signature: bs58::encode(&tx.signatures[0]).into_string(), timestamp: Instant::now(),
                                 slot: current_slot, creator_vault, fee_recipient, bonding_curve_token_account, token_program_id,
+                                full_transaction: tx,  // ✅ ذخیره کل تراکنش
                             });
                         }
                     }

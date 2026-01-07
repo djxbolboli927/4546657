@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use solana_sdk::transaction::Transaction;
+use solana_sdk::transaction::{Transaction, VersionedTransaction};
 use log::{info, warn, error, debug};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -361,6 +361,69 @@ impl JitoClient {
         self.get_tip_account().to_string()
     }
 
+    /// ✅ شبیه‌سازی تراکنش victim برای بررسی اینکه آیا موفق خواهد شد یا نه
+    /// این متد حتی برای تراکنش‌هایی که هنوز در blockchain history نیستند کار می‌کند!
+    pub async fn simulate_victim_transaction(
+        &self,
+        victim_tx: &VersionedTransaction,
+    ) -> Result<VictimSimulationResult> {
+        // Serialize کردن تراکنش victim
+        let serialized = bincode::serialize(victim_tx)
+            .map_err(|e| anyhow!("Failed to serialize victim tx: {}", e))?;
+        let encoded = bs58::encode(&serialized).into_string();
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "simulateTransaction",
+            "params": [
+                encoded,
+                {
+                    "encoding": "base58",
+                    "commitment": "processed",
+                    "replaceRecentBlockhash": true,  // ✅ از blockhash جدید استفاده کن
+                    "sigVerify": false,              // ✅ signature را verify نکن
+                }
+            ]
+        });
+
+        let response = self.http_client
+            .post(&self.rpc_endpoint)
+            .json(&request)
+            .timeout(std::time::Duration::from_millis(200))  // timeout سریع برای MEV
+            .send()
+            .await
+            .map_err(|e| anyhow!("Victim simulation network error: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("RPC HTTP error: {}", response.status()));
+        }
+
+        let response_json: serde_json::Value = response.json().await
+            .map_err(|e| anyhow!("Failed to parse JSON: {}", e))?;
+
+        if let Some(err) = response_json.get("error") {
+            return Err(anyhow!("RPC API Error: {:?}", err));
+        }
+
+        if let Some(result) = response_json.get("result").and_then(|r| r.get("value")) {
+            let will_succeed = result.get("err").and_then(|e| e.as_null()).is_some();
+            let error = result.get("err").cloned();
+            let logs = result.get("logs").and_then(|l| l.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect());
+            let units_consumed = result.get("unitsConsumed").and_then(|u| u.as_u64());
+
+            Ok(VictimSimulationResult {
+                will_succeed,
+                error,
+                logs,
+                units_consumed,
+            })
+        } else {
+            Err(anyhow!("Empty result from victim simulation"))
+        }
+    }
+
     /// ✅ ارسال bundle به endpoint مشخص
     pub async fn send_bundle_with_victim(
         &self,
@@ -422,4 +485,13 @@ pub enum TargetTxStatus {
 pub enum TokenProgramType {
     TokenProgram,
     Token2022Program,
+}
+
+/// نتیجه شبیه‌سازی تراکنش victim
+#[derive(Debug)]
+pub struct VictimSimulationResult {
+    pub will_succeed: bool,
+    pub error: Option<serde_json::Value>,
+    pub logs: Option<Vec<String>>,
+    pub units_consumed: Option<u64>,
 }
