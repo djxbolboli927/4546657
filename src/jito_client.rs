@@ -424,6 +424,50 @@ impl JitoClient {
         }
     }
 
+    /// ✅ ارسال bundle تک‌تراکنشی برای تست (بدون victim)
+    /// این متد برای تست اینکه Jito bundle های ما را قبول می‌کند استفاده می‌شود
+    pub async fn send_single_transaction_bundle(
+        &self,
+        transaction: &Transaction,
+        jito_endpoint: &str,
+    ) -> Result<String> {
+        // Serialize کردن تراکنش
+        let serialized = bincode::serialize(transaction)
+            .map_err(|e| anyhow!("Failed to serialize transaction: {}", e))?;
+        let encoded = bs58::encode(&serialized).into_string();
+
+        let request_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendBundle",
+            "params": [[encoded]]  // آرایه‌ای با یک عنصر
+        });
+
+        let url = format!("{}/api/v1/bundles", jito_endpoint);
+
+        debug!("📦 Sending single-tx bundle to Jito: {}", jito_endpoint);
+
+        let response = self.http_client
+            .post(&url)
+            .json(&request_body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| anyhow!("Jito bundle send error: {}", e))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("Jito bundle rejected: {} - {}", status, error_text));
+        }
+
+        let response_text = response.text().await.unwrap_or_default();
+        let result: SendBundleResponse = serde_json::from_str(&response_text)
+            .map_err(|e| anyhow!("Failed to parse Jito response: {} - Raw: {}", e, response_text))?;
+
+        Ok(result.result)
+    }
+
     /// ✅ ارسال bundle به endpoint مشخص
     pub async fn send_bundle_with_victim(
         &self,

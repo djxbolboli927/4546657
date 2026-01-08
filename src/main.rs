@@ -667,18 +667,31 @@ async fn unified_worker_thread(
         }
 
         // ═══════════════════════════════════════════════════════════
-        // 🔒 FINAL VICTIM STATUS CHECK (Race Condition Prevention)
+        // 📦 SEND BUNDLE TO JITO (تست - فقط front-run)
         // ═══════════════════════════════════════════════════════════
-        // بررسی نهایی قبل از ارسال bundle - جلوگیری از race condition
-        if let Ok(TargetTxStatus::AlreadyConfirmed) =
-            jito_client.check_target_transaction_status(&tx_info.signature).await
-        {
-            stats.skipped_target_confirmed.fetch_add(1, Ordering::Relaxed);
-            info!("⏭️  Victim confirmed during simulation - ABORT bundle");
-            continue;
+        info!("📦 Sending bundle to Jito (test - front-run only)...");
+        match jito_client.send_single_transaction_bundle(&front_tx, &optimal_jito_endpoint).await {
+            Ok(bundle_id) => {
+                info!("   ✅ JITO BUNDLE ACCEPTED!");
+                info!("      Bundle ID: {}", bundle_id);
+                info!("      Endpoint: {}", optimal_jito_endpoint);
+                stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
+
+                // اضافه کردن سود فرضی به آمار (برای تست)
+                if is_profit {
+                    stats.total_profit_lamports.fetch_add(
+                        simulation.net_profit as u64,
+                        Ordering::Relaxed
+                    );
+                }
+            }
+            Err(e) => {
+                error!("   ❌ JITO BUNDLE REJECTED: {}", e);
+                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
-        // TODO: در مراحل بعدی bundle ارسال می‌شود
+        // TODO: در مراحل بعدی victim را هم به bundle اضافه می‌کنیم
         // match jito_client.send_bundle_with_victim(
         //     vec![front_tx],
         //     Some(tx_info.signature.clone()),
@@ -1159,6 +1172,21 @@ async fn print_detailed_report(stats: &Arc<GlobalStats>, oracle: &Arc<LeaderOrac
     info!("║     • Processed (Ideal):     {:>10} ({:>5.1}%) - Ready for sandwich      ║", jito_processed, jito_processed_pct);
     info!("║     • Confirmed (Too Late):  {:>10} ({:>5.1}%) - Already confirmed      ║", jito_confirmed, jito_confirmed_pct);
     info!("║     • Unknown (Errors):      {:>10}                                       ║", jito_unknown);
+    info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
+
+    // Jito Bundle Stats
+    let bundles_sent = stats.bundles_sent.load(Ordering::Relaxed);
+    let bundles_failed = stats.bundles_failed.load(Ordering::Relaxed);
+    let bundle_success_rate = if bundles_sent + bundles_failed > 0 {
+        (bundles_sent as f64 / (bundles_sent + bundles_failed) as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    info!("║  📦 JITO BUNDLE STATS (Test Mode - Single Transaction)                       ║");
+    info!("║     • Bundles Sent:          {:>10}                                       ║", bundles_sent);
+    info!("║     • Bundles Failed:        {:>10}                                       ║", bundles_failed);
+    info!("║     • Success Rate:          {:>10.1}%                                    ║", bundle_success_rate);
     info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
 
     // Skip Reasons
