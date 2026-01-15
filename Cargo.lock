@@ -2569,6 +2569,7 @@ version = "3.0.0"
 dependencies = [
  "anyhow",
  "backoff",
+ "base64 0.22.1",
  "bincode",
  "borsh 1.6.0",
  "bs58",

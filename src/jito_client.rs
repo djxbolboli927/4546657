@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use solana_sdk::transaction::{Transaction, VersionedTransaction};
@@ -130,27 +131,27 @@ impl JitoClient {
         JITO_TIP_ACCOUNTS[index]
     }
 
-    /// ✅ شبیه‌سازی باندل با لاگ دقیق خطا
-    /// ✅ پارامتر جدید: jito_endpoint - برای ارسال به endpoint مشخص
+    /// ✅ شبیه‌سازی باندل با استفاده از Jito simulateBundle API
+    /// این متد از Base64 encoding استفاده می‌کند (طبق مستندات جیتو)
+    /// منبع: https://www.quicknode.com/docs/solana/simulateBundle
     pub async fn simulate_bundle(&self, transactions: Vec<Transaction>, jito_endpoint: Option<&str>) -> Result<SimulateBundleValue> {
+        // تبدیل تراکنش‌ها به Base64 (نه Base58!)
         let encoded_txs: Vec<String> = transactions
             .iter()
             .map(|tx| {
                 let serialized = bincode::serialize(tx)
                     .expect("Failed to serialize transaction");
-                bs58::encode(&serialized).into_string()
+                BASE64.encode(&serialized)
             })
             .collect();
 
+        // ساختار درخواست طبق مستندات QuickNode/Jito
         let params_vec = vec![
             serde_json::json!({
-                "encodedTransactions": encoded_txs
-            }),
-            serde_json::json!({
-                "encoding": "base58",
-                "commitment": "processed",
-                "replaceRecentBlockhash": true,
-                "sigVerify": false
+                "encodedTransactions": encoded_txs,
+                "simulationBank": "Tip",           // شبیه‌سازی روی آخرین وضعیت
+                "skipSigVerify": false,            // اعتبارسنجی امضا
+                "replaceRecentBlockhash": true     // جایگزینی هش بلاک قدیمی
             })
         ];
 
@@ -422,88 +423,6 @@ impl JitoClient {
         } else {
             Err(anyhow!("Empty result from victim simulation"))
         }
-    }
-
-    /// ✅ شبیه‌سازی تراکنش front-run با استفاده از Jito endpoint
-    /// این متد برای تست شبیه‌سازی front-run از طریق جیتو استفاده می‌شود
-    pub async fn simulate_transaction_via_jito(
-        &self,
-        transaction: &Transaction,
-        jito_endpoint: &str,
-    ) -> Result<VictimSimulationResult> {
-        // Serialize کردن تراکنش
-        let serialized = bincode::serialize(transaction)
-            .map_err(|e| anyhow!("Failed to serialize transaction: {}", e))?;
-        let encoded = bs58::encode(&serialized).into_string();
-
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "simulateTransaction",
-            "params": [
-                encoded,
-                {
-                    "encoding": "base58",
-                    "commitment": "processed",
-                    "replaceRecentBlockhash": true,
-                    "sigVerify": false,
-                }
-            ]
-        });
-
-        // استفاده از Jito RPC endpoint برای شبیه‌سازی
-        let jito_rpc_url = format!("{}/api/v1/transactions", jito_endpoint);
-
-        let response = self.http_client
-            .post(&jito_rpc_url)
-            .json(&request)
-            .timeout(std::time::Duration::from_millis(500))
-            .send()
-            .await
-            .map_err(|e| anyhow!("Jito simulation network error: {}", e))?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!("Jito RPC HTTP error: {}", response.status()));
-        }
-
-        let response_text = response.text().await
-            .map_err(|e| anyhow!("Failed to read Jito response: {}", e))?;
-
-        let response_json: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| anyhow!("Failed to parse Jito response: {} - Raw: {}", e, response_text))?;
-
-        // بررسی خطا در پاسخ
-        if let Some(error) = response_json.get("error") {
-            return Ok(VictimSimulationResult {
-                will_succeed: false,
-                error: Some(error.clone()),
-                logs: None,
-                units_consumed: None,
-            });
-        }
-
-        // استخراج نتیجه شبیه‌سازی
-        let result = response_json
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .ok_or_else(|| anyhow!("Missing result.value in Jito response"))?;
-
-        let err = result.get("err");
-        let will_succeed = err.is_none() || err == Some(&serde_json::Value::Null);
-
-        let logs = result.get("logs")
-            .and_then(|l| l.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect());
-
-        let units_consumed = result.get("unitsConsumed")
-            .and_then(|u| u.as_u64());
-
-        Ok(VictimSimulationResult {
-            will_succeed,
-            error: err.cloned(),
-            logs,
-            units_consumed,
-        })
     }
 
     /// ✅ ارسال bundle تک‌تراکنشی برای تست (بدون victim)

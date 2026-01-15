@@ -171,6 +171,8 @@ struct GlobalStats {
     total_profit_lamports: AtomicU64,
     bundles_sent: AtomicUsize,
     bundles_failed: AtomicUsize,
+    jito_sim_success: AtomicUsize,
+    jito_sim_failed: AtomicUsize,
     skipped_no_pool: AtomicUsize,
     skipped_low_sol: AtomicUsize,
     skipped_same_block: AtomicUsize,
@@ -205,6 +207,8 @@ impl GlobalStats {
             total_profit_lamports: AtomicU64::new(0),
             bundles_sent: AtomicUsize::new(0),
             bundles_failed: AtomicUsize::new(0),
+            jito_sim_success: AtomicUsize::new(0),
+            jito_sim_failed: AtomicUsize::new(0),
             skipped_no_pool: AtomicUsize::new(0),
             skipped_low_sol: AtomicUsize::new(0),
             skipped_same_block: AtomicUsize::new(0),
@@ -643,31 +647,77 @@ async fn unified_worker_thread(
         };
 
         // ═══════════════════════════════════════════════════════════
-        // 🌐 NETWORK SIMULATION (شبیه‌سازی front-run)
+        // 🌐 NETWORK SIMULATION (شبیه‌سازی front-run با RPC معمولی)
         // ═══════════════════════════════════════════════════════════
-        // نکته: Jito Block Engine هیچ endpoint برای simulateTransaction ندارد!
-        // فقط از RPC معمولی سولانا برای شبیه‌سازی استفاده می‌کنیم
         if ENABLE_RPC_SIMULATION {
             match jito_client.simulate_transaction(&front_tx).await {
                 Ok(sim_result) => {
                     if let Some(err) = &sim_result.err {
-                        error!("   ❌ SIMULATION FAILED: {:?}", err);
+                        error!("   ❌ NETWORK SIM FAILED: {:?}", err);
                         if let Some(logs) = &sim_result.logs {
                             info!("      📋 Logs:");
                             for log in logs.iter().take(5) { info!("         {}", log); }
                         }
                         continue;
                     } else {
-                        info!("   ✅ SIMULATION SUCCESS!");
+                        info!("   ✅ NETWORK SIMULATION SUCCESS!");
                         if let Some(units) = sim_result.units_consumed {
                             info!("      ⛽ Units: {}", units);
                         }
                     }
                 }
                 Err(e) => {
-                    error!("   ❌ Simulation Error: {}", e);
+                    error!("   ❌ Network Simulation Error: {}", e);
                     continue;
                 }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // 🎯 JITO BUNDLE SIMULATION (شبیه‌سازی bundle با simulateBundle)
+        // ═══════════════════════════════════════════════════════════
+        info!("🎯 Jito bundle simulation (simulateBundle)...");
+        let jito_sim_start = std::time::Instant::now();
+        match jito_client.simulate_bundle(vec![front_tx.clone()], Some(&optimal_jito_endpoint)).await {
+            Ok(jito_result) => {
+                let latency = jito_sim_start.elapsed().as_secs_f64() * 1000.0;
+
+                // بررسی موفقیت از روی summary
+                let failed_count = jito_result.summary
+                    .get("failed")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1);
+
+                let is_success = failed_count == 0;
+
+                if !is_success {
+                    error!("   ❌ JITO BUNDLE SIM FAILED!");
+                    for (idx, result) in jito_result.transaction_results.iter().enumerate() {
+                        if let Some(err) = &result.err {
+                            error!("      TX {} Error: {:?}", idx, err);
+                        }
+                    }
+                    stats.jito_sim_failed.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                } else {
+                    info!("   ✅ JITO BUNDLE SIMULATION SUCCESS!");
+                    info!("      ⏱️  Latency: {:.1}ms", latency);
+
+                    // استخراج compute units
+                    if let Some(first_result) = jito_result.transaction_results.first() {
+                        if let Some(units) = first_result.units_consumed {
+                            info!("      ⛽ Units: {}", units);
+                        }
+                    }
+
+                    info!("      🔒 NOT SENT - Simulation only");
+                    stats.jito_sim_success.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Err(e) => {
+                error!("   ❌ Jito Bundle Simulation Error: {}", e);
+                stats.jito_sim_failed.fetch_add(1, Ordering::Relaxed);
+                continue;
             }
         }
 
@@ -1198,6 +1248,22 @@ async fn print_detailed_report(stats: &Arc<GlobalStats>, oracle: &Arc<LeaderOrac
     info!("║     • Bundles Sent:          {:>10}                                       ║", bundles_sent);
     info!("║     • Bundles Failed:        {:>10}                                       ║", bundles_failed);
     info!("║     • Success Rate:          {:>10.1}%                                    ║", bundle_success_rate);
+    info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
+
+    // Jito Bundle Simulation Stats
+    let jito_sim_success = stats.jito_sim_success.load(Ordering::Relaxed);
+    let jito_sim_failed = stats.jito_sim_failed.load(Ordering::Relaxed);
+    let jito_sim_total = jito_sim_success + jito_sim_failed;
+    let jito_sim_success_rate = if jito_sim_total > 0 {
+        (jito_sim_success as f64 / jito_sim_total as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    info!("║  🎯 JITO BUNDLE SIMULATION (simulateBundle API)                              ║");
+    info!("║     • Successful:            {:>10} ({:>5.1}%)                             ║", jito_sim_success, jito_sim_success_rate);
+    info!("║     • Failed:                {:>10} ({:>5.1}%)                             ║", jito_sim_failed, 100.0 - jito_sim_success_rate);
+    info!("║     • Total:                 {:>10}                                       ║", jito_sim_total);
     info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
 
     // Skip Reasons
