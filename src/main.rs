@@ -171,8 +171,6 @@ struct GlobalStats {
     total_profit_lamports: AtomicU64,
     bundles_sent: AtomicUsize,
     bundles_failed: AtomicUsize,
-    jito_simulations_success: AtomicUsize,
-    jito_simulations_failed: AtomicUsize,
     skipped_no_pool: AtomicUsize,
     skipped_low_sol: AtomicUsize,
     skipped_same_block: AtomicUsize,
@@ -207,8 +205,6 @@ impl GlobalStats {
             total_profit_lamports: AtomicU64::new(0),
             bundles_sent: AtomicUsize::new(0),
             bundles_failed: AtomicUsize::new(0),
-            jito_simulations_success: AtomicUsize::new(0),
-            jito_simulations_failed: AtomicUsize::new(0),
             skipped_no_pool: AtomicUsize::new(0),
             skipped_low_sol: AtomicUsize::new(0),
             skipped_same_block: AtomicUsize::new(0),
@@ -647,68 +643,31 @@ async fn unified_worker_thread(
         };
 
         // ═══════════════════════════════════════════════════════════
-        // 🌐 NETWORK SIMULATION (شبیه‌سازی با شبکه لوکال)
+        // 🌐 NETWORK SIMULATION (شبیه‌سازی front-run)
         // ═══════════════════════════════════════════════════════════
-        let mut network_sim_units = 0u64;
+        // نکته: Jito Block Engine هیچ endpoint برای simulateTransaction ندارد!
+        // فقط از RPC معمولی سولانا برای شبیه‌سازی استفاده می‌کنیم
         if ENABLE_RPC_SIMULATION {
-            info!("🌐 Network simulation (local RPC)...");
             match jito_client.simulate_transaction(&front_tx).await {
                 Ok(sim_result) => {
                     if let Some(err) = &sim_result.err {
-                        error!("   ❌ NETWORK SIM FAILED: {:?}", err);
+                        error!("   ❌ SIMULATION FAILED: {:?}", err);
                         if let Some(logs) = &sim_result.logs {
                             info!("      📋 Logs:");
                             for log in logs.iter().take(5) { info!("         {}", log); }
                         }
                         continue;
                     } else {
-                        info!("   ✅ NETWORK SIMULATION SUCCESS!");
+                        info!("   ✅ SIMULATION SUCCESS!");
                         if let Some(units) = sim_result.units_consumed {
                             info!("      ⛽ Units: {}", units);
-                            network_sim_units = units;
                         }
                     }
                 }
                 Err(e) => {
-                    error!("   ❌ Network Simulation Error: {}", e);
+                    error!("   ❌ Simulation Error: {}", e);
                     continue;
                 }
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════════
-        // 🎯 JITO SIMULATION (شبیه‌سازی از طریق جیتو)
-        // ═══════════════════════════════════════════════════════════
-        info!("🎯 Jito simulation (via Jito RPC)...");
-        let jito_sim_start = std::time::Instant::now();
-        match jito_client.simulate_transaction_via_jito(&front_tx, &optimal_jito_endpoint).await {
-            Ok(jito_sim_result) => {
-                let jito_latency = jito_sim_start.elapsed().as_secs_f64() * 1000.0;
-                if !jito_sim_result.will_succeed {
-                    error!("   ❌ JITO SIM FAILED!");
-                    if let Some(err) = &jito_sim_result.error {
-                        error!("      Error: {:?}", err);
-                    }
-                    if let Some(logs) = &jito_sim_result.logs {
-                        info!("      📋 Logs:");
-                        for log in logs.iter().take(5) { info!("         {}", log); }
-                    }
-                    stats.jito_simulations_failed.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                } else {
-                    info!("   ✅ JITO SIMULATION SUCCESS!");
-                    info!("      ⏱️  Latency: {:.1}ms", jito_latency);
-                    if let Some(units) = jito_sim_result.units_consumed {
-                        info!("      ⛽ Units: {}", units);
-                        info!("      📊 Comparison: Network={} vs Jito={}", network_sim_units, units);
-                    }
-                    stats.jito_simulations_success.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            Err(e) => {
-                error!("   ❌ Jito Simulation Error: {}", e);
-                stats.jito_simulations_failed.fetch_add(1, Ordering::Relaxed);
-                continue;
             }
         }
 
@@ -1239,22 +1198,6 @@ async fn print_detailed_report(stats: &Arc<GlobalStats>, oracle: &Arc<LeaderOrac
     info!("║     • Bundles Sent:          {:>10}                                       ║", bundles_sent);
     info!("║     • Bundles Failed:        {:>10}                                       ║", bundles_failed);
     info!("║     • Success Rate:          {:>10.1}%                                    ║", bundle_success_rate);
-    info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
-
-    // Jito Simulation Stats
-    let jito_sim_success = stats.jito_simulations_success.load(Ordering::Relaxed);
-    let jito_sim_failed = stats.jito_simulations_failed.load(Ordering::Relaxed);
-    let jito_sim_total = jito_sim_success + jito_sim_failed;
-    let jito_sim_success_rate = if jito_sim_total > 0 {
-        (jito_sim_success as f64 / jito_sim_total as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    info!("║  🎯 JITO SIMULATION STATS (Front-run via Jito RPC)                           ║");
-    info!("║     • Successful:            {:>10} ({:>5.1}%)                             ║", jito_sim_success, jito_sim_success_rate);
-    info!("║     • Failed:                {:>10} ({:>5.1}%)                             ║", jito_sim_failed, 100.0 - jito_sim_success_rate);
-    info!("║     • Total:                 {:>10}                                       ║", jito_sim_total);
     info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
 
     // Skip Reasons
