@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use backoff::{future::retry, ExponentialBackoff};
+use bincode;
 use borsh::BorshDeserialize;
 use bs58;
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -667,14 +668,20 @@ async fn unified_worker_thread(
         }
 
         // ═══════════════════════════════════════════════════════════
-        // 📦 SEND BUNDLE TO JITO (تست - فقط front-run)
+        // 📦 TEST BUNDLE CONSTRUCTION (شبیه‌سازی - بدون ارسال واقعی)
         // ═══════════════════════════════════════════════════════════
-        info!("📦 Sending bundle to Jito (test - front-run only)...");
-        match jito_client.send_single_transaction_bundle(&front_tx, &optimal_jito_endpoint).await {
-            Ok(bundle_id) => {
-                info!("   ✅ JITO BUNDLE ACCEPTED!");
-                info!("      Bundle ID: {}", bundle_id);
-                info!("      Endpoint: {}", optimal_jito_endpoint);
+        info!("📦 Testing bundle construction (NOT sending to Jito)...");
+        match bincode::serialize(&front_tx) {
+            Ok(serialized) => {
+                let encoded = bs58::encode(&serialized).into_string();
+                info!("   ✅ BUNDLE CONSTRUCTION SUCCESS!");
+                info!("      Front-run serialized: {} bytes", serialized.len());
+                info!("      Base58 encoded: {}... ({} chars)",
+                    &encoded[..60.min(encoded.len())],
+                    encoded.len()
+                );
+                info!("      Target endpoint: {}", optimal_jito_endpoint);
+                info!("      🔒 NOT SENT - Simulation mode only");
                 stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
 
                 // اضافه کردن سود فرضی به آمار (برای تست)
@@ -686,7 +693,7 @@ async fn unified_worker_thread(
                 }
             }
             Err(e) => {
-                error!("   ❌ JITO BUNDLE REJECTED: {}", e);
+                error!("   ❌ BUNDLE SERIALIZATION FAILED: {}", e);
                 stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
             }
         }
