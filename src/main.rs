@@ -75,7 +75,8 @@ const FEE_DENOMINATOR: u64 = 10000;
 
 const SANDWICH_MIN_PROFIT_LAMPORTS: u64 = LAMPORTS_PER_SOL / 500;
 const SANDWICH_SAFETY_MARGIN: f64 = 0.90;
-const JITO_TIP_LAMPORTS: u64 = LAMPORTS_PER_SOL / 1000;
+// ✅ Jito tip: 0.005 SOL (5,000,000 lamports)
+const JITO_TIP_LAMPORTS: u64 = LAMPORTS_PER_SOL / 200;
 const ESTIMATED_NETWORK_FEE: u64 = 5000;
 
 const FRONT_RUN_FEE_MULTIPLIER: f64 = 1.0;
@@ -519,51 +520,8 @@ async fn unified_worker_thread(
         }
 
         // ═══════════════════════════════════════════════════════════
-        // 🔍 SIMULATE VICTIM TRANSACTION (بجای signature check)
+        // 🧮 LOCAL PROFITABILITY SIMULATION (فقط محاسبه محلی)
         // ═══════════════════════════════════════════════════════════
-        let optimal_jito_endpoint = leader_oracle.get_optimal_jito_endpoint(tx_info.slot).await;
-
-        use std::time::Instant;
-        let sim_start = Instant::now();
-
-        let victim_sim_result = match jito_client
-            .simulate_victim_transaction(&tx_info.full_transaction)
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                warn!("   ⚠️  Victim simulation failed: {} - SKIPPING", e);
-                stats.victim_unknown_rpc.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-        };
-
-        let sim_elapsed_ms = sim_start.elapsed().as_secs_f64() * 1000.0;
-        stats.victim_checks_rpc.fetch_add(1, Ordering::Relaxed);
-
-        info!("🔍 Victim Simulation for {}:", &tx_info.signature[..16]);
-        info!("   ⏱️  Latency: {:.1}ms", sim_elapsed_ms);
-
-        if !victim_sim_result.will_succeed {
-            stats.victim_confirmed_rpc.fetch_add(1, Ordering::Relaxed);
-            info!("   ⏭️  DECISION: SKIP - Victim tx will FAIL");
-            if let Some(err) = &victim_sim_result.error {
-                info!("      ❌ Error: {:?}", err);
-            }
-            if let Some(logs) = &victim_sim_result.logs {
-                for log in logs.iter().take(3) {
-                    info!("         {}", log);
-                }
-            }
-            continue;
-        }
-
-        stats.victim_processed_rpc.fetch_add(1, Ordering::Relaxed);
-        info!("   ✅ DECISION: PROCEED - Victim tx will SUCCEED!");
-        if let Some(units) = victim_sim_result.units_consumed {
-            info!("      ⛽ Victim will consume {} compute units", units);
-        }
-
         // Local Simulation
         let simulation = simulate_sandwich_attack(&tx_info, &pool_state);
 
@@ -624,10 +582,10 @@ async fn unified_worker_thread(
 
         let safe_front_run_sol = (simulation.front_run_sol as f64 * 1.70) as u64;
 
-        // 🌍 endpoint بهینه قبلاً در بررسی victim محاسبه شده است
-        info!("🎯 Using Jito endpoint: {}", optimal_jito_endpoint);
+        // 🌍 انتخاب Jito endpoint بهینه (Frankfurt = بهترین برای سرور ما)
+        let optimal_jito_endpoint = leader_oracle.get_optimal_jito_endpoint(tx_info.slot).await;
 
-        // Build Transaction
+        // Build Transactions
         let front_tx = match tx_builder.build_front_run_transaction(
             &wallet_manager.front_runner,
             &mint,

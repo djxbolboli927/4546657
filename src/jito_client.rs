@@ -551,3 +551,117 @@ pub struct VictimSimulationResult {
     pub logs: Option<Vec<String>>,
     pub units_consumed: Option<u64>,
 }
+
+/// Response از sendBundle API
+#[derive(Debug, Deserialize)]
+pub struct SendBundleRealResponse {
+    pub jsonrpc: String,
+    pub id: u64,
+    pub result: String, // bundle UUID
+}
+
+/// Bundle status از getBundleStatuses
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleStatusResult {
+    pub bundle_id: String,
+    pub status: String, // "Invalid", "Pending", "Failed", "Landed"
+    #[serde(default)]
+    pub landed_slot: Option<u64>,
+}
+
+impl JitoClient {
+    /// ✅ ارسال واقعی bundle به Jito Block Engine (Frankfurt/Amsterdam)
+    /// با استفاده از VersionedTransaction و Base58 encoding
+    pub async fn send_bundle_real(
+        &self,
+        transactions: Vec<VersionedTransaction>,
+        jito_endpoint: &str,
+    ) -> Result<String> {
+        // تبدیل به Base58 (نه Base64!)
+        let encoded_txs: Vec<String> = transactions
+            .iter()
+            .map(|tx| {
+                let serialized = bincode::serialize(tx)
+                    .expect("Failed to serialize transaction");
+                bs58::encode(&serialized).into_string()
+            })
+            .collect();
+
+        let params_vec = vec![encoded_txs];
+
+        let request_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendBundle",
+            "params": params_vec
+        });
+
+        let url = format!("{}/api/v1/bundles", jito_endpoint);
+
+        let response = self.http_client
+            .post(&url)
+            .json(&request_body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| anyhow!("Jito send error: {}", e))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("Jito rejected ({}): {}", status, error_text));
+        }
+
+        let response_text = response.text().await.unwrap_or_default();
+        let result: SendBundleRealResponse = serde_json::from_str(&response_text)
+            .map_err(|e| anyhow!("Parse error: {} - Raw: {}", e, response_text))?;
+
+        Ok(result.result)
+    }
+
+    /// ✅ دریافت وضعیت bundle از Block Engine
+    pub async fn get_bundle_status(
+        &self,
+        bundle_ids: Vec<String>,
+        jito_endpoint: &str,
+    ) -> Result<Vec<BundleStatusResult>> {
+        let request_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getInflightBundleStatuses",
+            "params": [bundle_ids]
+        });
+
+        let url = format!("{}/api/v1/bundles", jito_endpoint);
+
+        let response = self.http_client
+            .post(&url)
+            .json(&request_body)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| anyhow!("Status query error: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("HTTP error: {}", response.status()));
+        }
+
+        let response_text = response.text().await.unwrap_or_default();
+
+        #[derive(Debug, Deserialize)]
+        struct StatusResponse {
+            result: StatusValue,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct StatusValue {
+            value: Vec<BundleStatusResult>,
+        }
+
+        let result: StatusResponse = serde_json::from_str(&response_text)
+            .map_err(|e| anyhow!("Parse error: {} - Raw: {}", e, response_text))?;
+
+        Ok(result.result.value)
+    }
+}
