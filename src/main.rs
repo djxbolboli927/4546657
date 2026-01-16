@@ -77,6 +77,16 @@ const SANDWICH_MIN_PROFIT_LAMPORTS: u64 = LAMPORTS_PER_SOL / 500;
 const SANDWICH_SAFETY_MARGIN: f64 = 0.90;
 // ✅ Jito tip: 0.005 SOL (5,000,000 lamports)
 const JITO_TIP_LAMPORTS: u64 = LAMPORTS_PER_SOL / 200;
+const JITO_TIP_ACCOUNTS: [&str; 8] = [
+    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+    "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+];
 const ESTIMATED_NETWORK_FEE: u64 = 5000;
 
 const FRONT_RUN_FEE_MULTIPLIER: f64 = 1.0;
@@ -87,9 +97,6 @@ const PUMP_FUN_DISCRIMINATOR: [u8; 8] = [0x17, 0xb7, 0xf8, 0x37, 0x60, 0xd8, 0xa
 
 const CLEANUP_INTERVAL_SECS: u64 = 300;
 const MAX_ACTIVITY_AGE_SECS: u64 = 600;
-
-// ❌ غیرفعال - فقط Jito bundle simulation استفاده می‌شود
-const ENABLE_RPC_SIMULATION: bool = false;
 
 // ═══════════════════════════════════════════════════════════════
 // DATA STRUCTURES
@@ -172,6 +179,7 @@ struct GlobalStats {
     geyser_updates: AtomicUsize,
     total_profit_lamports: AtomicU64,
     bundles_sent: AtomicUsize,
+    bundles_landed: AtomicUsize,
     bundles_failed: AtomicUsize,
     skipped_no_pool: AtomicUsize,
     skipped_low_sol: AtomicUsize,
@@ -206,6 +214,7 @@ impl GlobalStats {
             geyser_updates: AtomicUsize::new(0),
             total_profit_lamports: AtomicU64::new(0),
             bundles_sent: AtomicUsize::new(0),
+            bundles_landed: AtomicUsize::new(0),
             bundles_failed: AtomicUsize::new(0),
             skipped_no_pool: AtomicUsize::new(0),
             skipped_low_sol: AtomicUsize::new(0),
@@ -439,34 +448,14 @@ fn simulate_sandwich_attack(victim_tx: &TransactionInfo, pool: &PoolState) -> Sa
 }
 
 fn print_simulation_result(sim: &SandwichSimulation, worker_id: usize, profitable: bool) {
-    let status = if profitable { "✅ PROFITABLE" } else { "❌ UNPROFITABLE" };
-
-    info!("╔═══════════════════════════════════════════════════════════╗");
-    info!("║ {} SANDWICH [Worker {}]", status, worker_id);
-    info!("╠═══════════════════════════════════════════════════════════╣");
-    info!("║ VICTIM:");
-    info!("║   Signature: ...{}", &sim.victim_tx.signature[sim.victim_tx.signature.len()-8..]);
-    info!("║   Token Amount: {}", sim.victim_tx.token_amount);
-    info!("║   Max SOL: {:.6}", sim.victim_tx.max_sol as f64 / LAMPORTS_PER_SOL as f64);
-    info!("║   Priority Fee: {} μLamp", sim.victim_tx.priority_fee);
-    info!("╠═══════════════════════════════════════════════════════════╣");
-    info!("║ ATTACK:");
-    info!("║   1. Front-run: {:.6} SOL → {} tokens",
-          sim.front_run_sol as f64 / LAMPORTS_PER_SOL as f64,
-          sim.front_run_tokens);
-    info!("║   2. Victim pays: {:.6} SOL (limit: {:.6})",
-          sim.victim_cost_after_frontrun as f64 / LAMPORTS_PER_SOL as f64,
-          sim.victim_tx.max_sol as f64 / LAMPORTS_PER_SOL as f64);
-    info!("║   3. Back-run: {} tokens → {:.6} SOL",
-          sim.front_run_tokens,
-          sim.back_run_sol as f64 / LAMPORTS_PER_SOL as f64);
-    info!("╠═══════════════════════════════════════════════════════════╣");
-    info!("║ PROFIT:");
-    info!("║   Gross: {:.6} SOL", sim.gross_profit as f64 / LAMPORTS_PER_SOL as f64);
-    info!("║   Fees: {:.6} SOL", sim.total_fees as f64 / LAMPORTS_PER_SOL as f64);
-    info!("║   Net: {:.6} SOL", sim.net_profit as f64 / LAMPORTS_PER_SOL as f64);
-    info!("║   ROI: {:.2}%", sim.roi_percent);
-    info!("╚═══════════════════════════════════════════════════════════╝");
+    if profitable {
+        info!("💰 W{} | Profit: {:.4} SOL | ROI: {:.1}% | Tx: ...{}",
+            worker_id,
+            sim.net_profit as f64 / LAMPORTS_PER_SOL as f64,
+            sim.roi_percent,
+            &sim.victim_tx.signature[sim.victim_tx.signature.len()-8..]
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -605,51 +594,10 @@ async fn unified_worker_thread(
         };
 
         // ═══════════════════════════════════════════════════════════
-        // 🌐 NETWORK SIMULATION (شبیه‌سازی front-run با RPC معمولی)
+        // 🚀 REAL JITO BUNDLE SENDING (ارسال واقعی به Block Engine)
         // ═══════════════════════════════════════════════════════════
-        if ENABLE_RPC_SIMULATION {
-            match jito_client.simulate_transaction(&front_tx).await {
-                Ok(sim_result) => {
-                    if let Some(err) = &sim_result.err {
-                        error!("   ❌ NETWORK SIM FAILED: {:?}", err);
-                        if let Some(logs) = &sim_result.logs {
-                            info!("      📋 Logs:");
-                            for log in logs.iter().take(5) { info!("         {}", log); }
-                        }
-                        continue;
-                    } else {
-                        info!("   ✅ NETWORK SIMULATION SUCCESS!");
-                        if let Some(units) = sim_result.units_consumed {
-                            info!("      ⛽ Units: {}", units);
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("   ❌ Network Simulation Error: {}", e);
-                    continue;
-                }
-            }
-        }
 
-        // ═══════════════════════════════════════════════════════════
-        // 🎯 JITO BUNDLE SIMULATION (شبیه‌سازی از طریق RPC endpoint)
-        // ═══════════════════════════════════════════════════════════
-        // نکته: simulateBundle به RPC endpoint می‌فرستد (ERPC با پشتیبانی Jito)
-        // برای sendBundle از Block Engine استفاده می‌شود
-
-        // انتخاب آدرس تیپ Jito (Frankfurt)
-        const JITO_TIP_LAMPORTS: u64 = 10_000; // 0.00001 SOL
-        const JITO_TIP_ACCOUNTS: [&str; 8] = [
-            "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
-            "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
-            "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
-            "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
-            "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
-            "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
-            "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
-            "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
-        ];
-
+        // Parse Jito tip account
         let jito_tip_account = match JITO_TIP_ACCOUNTS[0].parse::<Pubkey>() {
             Ok(pk) => pk,
             Err(_) => {
@@ -658,16 +606,15 @@ async fn unified_worker_thread(
             }
         };
 
-        // ساخت تراکنش back-run با tip در همان تراکنش
-        // back-run همان مقدار توکن‌هایی که در front-run خریدیم را می‌فروشد
+        // Build back-run transaction with Jito tip
         let back_tx = match tx_builder.build_back_run_transaction(
             &wallet_manager.front_runner,
             &mint,
             &creator_vault,
-            simulation.front_run_tokens, // می‌فروشیم همان مقداری که خریدیم
-            0, // min_sol_output (می‌توانیم بعداً محاسبه کنیم)
+            simulation.front_run_tokens,
+            0, // min_sol_output
             50_000, // priority fee
-            JITO_TIP_LAMPORTS, // tip در همان تراکنش
+            JITO_TIP_LAMPORTS, // 0.005 SOL tip
             &jito_tip_account,
             blockhash,
             token_program_type,
@@ -675,155 +622,75 @@ async fn unified_worker_thread(
         ).await {
             Ok(tx) => tx,
             Err(e) => {
-                error!("   ❌ Back-Run Build Failed: {}", e);
+                error!("   ❌ Back-run build failed: {}", e);
                 continue;
             }
         };
 
-        // تبدیل تراکنش‌ها به VersionedTransaction
-        let front_vtx = VersionedTransaction::from(front_tx.clone());
-        let victim_vtx = tx_info.full_transaction.clone(); // از قبل VersionedTransaction است
-        let back_vtx = VersionedTransaction::from(back_tx);
+        // Create bundle: [front-run, victim, back-run+tip]
+        let bundle = vec![
+            VersionedTransaction::from(front_tx),
+            tx_info.full_transaction.clone(),
+            VersionedTransaction::from(back_tx),
+        ];
 
-        info!("🎯 Jito bundle simulation (via RPC)...");
-        info!("   📦 Bundle: [front_tx, victim_tx, back_tx + tip] - 3 transactions");
-        info!("   💰 Tip amount: {} lamports (0.00001 SOL) - included in back_tx", JITO_TIP_LAMPORTS);
+        // Send bundle to Jito Block Engine
+        info!("🚀 Sending bundle to Jito (tip: {} SOL)...", JITO_TIP_LAMPORTS as f64 / LAMPORTS_PER_SOL as f64);
 
-        let jito_sim_start = std::time::Instant::now();
-        match jito_client.simulate_bundle(
-            vec![
-                front_vtx,      // خرید ما (قبل از victim)
-                victim_vtx,     // تراکنش victim (legacy یا v0)
-                back_vtx,       // فروش ما + پرداخت انعام Jito
-            ],
-            Some(&optimal_jito_endpoint)
+        let bundle_uuid = match jito_client.send_bundle_real(
+            bundle,
+            &optimal_jito_endpoint,
         ).await {
-            Ok(jito_result) => {
-                let latency = jito_sim_start.elapsed().as_secs_f64() * 1000.0;
-
-                // بررسی موفقیت - روش ترکیبی (امن‌ترین)
-                // 1. اول چک می‌کنیم که آیا در نتایج تراکنش‌ها خطا وجود دارد
-                let has_error = jito_result.transaction_results
-                    .iter()
-                    .any(|r| r.err.is_some());
-
-                // 2. سپس summary را هم چک می‌کنیم (ممکن است string یا object باشد)
-                let summary_ok = if let Some(summary_str) = jito_result.summary.as_str() {
-                    // اگر summary یک string است (مثل "succeeded")
-                    summary_str.contains("succeed")
-                } else {
-                    // اگر summary یک object است (مثل {"failed": 0, "succeeded": 1})
-                    jito_result.summary
-                        .get("failed")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) == 0
-                };
-
-                let is_success = !has_error && summary_ok;
-
-                if !is_success {
-                    error!("   ❌ JITO BUNDLE SIM FAILED!");
-                    error!("      📊 Has error in results: {}", has_error);
-                    error!("      📊 Summary OK: {}", summary_ok);
-                    error!("      📋 Full summary: {:?}", jito_result.summary);
-
-                    if jito_result.transaction_results.is_empty() {
-                        error!("      ⚠️  Transaction results array is EMPTY!");
-                    } else {
-                        error!("      📦 Transaction results count: {}", jito_result.transaction_results.len());
-                        for (idx, result) in jito_result.transaction_results.iter().enumerate() {
-                            error!("      🔍 TX {} Full Result:", idx);
-                            error!("         - Error: {:?}", result.err);
-                            error!("         - Logs: {:?}", result.logs);
-                            error!("         - Units consumed: {:?}", result.units_consumed);
-                            if let Some(accounts) = &result.accounts {
-                                error!("         - Accounts modified: {}", accounts.len());
-                            }
-                        }
-                    }
-                    continue;
-                } else {
-                    info!("   ✅ JITO BUNDLE SIMULATION SUCCESS!");
-                    info!("      ⏱️  Latency: {:.1}ms", latency);
-                    info!("      📦 Bundle size: {} transactions", jito_result.transaction_results.len());
-
-                    // نمایش جزئیات هر تراکنش در باندل
-                    for (idx, result) in jito_result.transaction_results.iter().enumerate() {
-                        let tx_name = match idx {
-                            0 => "Front-run (our buy)",
-                            1 => "Victim transaction",
-                            2 => "Back-run (our sell + Jito tip)",
-                            _ => "Unknown",
-                        };
-
-                        if let Some(units) = result.units_consumed {
-                            info!("      ⛽ TX {}: {} - {} units", idx, tx_name, units);
-                        } else {
-                            info!("      📝 TX {}: {}", idx, tx_name);
-                        }
-                    }
-
-                    // محاسبه مجموع compute units
-                    let total_units: u64 = jito_result.transaction_results
-                        .iter()
-                        .filter_map(|r| r.units_consumed)
-                        .sum();
-                    info!("      🔢 Total compute units: {}", total_units);
-                    info!("      🔒 NOT SENT - Simulation only");
-                }
+            Ok(uuid) => {
+                info!("   ✅ Bundle sent! UUID: {}", uuid);
+                stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
+                uuid
             }
             Err(e) => {
-                error!("   ❌ Jito Bundle Simulation Error: {}", e);
+                error!("   ❌ Bundle send failed: {}", e);
+                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-        }
+        };
 
-        // ═══════════════════════════════════════════════════════════
-        // 📦 TEST BUNDLE CONSTRUCTION (ساخت باندل - بدون ارسال واقعی)
-        // ═══════════════════════════════════════════════════════════
-        info!("📦 Testing bundle construction (NOT sending to Jito)...");
-        match bincode::serialize(&front_tx) {
-            Ok(serialized) => {
-                let encoded = bs58::encode(&serialized).into_string();
-                info!("   ✅ BUNDLE CONSTRUCTION SUCCESS!");
-                info!("      Front-run serialized: {} bytes", serialized.len());
-                info!("      Base58 encoded: {}... ({} chars)",
-                    &encoded[..60.min(encoded.len())],
-                    encoded.len()
-                );
-                info!("      Target endpoint: {}", optimal_jito_endpoint);
-                info!("      🔒 NOT SENT - Simulation mode only");
-                stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
+        // Wait briefly before checking status
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-                // اضافه کردن سود فرضی به آمار (برای تست)
-                if is_profit {
-                    stats.total_profit_lamports.fetch_add(
-                        simulation.net_profit as u64,
-                        Ordering::Relaxed
-                    );
+        // Check bundle status
+        match jito_client.get_bundle_status(
+            vec![bundle_uuid.clone()],
+            &optimal_jito_endpoint
+        ).await {
+            Ok(statuses) => {
+                if let Some(status) = statuses.first() {
+                    match status.status.as_str() {
+                        "Landed" => {
+                            info!("   🎯 LANDED! Slot: {:?}", status.landed_slot);
+                            stats.bundles_landed.fetch_add(1, Ordering::Relaxed);
+                            if is_profit {
+                                stats.total_profit_lamports.fetch_add(
+                                    simulation.net_profit as u64,
+                                    Ordering::Relaxed
+                                );
+                            }
+                        }
+                        "Failed" => {
+                            error!("   ❌ Bundle FAILED");
+                            stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        "Pending" => {
+                            info!("   ⏳ Bundle PENDING");
+                        }
+                        _ => {
+                            info!("   ❓ Status: {}", status.status);
+                        }
+                    }
                 }
             }
             Err(e) => {
-                error!("   ❌ BUNDLE SERIALIZATION FAILED: {}", e);
-                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+                error!("   ⚠️  Status check error: {}", e);
             }
         }
-
-        // TODO: در مراحل بعدی victim را هم به bundle اضافه می‌کنیم
-        // match jito_client.send_bundle_with_victim(
-        //     vec![front_tx],
-        //     Some(tx_info.signature.clone()),
-        //     Some(&optimal_jito_endpoint),  // 🌍 استفاده از endpoint بهینه
-        // ).await {
-        //     Ok(bundle_id) => {
-        //         info!("✅ Bundle sent: {}", bundle_id);
-        //         stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
-        //     }
-        //     Err(e) => {
-        //         error!("❌ Bundle send failed: {}", e);
-        //         stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
-        //     }
-        // }
     }
     info!("Worker {} stopped", worker_id);
 }
@@ -1294,17 +1161,18 @@ async fn print_detailed_report(stats: &Arc<GlobalStats>, oracle: &Arc<LeaderOrac
 
     // Jito Bundle Stats
     let bundles_sent = stats.bundles_sent.load(Ordering::Relaxed);
+    let bundles_landed = stats.bundles_landed.load(Ordering::Relaxed);
     let bundles_failed = stats.bundles_failed.load(Ordering::Relaxed);
-    let bundle_success_rate = if bundles_sent + bundles_failed > 0 {
-        (bundles_sent as f64 / (bundles_sent + bundles_failed) as f64) * 100.0
+    let bundle_success_rate = if bundles_sent > 0 {
+        (bundles_landed as f64 / bundles_sent as f64) * 100.0
     } else {
         0.0
     };
 
-    info!("║  📦 JITO BUNDLE STATS (Test Mode - Single Transaction)                       ║");
+    info!("║  📦 JITO BUNDLE STATS (Real Execution - 3-tx Sandwich)                       ║");
     info!("║     • Bundles Sent:          {:>10}                                       ║", bundles_sent);
+    info!("║     • Bundles Landed:        {:>10} ({:>5.1}%)                           ║", bundles_landed, bundle_success_rate);
     info!("║     • Bundles Failed:        {:>10}                                       ║", bundles_failed);
-    info!("║     • Success Rate:          {:>10.1}%                                    ║", bundle_success_rate);
     info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
 
     // Skip Reasons
