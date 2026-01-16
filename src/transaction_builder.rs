@@ -190,6 +190,53 @@ impl TransactionBuilder {
         Ok(transaction)
     }
 
+    /// ساخت تراکنش پرداخت انعام (tip) به Jito
+    /// این تراکنش باید در باندل قرار بگیرد تا Jito bundle را بپذیرد
+    pub fn build_jito_tip_transaction(
+        &self,
+        payer: &Keypair,
+        tip_lamports: u64,
+        recent_blockhash: Hash,
+    ) -> Result<Transaction> {
+        // آدرس‌های تیپ Jito برای Frankfurt region
+        const JITO_TIP_ACCOUNTS: [&str; 8] = [
+            "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+            "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+            "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+            "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+            "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+            "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+            "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+            "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+        ];
+
+        // انتخاب یکی از آدرس‌ها (می‌توان random کرد، اما فعلا اولی را می‌گیریم)
+        let tip_account = JITO_TIP_ACCOUNTS[0]
+            .parse::<Pubkey>()
+            .map_err(|e| anyhow::anyhow!("Invalid Jito tip account: {}", e))?;
+
+        debug!("💰 Building Jito tip transaction: {} lamports to {}", tip_lamports, tip_account);
+
+        // ساخت instruction انتقال SOL
+        let transfer_ix = system_instruction::transfer(
+            &payer.pubkey(),
+            &tip_account,
+            tip_lamports,
+        );
+
+        // ساخت message و transaction
+        let message = Message::new_with_blockhash(
+            &[transfer_ix],
+            Some(&payer.pubkey()),
+            &recent_blockhash,
+        );
+
+        let mut transaction = Transaction::new_unsigned(message);
+        transaction.sign(&[payer], recent_blockhash);
+
+        Ok(transaction)
+    }
+
     pub async fn get_recent_blockhash(&self) -> Result<Hash> {
         let blockhash = self.rpc_client
             .get_latest_blockhash()
