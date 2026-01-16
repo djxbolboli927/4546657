@@ -690,9 +690,21 @@ async fn unified_worker_thread(
 
                 if !is_success {
                     error!("   ❌ JITO BUNDLE SIM FAILED!");
-                    for (idx, result) in jito_result.transaction_results.iter().enumerate() {
-                        if let Some(err) = &result.err {
-                            error!("      TX {} Error: {:?}", idx, err);
+                    error!("      📊 Failed count: {}", failed_count);
+                    error!("      📋 Full summary: {:?}", jito_result.summary);
+
+                    if jito_result.transaction_results.is_empty() {
+                        error!("      ⚠️  Transaction results array is EMPTY!");
+                    } else {
+                        error!("      📦 Transaction results count: {}", jito_result.transaction_results.len());
+                        for (idx, result) in jito_result.transaction_results.iter().enumerate() {
+                            error!("      🔍 TX {} Full Result:", idx);
+                            error!("         - Error: {:?}", result.err);
+                            error!("         - Logs: {:?}", result.logs);
+                            error!("         - Units consumed: {:?}", result.units_consumed);
+                            if let Some(accounts) = &result.accounts {
+                                error!("         - Accounts modified: {}", accounts.len());
+                            }
                         }
                     }
                     continue;

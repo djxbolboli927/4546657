@@ -199,8 +199,13 @@ impl JitoClient {
         }
 
         if let Some(result) = sim_response.result {
+            debug!("✅ Jito simulation response received");
+            debug!("   Summary: {:?}", result.value.summary);
+            debug!("   Transaction results count: {}", result.value.transaction_results.len());
             Ok(result.value)
         } else {
+            error!("❌ Empty result from Jito simulation");
+            error!("   Raw response: {}", response_text);
             Err(anyhow!("Empty result from Jito simulation"))
         }
     }
