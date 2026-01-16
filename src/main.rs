@@ -670,11 +670,51 @@ async fn unified_worker_thread(
         }
 
         // ═══════════════════════════════════════════════════════════
-        // 🎯 JITO BUNDLE SIMULATION (غیرفعال - نیاز به QuickNode Premium)
+        // 🎯 JITO BUNDLE SIMULATION (شبیه‌سازی از طریق RPC endpoint)
         // ═══════════════════════════════════════════════════════════
-        // نکته: simulateBundle فقط در سرویس‌های پریمیوم (QuickNode با Lil' JIT افزونه) کار می‌کند
-        // Endpoint های عمومی جیتو خطای "Invalid method" می‌دهند
-        // برای فعال‌سازی: از QuickNode endpoint با افزونه Lil' JIT استفاده کنید
+        // نکته: simulateBundle به RPC endpoint می‌فرستد (ERPC با پشتیبانی Jito)
+        // برای sendBundle از Block Engine استفاده می‌شود
+        info!("🎯 Jito bundle simulation (via RPC)...");
+        let jito_sim_start = std::time::Instant::now();
+        match jito_client.simulate_bundle(vec![front_tx.clone()], Some(&optimal_jito_endpoint)).await {
+            Ok(jito_result) => {
+                let latency = jito_sim_start.elapsed().as_secs_f64() * 1000.0;
+
+                // بررسی موفقیت از روی summary
+                let failed_count = jito_result.summary
+                    .get("failed")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1);
+
+                let is_success = failed_count == 0;
+
+                if !is_success {
+                    error!("   ❌ JITO BUNDLE SIM FAILED!");
+                    for (idx, result) in jito_result.transaction_results.iter().enumerate() {
+                        if let Some(err) = &result.err {
+                            error!("      TX {} Error: {:?}", idx, err);
+                        }
+                    }
+                    continue;
+                } else {
+                    info!("   ✅ JITO BUNDLE SIMULATION SUCCESS!");
+                    info!("      ⏱️  Latency: {:.1}ms", latency);
+
+                    // استخراج compute units
+                    if let Some(first_result) = jito_result.transaction_results.first() {
+                        if let Some(units) = first_result.units_consumed {
+                            info!("      ⛽ Units: {}", units);
+                        }
+                    }
+
+                    info!("      🔒 NOT SENT - Simulation only");
+                }
+            }
+            Err(e) => {
+                error!("   ❌ Jito Bundle Simulation Error: {}", e);
+                continue;
+            }
+        }
 
         // ═══════════════════════════════════════════════════════════
         // 📦 TEST BUNDLE CONSTRUCTION (ساخت باندل - بدون ارسال واقعی)

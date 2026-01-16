@@ -133,8 +133,9 @@ impl JitoClient {
 
     /// ✅ شبیه‌سازی باندل با استفاده از Jito simulateBundle API
     /// این متد از Base64 encoding استفاده می‌کند (طبق مستندات جیتو)
+    /// نکته مهم: simulateBundle باید به RPC endpoint فرستاده شود (نه Block Engine!)
     /// منبع: https://www.quicknode.com/docs/solana/simulateBundle
-    pub async fn simulate_bundle(&self, transactions: Vec<Transaction>, jito_endpoint: Option<&str>) -> Result<SimulateBundleValue> {
+    pub async fn simulate_bundle(&self, transactions: Vec<Transaction>, _jito_endpoint: Option<&str>) -> Result<SimulateBundleValue> {
         // تبدیل تراکنش‌ها به Base64 (نه Base58!)
         let encoded_txs: Vec<String> = transactions
             .iter()
@@ -162,12 +163,15 @@ impl JitoClient {
             "params": params_vec
         });
 
-        // ✅ استفاده از endpoint مشخص یا default
-        let endpoint = jito_endpoint.unwrap_or(&self.endpoints[0]);
-        let jito_url = format!("{}/api/v1/bundles", endpoint);
+        // ✅ استفاده از RPC endpoint (نه Block Engine!)
+        // simulateBundle باید به RPC node فرستاده شود که jito-solana را اجرا می‌کند
+        // مثل ERPC، Helius، Triton (با پشتیبانی Jito)
+        let rpc_url = &self.rpc_endpoint;
+
+        debug!("📡 Sending simulateBundle to RPC: {}", rpc_url);
 
         let response = self.http_client
-            .post(&jito_url)
+            .post(rpc_url)
             .json(&request)
             .timeout(std::time::Duration::from_secs(15))
             .send()
