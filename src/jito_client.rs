@@ -135,7 +135,9 @@ impl JitoClient {
     /// این متد از Base64 encoding استفاده می‌کند (طبق مستندات جیتو)
     /// نکته مهم: simulateBundle باید به RPC endpoint فرستاده شود (نه Block Engine!)
     /// منبع: https://www.quicknode.com/docs/solana/simulateBundle
-    pub async fn simulate_bundle(&self, transactions: Vec<Transaction>, _jito_endpoint: Option<&str>) -> Result<SimulateBundleValue> {
+    ///
+    /// ✅ پشتیبانی از VersionedTransaction (هم legacy و هم v0)
+    pub async fn simulate_bundle(&self, transactions: Vec<VersionedTransaction>, _jito_endpoint: Option<&str>) -> Result<SimulateBundleValue> {
         // تبدیل تراکنش‌ها به Base64 (نه Base58!)
         let encoded_txs: Vec<String> = transactions
             .iter()

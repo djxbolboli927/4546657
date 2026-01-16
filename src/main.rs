@@ -87,7 +87,8 @@ const PUMP_FUN_DISCRIMINATOR: [u8; 8] = [0x17, 0xb7, 0xf8, 0x37, 0x60, 0xd8, 0xa
 const CLEANUP_INTERVAL_SECS: u64 = 300;
 const MAX_ACTIVITY_AGE_SECS: u64 = 600;
 
-const ENABLE_RPC_SIMULATION: bool = true;
+// ❌ غیرفعال - فقط Jito bundle simulation استفاده می‌شود
+const ENABLE_RPC_SIMULATION: bool = false;
 
 // ═══════════════════════════════════════════════════════════════
 // DATA STRUCTURES
@@ -574,6 +575,9 @@ async fn unified_worker_thread(
         let is_profit = simulation.is_profitable;
         if is_profit {
             print_simulation_result(&simulation, worker_id, true);
+        } else {
+            // ⏭️ فقط profitable ها را شبیه‌سازی می‌کنیم
+            continue;
         }
 
         // Prepare Data
@@ -675,39 +679,64 @@ async fn unified_worker_thread(
         // نکته: simulateBundle به RPC endpoint می‌فرستد (ERPC با پشتیبانی Jito)
         // برای sendBundle از Block Engine استفاده می‌شود
 
-        // ساخت تراکنش تیپ Jito (10,000 lamports = 0.00001 SOL)
-        const JITO_TIP_LAMPORTS: u64 = 10_000;
-        let tip_tx = match tx_builder.build_jito_tip_transaction(
+        // انتخاب آدرس تیپ Jito (Frankfurt)
+        const JITO_TIP_LAMPORTS: u64 = 10_000; // 0.00001 SOL
+        const JITO_TIP_ACCOUNTS: [&str; 8] = [
+            "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+            "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+            "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+            "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+            "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+            "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+            "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+            "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+        ];
+
+        let jito_tip_account = match JITO_TIP_ACCOUNTS[0].parse::<Pubkey>() {
+            Ok(pk) => pk,
+            Err(_) => {
+                error!("   ❌ Invalid Jito tip account");
+                continue;
+            }
+        };
+
+        // ساخت تراکنش back-run با tip در همان تراکنش
+        // back-run همان مقدار توکن‌هایی که در front-run خریدیم را می‌فروشد
+        let back_tx = match tx_builder.build_back_run_transaction(
             &wallet_manager.front_runner,
-            JITO_TIP_LAMPORTS,
+            &mint,
+            &creator_vault,
+            simulation.front_run_tokens, // می‌فروشیم همان مقداری که خریدیم
+            0, // min_sol_output (می‌توانیم بعداً محاسبه کنیم)
+            50_000, // priority fee
+            JITO_TIP_LAMPORTS, // tip در همان تراکنش
+            &jito_tip_account,
             blockhash,
-        ) {
+            token_program_type,
+            &token_program_id_pubkey,
+        ).await {
             Ok(tx) => tx,
             Err(e) => {
-                error!("   ❌ Failed to build Jito tip transaction: {}", e);
+                error!("   ❌ Back-Run Build Failed: {}", e);
                 continue;
             }
         };
 
-        // تبدیل victim VersionedTransaction به Transaction معمولی
-        let victim_tx_legacy = match tx_info.full_transaction.clone().into_legacy_transaction() {
-            Some(tx) => tx,
-            None => {
-                error!("   ❌ Victim transaction is v0, cannot convert to legacy format");
-                continue;
-            }
-        };
+        // تبدیل تراکنش‌ها به VersionedTransaction
+        let front_vtx = VersionedTransaction::from(front_tx.clone());
+        let victim_vtx = tx_info.full_transaction.clone(); // از قبل VersionedTransaction است
+        let back_vtx = VersionedTransaction::from(back_tx);
 
         info!("🎯 Jito bundle simulation (via RPC)...");
-        info!("   📦 Bundle: [front_tx, victim_tx, tip_tx] - 3 transactions");
-        info!("   💰 Tip amount: {} lamports (0.00001 SOL)", JITO_TIP_LAMPORTS);
+        info!("   📦 Bundle: [front_tx, victim_tx, back_tx + tip] - 3 transactions");
+        info!("   💰 Tip amount: {} lamports (0.00001 SOL) - included in back_tx", JITO_TIP_LAMPORTS);
 
         let jito_sim_start = std::time::Instant::now();
         match jito_client.simulate_bundle(
             vec![
-                front_tx.clone(),      // خرید ما (قبل از victim)
-                victim_tx_legacy,      // تراکنش victim
-                tip_tx,                // پرداخت انعام Jito
+                front_vtx,      // خرید ما (قبل از victim)
+                victim_vtx,     // تراکنش victim (legacy یا v0)
+                back_vtx,       // فروش ما + پرداخت انعام Jito
             ],
             Some(&optimal_jito_endpoint)
         ).await {
@@ -765,7 +794,7 @@ async fn unified_worker_thread(
                         let tx_name = match idx {
                             0 => "Front-run (our buy)",
                             1 => "Victim transaction",
-                            2 => "Jito tip",
+                            2 => "Back-run (our sell + Jito tip)",
                             _ => "Unknown",
                         };
 
@@ -776,6 +805,12 @@ async fn unified_worker_thread(
                         }
                     }
 
+                    // محاسبه مجموع compute units
+                    let total_units: u64 = jito_result.transaction_results
+                        .iter()
+                        .filter_map(|r| r.units_consumed)
+                        .sum();
+                    info!("      🔢 Total compute units: {}", total_units);
                     info!("      🔒 NOT SENT - Simulation only");
                 }
             }
