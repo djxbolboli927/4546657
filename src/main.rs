@@ -680,17 +680,30 @@ async fn unified_worker_thread(
             Ok(jito_result) => {
                 let latency = jito_sim_start.elapsed().as_secs_f64() * 1000.0;
 
-                // بررسی موفقیت از روی summary
-                let failed_count = jito_result.summary
-                    .get("failed")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1);
+                // بررسی موفقیت - روش ترکیبی (امن‌ترین)
+                // 1. اول چک می‌کنیم که آیا در نتایج تراکنش‌ها خطا وجود دارد
+                let has_error = jito_result.transaction_results
+                    .iter()
+                    .any(|r| r.err.is_some());
 
-                let is_success = failed_count == 0;
+                // 2. سپس summary را هم چک می‌کنیم (ممکن است string یا object باشد)
+                let summary_ok = if let Some(summary_str) = jito_result.summary.as_str() {
+                    // اگر summary یک string است (مثل "succeeded")
+                    summary_str.contains("succeed")
+                } else {
+                    // اگر summary یک object است (مثل {"failed": 0, "succeeded": 1})
+                    jito_result.summary
+                        .get("failed")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) == 0
+                };
+
+                let is_success = !has_error && summary_ok;
 
                 if !is_success {
                     error!("   ❌ JITO BUNDLE SIM FAILED!");
-                    error!("      📊 Failed count: {}", failed_count);
+                    error!("      📊 Has error in results: {}", has_error);
+                    error!("      📊 Summary OK: {}", summary_ok);
                     error!("      📋 Full summary: {:?}", jito_result.summary);
 
                     if jito_result.transaction_results.is_empty() {
