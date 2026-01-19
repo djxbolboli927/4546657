@@ -191,18 +191,6 @@ struct GlobalStats {
     skipped_late_tx: AtomicUsize, // تراکنش‌های بیش از 150ms قدیمی
     // 🌍 Leader Oracle Stats
     skipped_leader_outside_europe: AtomicUsize,
-    // 🔍 Victim Status Check Stats (RPC)
-    victim_checks_rpc: AtomicUsize,
-    victim_not_found_rpc: AtomicUsize,
-    victim_processed_rpc: AtomicUsize,
-    victim_confirmed_rpc: AtomicUsize,
-    victim_unknown_rpc: AtomicUsize,
-    // 🔍 Victim Status Check Stats (Jito)
-    victim_checks_jito: AtomicUsize,
-    victim_not_found_jito: AtomicUsize,
-    victim_processed_jito: AtomicUsize,
-    victim_confirmed_jito: AtomicUsize,
-    victim_unknown_jito: AtomicUsize,
 }
 
 impl GlobalStats {
@@ -226,17 +214,6 @@ impl GlobalStats {
             skipped_simulation_failed: AtomicUsize::new(0),
             skipped_late_tx: AtomicUsize::new(0),
             skipped_leader_outside_europe: AtomicUsize::new(0),
-            // Victim checks
-            victim_checks_rpc: AtomicUsize::new(0),
-            victim_not_found_rpc: AtomicUsize::new(0),
-            victim_processed_rpc: AtomicUsize::new(0),
-            victim_confirmed_rpc: AtomicUsize::new(0),
-            victim_unknown_rpc: AtomicUsize::new(0),
-            victim_checks_jito: AtomicUsize::new(0),
-            victim_not_found_jito: AtomicUsize::new(0),
-            victim_processed_jito: AtomicUsize::new(0),
-            victim_confirmed_jito: AtomicUsize::new(0),
-            victim_unknown_jito: AtomicUsize::new(0),
         }
     }
 }
@@ -651,17 +628,19 @@ async fn unified_worker_thread(
         // Send bundle to Jito Block Engine
         info!("🚀 Sending bundle to Jito (tip: {} SOL)...", JITO_TIP_LAMPORTS as f64 / LAMPORTS_PER_SOL as f64);
 
+        // Count as attempted (before send to track all tries)
+        stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
+
         let bundle_uuid = match jito_client.send_bundle_real(
             bundle,
             &optimal_jito_endpoint,
         ).await {
             Ok(uuid) => {
-                info!("   ✅ Bundle sent! UUID: {}", uuid);
-                stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
+                info!("   ✅ Bundle accepted by Jito! UUID: {}", uuid);
                 uuid
             }
             Err(e) => {
-                error!("   ❌ Bundle send failed: {}", e);
+                error!("   ❌ Bundle rejected: {}", e);
                 stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -1174,28 +1153,6 @@ async fn print_detailed_report(stats: &Arc<GlobalStats>, oracle: &Arc<LeaderOrac
         0.0
     };
 
-    // آمار RPC victim checks
-    let rpc_total = stats.victim_checks_rpc.load(Ordering::Relaxed);
-    let rpc_not_found = stats.victim_not_found_rpc.load(Ordering::Relaxed);
-    let rpc_processed = stats.victim_processed_rpc.load(Ordering::Relaxed);
-    let rpc_confirmed = stats.victim_confirmed_rpc.load(Ordering::Relaxed);
-    let rpc_unknown = stats.victim_unknown_rpc.load(Ordering::Relaxed);
-
-    let rpc_not_found_pct = if rpc_total > 0 { (rpc_not_found as f64 / rpc_total as f64) * 100.0 } else { 0.0 };
-    let rpc_processed_pct = if rpc_total > 0 { (rpc_processed as f64 / rpc_total as f64) * 100.0 } else { 0.0 };
-    let rpc_confirmed_pct = if rpc_total > 0 { (rpc_confirmed as f64 / rpc_total as f64) * 100.0 } else { 0.0 };
-
-    // آمار Jito victim checks
-    let jito_total = stats.victim_checks_jito.load(Ordering::Relaxed);
-    let jito_not_found = stats.victim_not_found_jito.load(Ordering::Relaxed);
-    let jito_processed = stats.victim_processed_jito.load(Ordering::Relaxed);
-    let jito_confirmed = stats.victim_confirmed_jito.load(Ordering::Relaxed);
-    let jito_unknown = stats.victim_unknown_jito.load(Ordering::Relaxed);
-
-    let jito_not_found_pct = if jito_total > 0 { (jito_not_found as f64 / jito_total as f64) * 100.0 } else { 0.0 };
-    let jito_processed_pct = if jito_total > 0 { (jito_processed as f64 / jito_total as f64) * 100.0 } else { 0.0 };
-    let jito_confirmed_pct = if jito_total > 0 { (jito_confirmed as f64 / jito_total as f64) * 100.0 } else { 0.0 };
-
     info!("╔═══════════════════════════════════════════════════════════════════════════════╗");
     info!("║                          📊 DETAILED PERFORMANCE REPORT                       ║");
     info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
@@ -1221,24 +1178,6 @@ async fn print_detailed_report(stats: &Arc<GlobalStats>, oracle: &Arc<LeaderOrac
     info!("║     • Total Simulations:     {:>10}                                       ║", total_simulations);
     info!("║     • Profitable:            {:>10} ({:>5.1}%)                           ║", profitable, profitable_percent);
     info!("║     • Unprofitable:          {:>10} ({:>5.1}%)                           ║", unprofitable, 100.0 - profitable_percent);
-    info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
-
-    // Victim Status Checks - RPC
-    info!("║  🔍 VICTIM STATUS CHECKS - RPC                                               ║");
-    info!("║     • Total Checks:          {:>10}                                       ║", rpc_total);
-    info!("║     • Not Found (New):       {:>10} ({:>5.1}%) - Still on network        ║", rpc_not_found, rpc_not_found_pct);
-    info!("║     • Processed (Ideal):     {:>10} ({:>5.1}%) - Ready for sandwich      ║", rpc_processed, rpc_processed_pct);
-    info!("║     • Confirmed (Too Late):  {:>10} ({:>5.1}%) - Already confirmed      ║", rpc_confirmed, rpc_confirmed_pct);
-    info!("║     • Unknown (Errors):      {:>10}                                       ║", rpc_unknown);
-    info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
-
-    // Victim Status Checks - Jito
-    info!("║  🔍 VICTIM STATUS CHECKS - JITO                                              ║");
-    info!("║     • Total Checks:          {:>10}                                       ║", jito_total);
-    info!("║     • Not Found (New):       {:>10} ({:>5.1}%) - Still on network        ║", jito_not_found, jito_not_found_pct);
-    info!("║     • Processed (Ideal):     {:>10} ({:>5.1}%) - Ready for sandwich      ║", jito_processed, jito_processed_pct);
-    info!("║     • Confirmed (Too Late):  {:>10} ({:>5.1}%) - Already confirmed      ║", jito_confirmed, jito_confirmed_pct);
-    info!("║     • Unknown (Errors):      {:>10}                                       ║", jito_unknown);
     info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
 
     // Jito Bundle Stats
