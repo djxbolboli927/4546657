@@ -27,6 +27,7 @@ use solana_stream_sdk::{
     GeyserSubscribeRequestFilterEntry, GeyserSubscribeRequestFilterSlots,
     GeyserSubscribeRequestFilterTransactions, GeyserSubscribeUpdate, GeyserUpdateOneof,
     ShredstreamClient,
+    yellowstone_grpc_client::ClientTlsConfig,
 };
 use std::{
     env, fs,
@@ -35,7 +36,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tonic::transport::ClientTlsConfig;
 
 mod config;
 use config::{commitment_from_str, Config};
@@ -847,6 +847,10 @@ async fn run_shreds_task(endpoint: String, tx: Sender<ShredsData>) -> Result<()>
     Ok(())
 }
 
+// ═══════════════════════════════════════════════════════════
+// 🚀 OPTIMIZED GEYSER TASK - Yellowstone v10/v11 + Agave v2.x
+// ═══════════════════════════════════════════════════════════
+// با TCP Keepalive، Aggressive Timeouts، و بازیابی سریع
 async fn run_geyser_task(
     grpc_endpoint: String,
     x_token: Option<String>,
@@ -856,33 +860,97 @@ async fn run_geyser_task(
     slot_tx: tokio::sync::watch::Sender<u64>,
 ) -> Result<()> {
     let mut reconnect_count = 0;
+
+    info!("🔧 Geyser connection mode: Yellowstone v10/v11 + Agave v2.x");
+    info!("⚡ TCP Tuning: Keepalive=15s, ConnectTimeout=5s");
+
     loop {
         let result: Result<()> = async {
-            let mut client = retry(ExponentialBackoff::default(), || {
-                let grpc_endpoint = grpc_endpoint.clone();
-                let x_token = x_token.clone();
-                async move {
-                    let mut builder = GeyserGrpcClient::build_from_shared(grpc_endpoint.clone())?;
-                    if let Some(token) = x_token { builder = builder.x_token(Some(token))?; }
-                    if grpc_endpoint.starts_with("https://") { builder = builder.tls_config(ClientTlsConfig::new().with_native_roots())?; }
-                    builder.connect().await.map_err(backoff::Error::transient)
-                }
-            }).await?;
-            info!("✅ Connected to Geyser successfully!");
+            // ═══════════════════════════════════════════════════════════
+            // 🔌 AGGRESSIVE CONNECTION WITH TCP TUNING
+            // ═══════════════════════════════════════════════════════════
+            let mut client = retry(
+                ExponentialBackoff {
+                    max_elapsed_time: Some(Duration::from_secs(60)),
+                    max_interval: Duration::from_secs(5),
+                    ..Default::default()
+                },
+                || {
+                    let grpc_endpoint = grpc_endpoint.clone();
+                    let x_token = x_token.clone();
+                    async move {
+                        let mut builder = GeyserGrpcClient::build_from_shared(grpc_endpoint.clone())?;
+
+                        // Auth token
+                        if let Some(token) = x_token {
+                            builder = builder.x_token(Some(token))?;
+                        }
+
+                        // TLS for HTTPS
+                        if grpc_endpoint.starts_with("https://") {
+                            builder = builder.tls_config(ClientTlsConfig::new().with_enabled_roots())?;
+                        }
+
+                        // ⚡ TCP TUNING: Aggressive timeouts
+                        builder = builder
+                            .connect_timeout(Duration::from_secs(5))
+                            .timeout(Duration::from_secs(30))
+                            .tcp_keepalive(Some(Duration::from_secs(15)))
+                            .http2_keep_alive_interval(Duration::from_secs(10))
+                            .keep_alive_timeout(Duration::from_secs(5))
+                            .http2_adaptive_window(true);
+
+                        builder.connect().await.map_err(backoff::Error::transient)
+                    }
+                },
+            ).await?;
+
+            info!("✅ Connected to Geyser with optimized TCP settings!");
+
+            // ═══════════════════════════════════════════════════════════
+            // 📡 SUBSCRIBE WITH STREAMING
+            // ═══════════════════════════════════════════════════════════
             let (mut sink, mut stream) = client.subscribe().await?;
             sink.send(request.clone()).await?;
+
+            info!("📡 Subscribed to Geyser stream (Yellowstone v10/v11)");
+
+            // Reset reconnect counter on successful connection
             reconnect_count = 0;
+
+            // ═══════════════════════════════════════════════════════════
+            // 🔄 STREAM PROCESSING LOOP
+            // ═══════════════════════════════════════════════════════════
             while let Some(message) = stream.next().await {
                 match message {
-                    Ok(msg) => handle_account_update(&msg, &pool_tracker, &stats, &slot_tx).await,
-                    Err(e) => { error!("Stream error: {:?}", e); break; }
+                    Ok(msg) => {
+                        // Process account updates with zero-copy optimizations
+                        handle_account_update(&msg, &pool_tracker, &stats, &slot_tx).await;
+                    }
+                    Err(e) => {
+                        error!("❌ Stream error: {:?}", e);
+                        break;
+                    }
                 }
             }
+
+            warn!("⚠️  Geyser stream ended unexpectedly");
             Ok(())
-        }.await;
+        }
+        .await;
+
+        // ═══════════════════════════════════════════════════════════
+        // 🔄 RECONNECTION LOGIC
+        // ═══════════════════════════════════════════════════════════
         if result.is_err() {
             reconnect_count += 1;
-            tokio::time::sleep(Duration::from_secs(reconnect_count.min(30))).await;
+            let backoff_delay = (reconnect_count * 2).min(30);
+            error!("🔄 Geyser reconnecting in {}s (attempt #{})...", backoff_delay, reconnect_count);
+            tokio::time::sleep(Duration::from_secs(backoff_delay)).await;
+        } else {
+            // Stream ended cleanly, reconnect immediately
+            warn!("🔄 Geyser stream closed cleanly, reconnecting...");
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 }

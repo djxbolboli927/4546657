@@ -7,13 +7,13 @@
       "owner": ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"],
       "filters": [
         {
+          "dataSize": 264
+        },
+        {
           "lamports": {
             "cmp": "gt",
             "value": 4000000000
           }
-        },
-        {
-          "dataSize": 256
         }
       ]
     }
