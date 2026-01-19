@@ -187,6 +187,8 @@ struct GlobalStats {
     skipped_no_creator: AtomicUsize,
     skipped_target_confirmed: AtomicUsize,
     skipped_simulation_failed: AtomicUsize,
+    // ⏱️ Timing Filter
+    skipped_late_tx: AtomicUsize, // تراکنش‌های بیش از 150ms قدیمی
     // 🌍 Leader Oracle Stats
     skipped_leader_outside_europe: AtomicUsize,
     // 🔍 Victim Status Check Stats (RPC)
@@ -222,6 +224,7 @@ impl GlobalStats {
             skipped_no_creator: AtomicUsize::new(0),
             skipped_target_confirmed: AtomicUsize::new(0),
             skipped_simulation_failed: AtomicUsize::new(0),
+            skipped_late_tx: AtomicUsize::new(0),
             skipped_leader_outside_europe: AtomicUsize::new(0),
             // Victim checks
             victim_checks_rpc: AtomicUsize::new(0),
@@ -502,6 +505,15 @@ async fn unified_worker_thread(
             continue;
         }
 
+        // ⏱️ Timing filter: Skip transactions older than 150ms
+        // (فقط 150 میلی‌ثانیه اول بلاک - بعد از آن دیر است)
+        let tx_age = tx_info.timestamp.elapsed();
+        if tx_age.as_millis() > 150 {
+            stats.skipped_late_tx.fetch_add(1, Ordering::Relaxed);
+            debug!("⏭️  Skipping late tx ({}ms old): ...{}", tx_age.as_millis(), &tx_info.signature[tx_info.signature.len()-8..]);
+            continue;
+        }
+
         // Same block check
         if has_same_block_buy_sell(&tx_info.buyer, &tx_info.mint, tx_info.slot, &recent_activity) {
             stats.skipped_same_block.fetch_add(1, Ordering::Relaxed);
@@ -521,9 +533,11 @@ async fn unified_worker_thread(
 
         let is_profit = simulation.is_profitable;
         if is_profit {
+            stats.profitable_count.fetch_add(1, Ordering::Relaxed);
             print_simulation_result(&simulation, worker_id, true);
         } else {
-            // ⏭️ فقط profitable ها را شبیه‌سازی می‌کنیم
+            stats.unprofitable_count.fetch_add(1, Ordering::Relaxed);
+            // ⏭️ فقط profitable ها را می‌فرستیم
             continue;
         }
 
@@ -1247,6 +1261,7 @@ async fn print_detailed_report(stats: &Arc<GlobalStats>, oracle: &Arc<LeaderOrac
     info!("║  ⏭️  SKIP REASONS                                                             ║");
     info!("║     • No Pool Data:          {:>10}                                       ║", stats.skipped_no_pool.load(Ordering::Relaxed));
     info!("║     • Low SOL:               {:>10}                                       ║", stats.skipped_low_sol.load(Ordering::Relaxed));
+    info!("║     • Late TX (>150ms):      {:>10}                                       ║", stats.skipped_late_tx.load(Ordering::Relaxed));
     info!("║     • Same Block:            {:>10}                                       ║", stats.skipped_same_block.load(Ordering::Relaxed));
     info!("║     • No Creator:            {:>10}                                       ║", stats.skipped_no_creator.load(Ordering::Relaxed));
     info!("║     • Target Confirmed:      {:>10}                                       ║", stats.skipped_target_confirmed.load(Ordering::Relaxed));
