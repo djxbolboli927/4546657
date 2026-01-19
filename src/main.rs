@@ -521,12 +521,16 @@ async fn unified_worker_thread(
         // Prepare Data
         let mint = match Pubkey::from_str(&tx_info.mint) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(_) => {
+                error!("   ❌ [Bundle] Mint parse failed");
+                continue;
+            }
         };
 
         let blockhash = match tx_builder.get_recent_blockhash().await {
             Ok(bh) => bh,
             Err(_) => {
+                error!("   ❌ [Bundle] Blockhash fetch failed");
                 stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -535,18 +539,25 @@ async fn unified_worker_thread(
         let creator_vault_str = match &tx_info.creator_vault {
             Some(cv) => cv,
             None => {
+                error!("   ❌ [Bundle] No creator vault");
                 stats.skipped_no_creator.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         };
         let creator_vault = match Pubkey::from_str(creator_vault_str) {
             Ok(cv) => cv,
-            Err(_) => continue,
+            Err(_) => {
+                error!("   ❌ [Bundle] Creator vault parse failed");
+                continue;
+            }
         };
 
         let token_program_id_str = match &tx_info.token_program_id {
             Some(tp) => tp,
-            None => continue,
+            None => {
+                error!("   ❌ [Bundle] No token program ID");
+                continue;
+            }
         };
 
         let token_program_type = if token_program_id_str == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" {
@@ -557,7 +568,10 @@ async fn unified_worker_thread(
 
         let token_program_id_pubkey = match Pubkey::from_str(token_program_id_str) {
             Ok(pk) => pk,
-            Err(_) => continue,
+            Err(_) => {
+                error!("   ❌ [Bundle] Token program ID parse failed");
+                continue;
+            }
         };
 
         let safe_front_run_sol = (simulation.front_run_sol as f64 * 1.70) as u64;
