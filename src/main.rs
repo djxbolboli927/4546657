@@ -529,8 +529,8 @@ async fn unified_worker_thread(
 
         let blockhash = match tx_builder.get_recent_blockhash().await {
             Ok(bh) => bh,
-            Err(_) => {
-                error!("   ❌ [Bundle] Blockhash fetch failed");
+            Err(e) => {
+                error!("   ❌ [Bundle] Blockhash fetch failed: {}", e);
                 stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -756,6 +756,11 @@ fn get_priority_fee(tx: &VersionedTransaction) -> u64 {
 
 fn extract_transaction_info(tx: VersionedTransaction, pump_fun_program_id: &Pubkey, buy_discriminator: &[u8], current_slot: u64) -> Option<TransactionInfo> {
     let account_keys = tx.message.static_account_keys();
+
+    // Known Solana token program IDs
+    let token_program = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+    let token_2022_program = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
+
     for instruction in tx.message.instructions() {
         if let Some(program_id) = account_keys.get(instruction.program_id_index as usize) {
             if program_id == pump_fun_program_id && instruction.data.starts_with(buy_discriminator) {
@@ -766,9 +771,41 @@ fn extract_transaction_info(tx: VersionedTransaction, pump_fun_program_id: &Pubk
                         let fee_recipient = instruction.accounts.get(1).and_then(|&idx| account_keys.get(idx as usize)).map(|pk| pk.to_string());
                         let bonding_curve = instruction.accounts.get(3).and_then(|&idx| account_keys.get(idx as usize)).map(|pk| pk.to_string());
                         let bonding_curve_token_account = instruction.accounts.get(4).and_then(|&idx| account_keys.get(idx as usize)).map(|pk| pk.to_string());
-                        let token_program_id = instruction.accounts.get(8).and_then(|&idx| account_keys.get(idx as usize)).map(|pk| pk.to_string());
                         let creator_vault = instruction.accounts.get(9).and_then(|&idx| account_keys.get(idx as usize)).map(|pk| pk.to_string());
                         let priority_fee = get_priority_fee(&tx);
+
+                        // 🔍 SMART TOKEN PROGRAM DETECTION
+                        // Try multiple account indices and search through all accounts
+                        let mut token_program_id: Option<String> = None;
+
+                        // Strategy 1: Check common indices (7, 8, 10)
+                        for idx in [7, 8, 10].iter() {
+                            if let Some(account_idx) = instruction.accounts.get(*idx) {
+                                if let Some(pubkey) = account_keys.get(*account_idx as usize) {
+                                    if pubkey == &token_program || pubkey == &token_2022_program {
+                                        token_program_id = Some(pubkey.to_string());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Strategy 2: If not found, search ALL instruction accounts
+                        if token_program_id.is_none() {
+                            for account_idx in &instruction.accounts {
+                                if let Some(pubkey) = account_keys.get(*account_idx as usize) {
+                                    if pubkey == &token_program || pubkey == &token_2022_program {
+                                        token_program_id = Some(pubkey.to_string());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Strategy 3: Default to standard Token Program
+                        if token_program_id.is_none() {
+                            token_program_id = Some(token_program.to_string());
+                        }
 
                         if let (Some(buyer), Some(mint), Some(bonding_curve)) = (buyer_pubkey, mint_pubkey, &bonding_curve) {
                             return Some(TransactionInfo {
