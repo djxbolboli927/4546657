@@ -87,7 +87,8 @@ const JITO_TIP_ACCOUNTS: [&str; 8] = [
     "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 ];
-const ESTIMATED_NETWORK_FEE: u64 = 5000;
+// کارمزد متوسط شبکه از Solscan: 0.00003322 SOL
+const ESTIMATED_NETWORK_FEE: u64 = 33220;
 
 const FRONT_RUN_FEE_MULTIPLIER: f64 = 1.0;
 const BACK_RUN_FEE_MULTIPLIER: f64 = 1.0;
@@ -631,15 +632,16 @@ async fn unified_worker_thread(
             }
         };
 
-        // Create bundle: [front-run, back-run+tip] (victim NOT included)
-        // Victim will execute naturally between our transactions
+        // 🧪 TEST: Create 3-tx bundle [front-run, victim, back-run+tip]
+        // قبلاً این خطای 400 می‌داد، اما حالا با blockhash از victim می‌خواهیم تست کنیم
         let bundle = vec![
             VersionedTransaction::from(front_tx),
+            tx_info.full_transaction.clone(),  // ✅ Victim transaction
             VersionedTransaction::from(back_tx),
         ];
 
         // Send bundle to Jito Block Engine
-        info!("🚀 Sending 2-tx bundle to Jito (tip: {} SOL)...", JITO_TIP_LAMPORTS as f64 / LAMPORTS_PER_SOL as f64);
+        info!("🚀 Sending 3-tx bundle [front+victim+back] to Jito (tip: {} SOL)...", JITO_TIP_LAMPORTS as f64 / LAMPORTS_PER_SOL as f64);
 
         // Count as attempted (before send to track all tries)
         stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
@@ -998,10 +1000,11 @@ async fn run_geyser_task(
 async fn main() -> Result<()> {
     dotenv().ok();
 
-    // Configure logger: غیرفعال کردن h2 debug logs (خیلی زیاد هستند)
+    // Configure logger: غیرفعال کردن debug logs غیرضروری
     env_logger::Builder::from_default_env()
         .filter_module("h2", log::LevelFilter::Info)  // فقط Info و بالاتر از h2
         .filter_module("hyper", log::LevelFilter::Info)  // فقط Info و بالاتر از hyper
+        .filter_module("mev_bot_unified::leader_oracle", log::LevelFilter::Warn)  // فقط Warn و بالاتر از leader_oracle
         .init();
 
     info!("═══════════════════════════════════════════════════════════");
