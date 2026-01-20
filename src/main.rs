@@ -152,7 +152,9 @@ struct TransactionInfo {
     fee_recipient: Option<String>,
     bonding_curve_token_account: Option<String>,
     token_program_id: Option<String>,
-    // ✅ NEW: ذخیره کل تراکنش برای شبیه‌سازی victim
+    // ✅ استخراج blockhash از victim transaction (صفر latency!)
+    blockhash: solana_sdk::hash::Hash,
+    // ✅ ذخیره کل تراکنش برای شبیه‌سازی victim
     full_transaction: VersionedTransaction,
 }
 
@@ -527,14 +529,8 @@ async fn unified_worker_thread(
             }
         };
 
-        let blockhash = match tx_builder.get_recent_blockhash().await {
-            Ok(bh) => bh,
-            Err(e) => {
-                error!("   ❌ [Bundle] Blockhash fetch failed: {}", e);
-                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-        };
+        // 🚀 استفاده از blockhash از victim transaction (صفر latency - بدون RPC call!)
+        let blockhash = tx_info.blockhash;
 
         let creator_vault_str = match &tx_info.creator_vault {
             Some(cv) => cv,
@@ -808,11 +804,15 @@ fn extract_transaction_info(tx: VersionedTransaction, pump_fun_program_id: &Pubk
                         }
 
                         if let (Some(buyer), Some(mint), Some(bonding_curve)) = (buyer_pubkey, mint_pubkey, &bonding_curve) {
+                            // 🚀 استخراج blockhash از victim transaction (صفر latency!)
+                            let blockhash = *tx.message.recent_blockhash();
+
                             return Some(TransactionInfo {
                                 buyer: buyer.to_string(), mint: mint.to_string(), bonding_curve: bonding_curve.clone(),
                                 max_sol: args.max_sol, token_amount: args.token_amount, priority_fee,
                                 signature: bs58::encode(&tx.signatures[0]).into_string(), timestamp: Instant::now(),
                                 slot: current_slot, creator_vault, fee_recipient, bonding_curve_token_account, token_program_id,
+                                blockhash,  // ✅ استفاده از blockhash victim
                                 full_transaction: tx,  // ✅ ذخیره کل تراکنش
                             });
                         }
