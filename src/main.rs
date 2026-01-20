@@ -594,6 +594,9 @@ async fn unified_worker_thread(
             }
         };
 
+        // ✅ استخراج signature قبل از move کردن front_tx
+        let my_signature = bs58::encode(&front_tx.signatures[0]).into_string();
+
         // ═══════════════════════════════════════════════════════════
         // 🚀 REAL JITO BUNDLE SENDING (ارسال واقعی به Block Engine)
         // ═══════════════════════════════════════════════════════════
@@ -647,60 +650,45 @@ async fn unified_worker_thread(
         ).await {
             Ok(uuid) => {
                 info!("   ✅ Bundle accepted by Jito! UUID: {}", uuid);
-                // ✅ Bundle UUID گرفته شد - موفقیت!
-                // اگر bundle land شود، موجودی wallet زیاد می‌شود
             }
             Err(e) => {
-                error!("   ❌ Bundle rejected: {}", e);
+                error!("   ❌ Bundle rejected by Jito: {}", e);
                 stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         };
 
-        // ⚠️ DISABLED: get_bundle_status باعث 429 rate limit می‌شود
-        // دلیل غیرفعال سازی: Jito rate limit دارد و چک کردن بلافاصله بعد از send باعث 429 می‌شود
-        // راه حل: اگر bundle land شود، موجودی wallet زیاد می‌شود و در monitoring مشخص است
+        // ⚡ چک کردن وضعیت از ERPC (بدون 429 error!)
+        // دلیل: ERPC whitelist دارد و rate limit ندارد
+        // ما از signature تراکنش استفاده می‌کنیم بجای Jito UUID
 
-        /*
-        // Wait briefly before checking status
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        // صبر کوتاه برای پردازش تراکنش (500ms)
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-        // Check bundle status
-        match jito_client.get_bundle_status(
-            vec![bundle_uuid.clone()],
-            &optimal_jito_endpoint
-        ).await {
-            Ok(statuses) => {
-                if let Some(status) = statuses.first() {
-                    match status.status.as_str() {
-                        "Landed" => {
-                            info!("   🎯 LANDED! Slot: {:?}", status.landed_slot);
-                            stats.bundles_landed.fetch_add(1, Ordering::Relaxed);
-                            if is_profit {
-                                stats.total_profit_lamports.fetch_add(
-                                    simulation.net_profit as u64,
-                                    Ordering::Relaxed
-                                );
-                            }
-                        }
-                        "Failed" => {
-                            error!("   ❌ Bundle FAILED");
-                            stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
-                        }
-                        "Pending" => {
-                            info!("   ⏳ Bundle PENDING");
-                        }
-                        _ => {
-                            info!("   ❓ Status: {}", status.status);
-                        }
-                    }
+        // چک کردن از ERPC که آیا تراکنش ما در blockchain قرار گرفت
+        match jito_client.check_target_transaction_status(&my_signature).await {
+            Ok(TargetTxStatus::AlreadyConfirmed) | Ok(TargetTxStatus::Processed) => {
+                info!("   🎯 Transaction LANDED! (verified via ERPC)");
+                stats.bundles_landed.fetch_add(1, Ordering::Relaxed);
+                if is_profit {
+                    stats.total_profit_lamports.fetch_add(
+                        simulation.net_profit as u64,
+                        Ordering::Relaxed
+                    );
                 }
             }
+            Ok(TargetTxStatus::NotFound) => {
+                // تراکنش هنوز در blockchain نیست - احتمالاً bundle land نشد
+                debug!("   ⏳ Transaction not found yet (may land in next slots)");
+            }
+            Ok(TargetTxStatus::Unknown) => {
+                // وضعیت نامشخص - احتمالاً در حال پردازش است
+                debug!("   ❓ Transaction status unknown");
+            }
             Err(e) => {
-                error!("   ⚠️  Status check error: {}", e);
+                debug!("   ⚠️  ERPC check error: {}", e);
             }
         }
-        */
     }
     info!("Worker {} stopped", worker_id);
 }
@@ -1009,7 +997,12 @@ async fn run_geyser_task(
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
-    env_logger::init();
+
+    // Configure logger: غیرفعال کردن h2 debug logs (خیلی زیاد هستند)
+    env_logger::Builder::from_default_env()
+        .filter_module("h2", log::LevelFilter::Info)  // فقط Info و بالاتر از h2
+        .filter_module("hyper", log::LevelFilter::Info)  // فقط Info و بالاتر از hyper
+        .init();
 
     info!("═══════════════════════════════════════════════════════════");
     info!("🌍 MEV BOT with LEADER ORACLE (Geographic-Aware Trading) 🌍");
