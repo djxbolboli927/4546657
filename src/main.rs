@@ -641,13 +641,14 @@ async fn unified_worker_thread(
         // Count as attempted (before send to track all tries)
         stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
 
-        let bundle_uuid = match jito_client.send_bundle_real(
+        match jito_client.send_bundle_real(
             bundle,
             &optimal_jito_endpoint,
         ).await {
             Ok(uuid) => {
                 info!("   ✅ Bundle accepted by Jito! UUID: {}", uuid);
-                uuid
+                // ✅ Bundle UUID گرفته شد - موفقیت!
+                // اگر bundle land شود، موجودی wallet زیاد می‌شود
             }
             Err(e) => {
                 error!("   ❌ Bundle rejected: {}", e);
@@ -656,6 +657,11 @@ async fn unified_worker_thread(
             }
         };
 
+        // ⚠️ DISABLED: get_bundle_status باعث 429 rate limit می‌شود
+        // دلیل غیرفعال سازی: Jito rate limit دارد و چک کردن بلافاصله بعد از send باعث 429 می‌شود
+        // راه حل: اگر bundle land شود، موجودی wallet زیاد می‌شود و در monitoring مشخص است
+
+        /*
         // Wait briefly before checking status
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
@@ -694,6 +700,7 @@ async fn unified_worker_thread(
                 error!("   ⚠️  Status check error: {}", e);
             }
         }
+        */
     }
     info!("Worker {} stopped", worker_id);
 }
