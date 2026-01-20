@@ -632,15 +632,15 @@ async fn unified_worker_thread(
             }
         };
 
-        // Create bundle: [front-run, victim, back-run+tip]
+        // Create bundle: [front-run, back-run+tip] (victim NOT included)
+        // Victim will execute naturally between our transactions
         let bundle = vec![
             VersionedTransaction::from(front_tx),
-            tx_info.full_transaction.clone(),
             VersionedTransaction::from(back_tx),
         ];
 
         // Send bundle to Jito Block Engine
-        info!("🚀 Sending bundle to Jito (tip: {} SOL)...", JITO_TIP_LAMPORTS as f64 / LAMPORTS_PER_SOL as f64);
+        info!("🚀 Sending 2-tx bundle to Jito (tip: {} SOL)...", JITO_TIP_LAMPORTS as f64 / LAMPORTS_PER_SOL as f64);
 
         // Count as attempted (before send to track all tries)
         stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
