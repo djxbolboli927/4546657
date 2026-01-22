@@ -19,7 +19,9 @@ use solana_entry::entry::Entry;
 use solana_sdk::{
     native_token::LAMPORTS_PER_SOL,
     pubkey::Pubkey,
-    transaction::VersionedTransaction,
+    signature::Signer,
+    system_instruction,
+    transaction::{Transaction, VersionedTransaction},
 };
 use solana_stream_sdk::{
     GeyserGrpcClient, GeyserSubscribeRequest, GeyserSubscribeRequestFilterAccounts,
@@ -442,6 +444,110 @@ fn print_simulation_result(sim: &SandwichSimulation, worker_id: usize, profitabl
 }
 
 // ═══════════════════════════════════════════════════════════
+// 🧪 JITO CONNECTIVITY TEST (Zero-Risk Bundle)
+// ═══════════════════════════════════════════════════════════
+
+async fn run_jito_connectivity_test(
+    jito_client: &Arc<JitoClient>,
+    wallet_manager: &Arc<WalletManager>,
+    tx_builder: &Arc<TransactionBuilder>,
+    oracle: &Arc<LeaderOracle>,
+) -> Result<()> {
+    info!("═══════════════════════════════════════════════════════");
+    info!("🧪 Starting Jito Connectivity Test (Zero-Risk Bundle)");
+    info!("═══════════════════════════════════════════════════════");
+
+    // 1. دریافت هش بلاک جدید
+    let blockhash = tx_builder.get_recent_blockhash().await?;
+    let current_slot = tx_builder.rpc_client.get_slot().unwrap_or(0);
+
+    // 2. پیدا کردن بهترین انجین جیتو
+    let optimal_endpoint = oracle.get_optimal_jito_endpoint(current_slot).await;
+    info!("📍 Target Jito Engine: {}", optimal_endpoint);
+    info!("👛 Wallet: {}", wallet_manager.front_runner.pubkey());
+
+    // 3. ساخت تراکنش "پوچ" (Self-Transfer) - 1 lamport به خودمان
+    let dummy_ix = solana_sdk::system_instruction::transfer(
+        &wallet_manager.front_runner.pubkey(),
+        &wallet_manager.front_runner.pubkey(), // به خودمان
+        1, // 1 Lamport
+    );
+
+    let dummy_tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+        &[dummy_ix],
+        Some(&wallet_manager.front_runner.pubkey()),
+        &[&wallet_manager.front_runner],
+        blockhash,
+    );
+
+    // 4. ساخت تراکنش انعام (Tip) - 0.0001 SOL
+    let tip_account = JITO_TIP_ACCOUNTS[0].parse::<Pubkey>()
+        .map_err(|e| anyhow::anyhow!("Invalid tip account: {}", e))?;
+
+    let tip_ix = solana_sdk::system_instruction::transfer(
+        &wallet_manager.front_runner.pubkey(),
+        &tip_account,
+        100_000, // 0.0001 SOL for test
+    );
+
+    let tip_tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+        &[tip_ix],
+        Some(&wallet_manager.front_runner.pubkey()),
+        &[&wallet_manager.front_runner],
+        blockhash,
+    );
+
+    // استخراج signature برای tracking
+    let dummy_signature = bs58::encode(&dummy_tx.signatures[0]).into_string();
+
+    // 5. بسته‌بندی باندل
+    let bundle = vec![
+        VersionedTransaction::from(dummy_tx),
+        VersionedTransaction::from(tip_tx),
+    ];
+
+    // 6. ارسال به Jito
+    info!("🚀 Sending Test Bundle [1 lamport self-transfer + 0.0001 SOL tip]...");
+    match jito_client.send_bundle_real(bundle, &optimal_endpoint).await {
+        Ok(uuid) => {
+            info!("   ✅ Jito ACCEPTED the bundle!");
+            info!("   🎫 UUID: {}", uuid);
+            info!("   📝 Signature: {}", dummy_signature);
+            info!("   ⏳ Waiting 5 seconds to check confirmation...");
+
+            // صبر برای نشستن در بلاک
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
+            // چک کردن وضعیت از ERPC
+            match jito_client.check_target_transaction_status(&dummy_signature).await {
+                Ok(TargetTxStatus::AlreadyConfirmed) | Ok(TargetTxStatus::Processed) => {
+                    info!("   🎉 TEST PASSED! Transaction LANDED on chain!");
+                    info!("   ✅ Your Jito connection is 100% working!");
+                }
+                Ok(TargetTxStatus::NotFound) => {
+                    warn!("   ⏳ Bundle accepted but not found on chain yet");
+                    warn!("   💡 This might be due to timing or slot issues");
+                }
+                Ok(TargetTxStatus::Unknown) => {
+                    warn!("   ❓ Transaction status unknown");
+                }
+                Err(e) => {
+                    warn!("   ⚠️  Could not verify on chain: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            error!("   ❌ Jito REJECTED the bundle immediately!");
+            error!("   📋 Reason: {}", e);
+            error!("   💡 This indicates a problem with bundle construction or connection");
+        }
+    }
+
+    info!("═══════════════════════════════════════════════════════");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════
 // 🌍 WORKER THREAD with Leader Oracle Integration
 // ═══════════════════════════════════════════════════════════
 
@@ -457,6 +563,14 @@ async fn unified_worker_thread(
     leader_oracle: Arc<LeaderOracle>, // 🌍 NEW
 ) {
     info!("Worker {} started 🚀 (with Leader Oracle)", worker_id);
+
+    // ⚠️ DISABLED FOR TESTING: MEV logic temporarily disabled
+    // Worker thread will wait for transactions but not process them
+    info!("⚠️  Worker {} in STANDBY mode (MEV logic disabled for testing)", worker_id);
+
+    /* ═══════════════════════════════════════════════════════════
+       🔒 TEMPORARILY DISABLED: Full MEV sandwich logic
+       ═══════════════════════════════════════════════════════════
 
     for tx_info in rx.iter() {
         stats.total_tx_processed.fetch_add(1, Ordering::Relaxed);
@@ -692,6 +806,16 @@ async fn unified_worker_thread(
             }
         }
     }
+
+    ═══════════════════════════════════════════════════════════
+    END OF DISABLED MEV LOGIC
+    ═══════════════════════════════════════════════════════════ */
+
+    // Worker just waits and consumes messages without processing
+    for _tx_info in rx.iter() {
+        // Messages received but not processed during test mode
+    }
+
     info!("Worker {} stopped", worker_id);
 }
 
@@ -1150,6 +1274,36 @@ async fn main() -> Result<()> {
         loop {
             interval.tick().await;
             print_detailed_report(&stats_for_reporting, &oracle_for_reporting).await;
+        }
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    // 🧪 JITO CONNECTIVITY TEST TASK (هر 30 ثانیه)
+    // ═══════════════════════════════════════════════════════════
+    let jito_for_test = jito_client.clone();
+    let wallet_for_test = wallet_manager.clone();
+    let builder_for_test = tx_builder.clone();
+    let oracle_for_test = leader_oracle.clone();
+
+    tokio::spawn(async move {
+        // صبر 5 ثانیه قبل از شروع اولین تست
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+
+            // اجرای تست
+            if let Err(e) = run_jito_connectivity_test(
+                &jito_for_test,
+                &wallet_for_test,
+                &builder_for_test,
+                &oracle_for_test,
+            ).await {
+                error!("🧪 Test error: {}", e);
+            }
+
+            info!("⏰ Next test in 30 seconds...\n");
         }
     });
 
