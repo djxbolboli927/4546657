@@ -453,101 +453,76 @@ async fn run_jito_buy_sell_test(
     tx_builder: &Arc<TransactionBuilder>,
     oracle: &Arc<LeaderOracle>,
     tx_info: &TransactionInfo,
-    pool_tracker: &PoolTracker,  // ✅ اضافه شد برای گرفتن قیمت واقعی
+    pool_tracker: &PoolTracker,
 ) -> Result<()> {
     info!("═══════════════════════════════════════════════════════");
-    info!("🧪 Starting Jito Buy/Sell Test (WITH Pool Price Calculation)");
+    info!("🧪 Starting Simple Buy Test (Only Mint from Victim)");
     info!("═══════════════════════════════════════════════════════");
     info!("📦 Victim Transaction: ...{}", &tx_info.signature[tx_info.signature.len()-8..]);
     info!("🪙 Mint: {}", tx_info.mint);
 
-    // استفاده از blockhash victim (صفر latency)
-    let blockhash = tx_info.blockhash;
-
-    // استفاده از اطلاعات victim
+    // فقط mint را از victim می‌گیریم
     let mint = Pubkey::from_str(&tx_info.mint)
         .map_err(|e| anyhow::anyhow!("Invalid mint: {}", e))?;
 
-    let creator_vault = match &tx_info.creator_vault {
-        Some(cv) => Pubkey::from_str(cv)
-            .map_err(|e| anyhow::anyhow!("Invalid creator vault: {}", e))?,
-        None => {
-            warn!("   ⚠️  No creator vault, skipping test");
-            return Ok(());
-        }
-    };
+    // بقیه را خودمان derive می‌کنیم
+    let pump_program = Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+        .map_err(|e| anyhow::anyhow!("Invalid pump program: {}", e))?;
 
-    let token_program_id_str = match &tx_info.token_program_id {
-        Some(tp) => tp,
-        None => {
-            warn!("   ⚠️  No token program ID, skipping test");
-            return Ok(());
-        }
-    };
-
-    let token_program_type = if token_program_id_str == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" {
-        TokenProgramType::Token2022Program
-    } else {
-        TokenProgramType::TokenProgram
-    };
-
-    let token_program_id_pubkey = Pubkey::from_str(token_program_id_str)
-        .map_err(|e| anyhow::anyhow!("Invalid token program: {}", e))?;
-
-    // ═══════════════════════════════════════════════════════════
-    // 🔍 گرفتن pool state از gRPC برای محاسبه قیمت واقعی
-    // ═══════════════════════════════════════════════════════════
-    let pool_state = match pool_tracker.get(&tx_info.bonding_curve) {
-        Some(pool) => pool.clone(),
-        None => {
-            warn!("   ⚠️  No pool state available, skipping test");
-            return Ok(());
-        }
-    };
-
-    info!("💎 Pool State:");
-    info!("   • Virtual SOL: {} SOL", pool_state.virtual_sol_reserves as f64 / LAMPORTS_PER_SOL as f64);
-    info!("   • Virtual Tokens: {}", pool_state.virtual_token_reserves);
-
-    // ═══════════════════════════════════════════════════════════
-    // 💰 محاسبه قیمت واقعی + slippage بالا
-    // ═══════════════════════════════════════════════════════════
-    let test_token_amount = 50;  // فقط 50 توکن (کم برای test)
-
-    // محاسبه SOL مورد نیاز برای 50 توکن
-    let actual_cost = calculate_sol_in_with_fee(
-        test_token_amount,
-        pool_state.virtual_sol_reserves,
-        pool_state.virtual_token_reserves
+    // Derive creator vault (global PDA)
+    let (creator_vault, _) = Pubkey::find_program_address(
+        &[b"mint-authority"],
+        &pump_program,
     );
 
-    // slippage: 3x بیشتر از قیمت واقعی (خیلی سخاوتمندانه!)
-    let test_buy_amount = (actual_cost as f64 * 3.0) as u64;
+    info!("📍 Derived Accounts:");
+    info!("   • Creator Vault: {}", creator_vault);
 
-    // حداقل 0.005 SOL برای اطمینان
-    let test_buy_amount = test_buy_amount.max(5_000_000);
+    // Token program: سعی می‌کنیم از victim بگیریم، اگر نبود TokenProgram استاندارد
+    let (token_program_type, token_program_id) = match &tx_info.token_program_id {
+        Some(tp_str) if tp_str == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" => {
+            (TokenProgramType::Token2022Program, Pubkey::from_str(tp_str).unwrap())
+        }
+        Some(tp_str) => {
+            (TokenProgramType::TokenProgram, Pubkey::from_str(tp_str).unwrap())
+        }
+        _ => {
+            // Default: standard token program
+            (TokenProgramType::TokenProgram, Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap())
+        }
+    };
 
-    let test_tip = 5_000_000;  // 0.005 SOL tip
+    info!("   • Token Program: {:?} ({})", token_program_type, token_program_id);
 
-    info!("💰 Calculated amounts:");
-    info!("   • Actual cost for 50 tokens: {} SOL", actual_cost as f64 / LAMPORTS_PER_SOL as f64);
-    info!("   • Max SOL (3x slippage): {} SOL", test_buy_amount as f64 / LAMPORTS_PER_SOL as f64);
+    // ═══════════════════════════════════════════════════════════
+    // مقادیر ثابت TEST
+    // ═══════════════════════════════════════════════════════════
+    let test_token_amount = 100;       // 100 توکن
+    let test_max_sol = 5_000_000;      // 0.005 SOL
+    let test_tip = 5_000_000;          // 0.005 SOL tip
+
+    info!("💰 Fixed amounts:");
     info!("   • Tokens to buy: {}", test_token_amount);
+    info!("   • Max SOL: {} SOL", test_max_sol as f64 / LAMPORTS_PER_SOL as f64);
     info!("   • Tip: {} SOL", test_tip as f64 / LAMPORTS_PER_SOL as f64);
 
+    // استفاده از blockhash victim (صفر latency!)
+    let blockhash = tx_info.blockhash;
+    info!("   • Using victim blockhash: {:?}", blockhash);
+
     // ═══════════════════════════════════════════════════════════
-    // 1️⃣ ساخت BUY transaction
+    // ساخت تراکنش خرید (بدون tip ابتدا)
     // ═══════════════════════════════════════════════════════════
-    let buy_tx = match tx_builder.build_front_run_transaction(
+    let buy_tx_without_tip = match tx_builder.build_front_run_transaction(
         &wallet_manager.front_runner,
         &mint,
         &creator_vault,
         test_token_amount,
-        test_buy_amount,
+        test_max_sol,
         50_000, // priority fee
         blockhash,
         token_program_type,
-        &token_program_id_pubkey,
+        &token_program_id,
     ).await {
         Ok(tx) => tx,
         Err(e) => {
@@ -556,67 +531,78 @@ async fn run_jito_buy_sell_test(
         }
     };
 
-    let buy_signature = bs58::encode(&buy_tx.signatures[0]).into_string();
-    info!("✅ Buy transaction built: ...{}", &buy_signature[buy_signature.len()-8..]);
-
-    // ═══════════════════════════════════════════════════════════
-    // 2️⃣ ساخت SELL transaction
-    // ═══════════════════════════════════════════════════════════
+    // اضافه کردن tip instruction به تراکنش
     let jito_tip_account = JITO_TIP_ACCOUNTS[0].parse::<Pubkey>()
         .map_err(|e| anyhow::anyhow!("Invalid tip account: {}", e))?;
 
-    let sell_tx = match tx_builder.build_back_run_transaction(
-        &wallet_manager.front_runner,
-        &mint,
-        &creator_vault,
-        test_token_amount,
-        0, // min_sol_output (accept any - قبول هر قیمتی!)
-        50_000, // priority fee
-        test_tip,
+    use solana_sdk::message::Message;
+    use solana_sdk::instruction::Instruction;
+
+    // Extract existing instructions
+    let mut all_instructions: Vec<Instruction> = vec![];
+    for (idx, compiled_ix) in buy_tx_without_tip.message.instructions.iter().enumerate() {
+        let program_id = buy_tx_without_tip.message.account_keys[compiled_ix.program_id_index as usize];
+        let accounts: Vec<_> = compiled_ix.accounts.iter().map(|&acc_idx| {
+            let pubkey = buy_tx_without_tip.message.account_keys[acc_idx as usize];
+            let is_signer = buy_tx_without_tip.message.is_signer(acc_idx as usize);
+            let is_writable = buy_tx_without_tip.message.is_writable(acc_idx as usize);
+            solana_sdk::instruction::AccountMeta {
+                pubkey,
+                is_signer,
+                is_writable,
+            }
+        }).collect();
+        all_instructions.push(Instruction {
+            program_id,
+            accounts,
+            data: compiled_ix.data.clone(),
+        });
+    }
+
+    // Add tip instruction
+    all_instructions.push(system_instruction::transfer(
+        &wallet_manager.front_runner.pubkey(),
         &jito_tip_account,
-        blockhash,
-        token_program_type,
-        &token_program_id_pubkey,
-    ).await {
-        Ok(tx) => tx,
-        Err(e) => {
-            error!("   ❌ Sell transaction build failed: {}", e);
-            return Ok(());
-        }
-    };
+        test_tip,
+    ));
 
-    let sell_signature = bs58::encode(&sell_tx.signatures[0]).into_string();
-    info!("✅ Sell transaction built: ...{}", &sell_signature[sell_signature.len()-8..]);
+    // Create new transaction
+    let message = Message::new_with_blockhash(
+        &all_instructions,
+        Some(&wallet_manager.front_runner.pubkey()),
+        &blockhash,
+    );
+
+    let mut buy_tx = Transaction::new_unsigned(message);
+    buy_tx.sign(&[&wallet_manager.front_runner], blockhash);
+
+    let buy_signature = bs58::encode(&buy_tx.signatures[0]).into_string();
+    info!("✅ Buy transaction with tip built: {}", buy_signature);
 
     // ═══════════════════════════════════════════════════════════
-    // 3️⃣ ساخت Bundle و ارسال به Jito
+    // ارسال تراکنش به Jito (بدون bundle، فقط یک tx)
     // ═══════════════════════════════════════════════════════════
-    let bundle = vec![
-        VersionedTransaction::from(buy_tx),
-        VersionedTransaction::from(sell_tx),
-    ];
+    let bundle = vec![VersionedTransaction::from(buy_tx)];
 
     let optimal_endpoint = oracle.get_optimal_jito_endpoint(tx_info.slot).await;
     info!("📍 Target Jito Engine: {}", optimal_endpoint);
-    info!("🚀 Sending 2-tx bundle [buy 50 tokens + sell+tip] to Jito...");
+    info!("🚀 Sending single buy transaction to Jito...");
 
     match jito_client.send_bundle_real(bundle, &optimal_endpoint).await {
         Ok(uuid) => {
-            info!("   ✅ Jito ACCEPTED the bundle!");
+            info!("   ✅ Jito ACCEPTED!");
             info!("   🎫 UUID: {}", uuid);
             info!("   ⏳ Waiting 5 seconds to check confirmation...");
 
             tokio::time::sleep(Duration::from_secs(5)).await;
 
-            // چک کردن از ERPC
             match jito_client.check_target_transaction_status(&buy_signature).await {
                 Ok(TargetTxStatus::AlreadyConfirmed) | Ok(TargetTxStatus::Processed) => {
-                    info!("   🎉 TEST PASSED! Buy/Sell bundle LANDED on chain!");
-                    info!("   ✅ Proof: gRPC pool data + proper slippage works!");
+                    info!("   🎉 TEST PASSED! Transaction LANDED on chain!");
+                    info!("   ✅ Simple buy with derived accounts works!");
                 }
                 Ok(TargetTxStatus::NotFound) => {
-                    warn!("   ⏳ Bundle accepted but not found on chain yet");
-                    warn!("   💡 Might be timing issue (too late in slot)");
+                    warn!("   ⏳ Transaction accepted but not found on chain yet");
                 }
                 Ok(TargetTxStatus::Unknown) => {
                     warn!("   ❓ Transaction status unknown");
@@ -627,9 +613,8 @@ async fn run_jito_buy_sell_test(
             }
         }
         Err(e) => {
-            error!("   ❌ Jito REJECTED the bundle!");
+            error!("   ❌ Jito REJECTED!");
             error!("   📋 Reason: {}", e);
-            error!("   💡 This might indicate slippage calculation issue");
         }
     }
 
