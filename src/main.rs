@@ -453,9 +453,10 @@ async fn run_jito_buy_sell_test(
     tx_builder: &Arc<TransactionBuilder>,
     oracle: &Arc<LeaderOracle>,
     tx_info: &TransactionInfo,
+    pool_tracker: &PoolTracker,  // ✅ اضافه شد برای گرفتن قیمت واقعی
 ) -> Result<()> {
     info!("═══════════════════════════════════════════════════════");
-    info!("🧪 Starting Jito Buy/Sell Test (No Simulation, No Pool)");
+    info!("🧪 Starting Jito Buy/Sell Test (WITH Pool Price Calculation)");
     info!("═══════════════════════════════════════════════════════");
     info!("📦 Victim Transaction: ...{}", &tx_info.signature[tx_info.signature.len()-8..]);
     info!("🪙 Mint: {}", tx_info.mint);
@@ -494,15 +495,44 @@ async fn run_jito_buy_sell_test(
         .map_err(|e| anyhow::anyhow!("Invalid token program: {}", e))?;
 
     // ═══════════════════════════════════════════════════════════
-    // مقادیر ثابت TEST (بدون simulation!)
+    // 🔍 گرفتن pool state از gRPC برای محاسبه قیمت واقعی
     // ═══════════════════════════════════════════════════════════
-    let test_buy_amount = 10_000;      // 0.00001 SOL
-    let test_token_amount = 1000;      // مقدار دلخواه token
-    let test_tip = 5_000_000;          // 0.005 SOL (50x higher for better landing)
+    let pool_state = match pool_tracker.get(&tx_info.bonding_curve) {
+        Some(pool) => pool.clone(),
+        None => {
+            warn!("   ⚠️  No pool state available, skipping test");
+            return Ok(());
+        }
+    };
 
-    info!("💰 Test amounts:");
-    info!("   • Buy: {} SOL", test_buy_amount as f64 / LAMPORTS_PER_SOL as f64);
-    info!("   • Tokens: {}", test_token_amount);
+    info!("💎 Pool State:");
+    info!("   • Virtual SOL: {} SOL", pool_state.virtual_sol_reserves as f64 / LAMPORTS_PER_SOL as f64);
+    info!("   • Virtual Tokens: {}", pool_state.virtual_token_reserves);
+
+    // ═══════════════════════════════════════════════════════════
+    // 💰 محاسبه قیمت واقعی + slippage بالا
+    // ═══════════════════════════════════════════════════════════
+    let test_token_amount = 50;  // فقط 50 توکن (کم برای test)
+
+    // محاسبه SOL مورد نیاز برای 50 توکن
+    let actual_cost = calculate_sol_in_with_fee(
+        test_token_amount,
+        pool_state.virtual_sol_reserves,
+        pool_state.virtual_token_reserves
+    );
+
+    // slippage: 3x بیشتر از قیمت واقعی (خیلی سخاوتمندانه!)
+    let test_buy_amount = (actual_cost as f64 * 3.0) as u64;
+
+    // حداقل 0.005 SOL برای اطمینان
+    let test_buy_amount = test_buy_amount.max(5_000_000);
+
+    let test_tip = 5_000_000;  // 0.005 SOL tip
+
+    info!("💰 Calculated amounts:");
+    info!("   • Actual cost for 50 tokens: {} SOL", actual_cost as f64 / LAMPORTS_PER_SOL as f64);
+    info!("   • Max SOL (3x slippage): {} SOL", test_buy_amount as f64 / LAMPORTS_PER_SOL as f64);
+    info!("   • Tokens to buy: {}", test_token_amount);
     info!("   • Tip: {} SOL", test_tip as f64 / LAMPORTS_PER_SOL as f64);
 
     // ═══════════════════════════════════════════════════════════
@@ -540,7 +570,7 @@ async fn run_jito_buy_sell_test(
         &mint,
         &creator_vault,
         test_token_amount,
-        0, // min_sol_output (accept any)
+        0, // min_sol_output (accept any - قبول هر قیمتی!)
         50_000, // priority fee
         test_tip,
         &jito_tip_account,
@@ -568,7 +598,7 @@ async fn run_jito_buy_sell_test(
 
     let optimal_endpoint = oracle.get_optimal_jito_endpoint(tx_info.slot).await;
     info!("📍 Target Jito Engine: {}", optimal_endpoint);
-    info!("🚀 Sending 2-tx bundle [buy + sell+tip] to Jito...");
+    info!("🚀 Sending 2-tx bundle [buy 50 tokens + sell+tip] to Jito...");
 
     match jito_client.send_bundle_real(bundle, &optimal_endpoint).await {
         Ok(uuid) => {
@@ -582,11 +612,11 @@ async fn run_jito_buy_sell_test(
             match jito_client.check_target_transaction_status(&buy_signature).await {
                 Ok(TargetTxStatus::AlreadyConfirmed) | Ok(TargetTxStatus::Processed) => {
                     info!("   🎉 TEST PASSED! Buy/Sell bundle LANDED on chain!");
-                    info!("   ✅ This proves gRPC delay is NOT the problem!");
+                    info!("   ✅ Proof: gRPC pool data + proper slippage works!");
                 }
                 Ok(TargetTxStatus::NotFound) => {
                     warn!("   ⏳ Bundle accepted but not found on chain yet");
-                    warn!("   💡 Might be tip too low or timing issue");
+                    warn!("   💡 Might be timing issue (too late in slot)");
                 }
                 Ok(TargetTxStatus::Unknown) => {
                     warn!("   ❓ Transaction status unknown");
@@ -599,6 +629,7 @@ async fn run_jito_buy_sell_test(
         Err(e) => {
             error!("   ❌ Jito REJECTED the bundle!");
             error!("   📋 Reason: {}", e);
+            error!("   💡 This might indicate slippage calculation issue");
         }
     }
 
@@ -987,6 +1018,7 @@ async fn unified_worker_thread(
                 &tx_builder,
                 &leader_oracle,
                 &tx_info,
+                &pool_tracker,
             ).await {
                 error!("🧪 Worker {} test error: {}", worker_id, e);
             }
