@@ -580,6 +580,46 @@ async fn run_jito_buy_sell_test(
     info!("✅ Buy transaction with tip built: {}", buy_signature);
 
     // ═══════════════════════════════════════════════════════════
+    // 🕵️ شبیه‌سازی محلی قبل از ارسال (CRITICAL!)
+    // ═══════════════════════════════════════════════════════════
+    info!("🕵️ Simulating transaction locally...");
+
+    match jito_client.simulate_transaction(&buy_tx).await {
+        Ok(sim_result) => {
+            if let Some(err) = &sim_result.err {
+                error!("❌ SIMULATION FAILED!");
+                error!("   Error: {:?}", err);
+                if let Some(logs) = &sim_result.logs {
+                    error!("   📜 Logs:");
+                    for log in logs.iter().take(20) {
+                        error!("      {}", log);
+                    }
+                }
+                error!("   💡 This is why Jito drops your bundle!");
+                return Ok(());
+            }
+
+            info!("   ✅ Simulation SUCCESS!");
+            if let Some(units) = sim_result.units_consumed {
+                info!("   ⚡ Compute Units Used: {}", units);
+                if units > 350_000 {
+                    warn!("   ⚠️  High CU usage detected!");
+                }
+            }
+            if let Some(logs) = &sim_result.logs {
+                info!("   📜 Sample logs:");
+                for log in logs.iter().take(5) {
+                    info!("      {}", log);
+                }
+            }
+        }
+        Err(e) => {
+            error!("   ⚠️  Could not simulate (RPC issue): {}", e);
+            warn!("   💡 Continuing anyway, but bundle might fail...");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
     // ارسال تراکنش به Jito (بدون bundle، فقط یک tx)
     // ═══════════════════════════════════════════════════════════
     let bundle = vec![VersionedTransaction::from(buy_tx)];

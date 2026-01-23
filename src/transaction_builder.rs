@@ -68,8 +68,9 @@ impl TransactionBuilder {
 
         let mut instructions = Vec::new();
 
+        // ✅ افزایش CU limit برای تراکنش‌های سنگین Pump.fun
         instructions.push(
-            ComputeBudgetInstruction::set_compute_unit_limit(250_000)
+            ComputeBudgetInstruction::set_compute_unit_limit(400_000)
         );
 
         instructions.push(
@@ -140,6 +141,7 @@ impl TransactionBuilder {
 
         let mut instructions = Vec::new();
 
+        // ✅ افزایش CU limit برای تراکنش‌های سنگین Pump.fun
         instructions.push(
             ComputeBudgetInstruction::set_compute_unit_limit(400_000)
         );
