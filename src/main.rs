@@ -498,7 +498,7 @@ async fn run_jito_buy_sell_test(
     // مقادیر ثابت TEST
     // ═══════════════════════════════════════════════════════════
     let test_token_amount = 100;       // 100 توکن
-    let test_max_sol = 5_000_000;      // 0.005 SOL
+    let test_max_sol = 10_000_000;     // 0.01 SOL (دوبرابر شد برای اطمینان)
     let test_tip = 5_000_000;          // 0.005 SOL tip
 
     info!("💰 Fixed amounts:");
@@ -506,9 +506,33 @@ async fn run_jito_buy_sell_test(
     info!("   • Max SOL: {} SOL", test_max_sol as f64 / LAMPORTS_PER_SOL as f64);
     info!("   • Tip: {} SOL", test_tip as f64 / LAMPORTS_PER_SOL as f64);
 
-    // استفاده از blockhash victim (صفر latency!)
-    let blockhash = tx_info.blockhash;
-    info!("   • Using victim blockhash: {:?}", blockhash);
+    // ✅ استفاده از fresh blockhash (نه victim's!) برای جلوگیری از expired blockhash
+    let blockhash = match tx_builder.get_recent_blockhash().await {
+        Ok(bh) => {
+            info!("   • Using fresh blockhash: {:?}", bh);
+            bh
+        }
+        Err(e) => {
+            error!("   ❌ Failed to get fresh blockhash: {}", e);
+            return Ok(());
+        }
+    };
+
+    // بررسی موجودی wallet
+    match tx_builder.rpc_client.get_balance(&wallet_manager.front_runner.pubkey()) {
+        Ok(balance) => {
+            let balance_sol = balance as f64 / LAMPORTS_PER_SOL as f64;
+            info!("   • Wallet balance: {} SOL", balance_sol);
+            if balance < (test_max_sol + test_tip + 10_000_000) {
+                error!("   ❌ Insufficient balance! Need at least {} SOL",
+                    (test_max_sol + test_tip + 10_000_000) as f64 / LAMPORTS_PER_SOL as f64);
+                return Ok(());
+            }
+        }
+        Err(e) => {
+            warn!("   ⚠️  Could not check balance: {}", e);
+        }
+    }
 
     // ═══════════════════════════════════════════════════════════
     // ساخت تراکنش خرید (بدون tip ابتدا)
@@ -589,13 +613,42 @@ async fn run_jito_buy_sell_test(
             if let Some(err) = &sim_result.err {
                 error!("❌ SIMULATION FAILED!");
                 error!("   Error: {:?}", err);
+
+                // تلاش برای decode کردن error
+                if let Some(err_obj) = err.as_object() {
+                    if let Some(instruction_error) = err_obj.get("InstructionError") {
+                        if let Some(arr) = instruction_error.as_array() {
+                            if arr.len() >= 2 {
+                                let ix_index = arr[0].as_u64().unwrap_or(0);
+                                error!("   📍 Failed at instruction #{}", ix_index);
+
+                                if let Some(custom_err) = arr[1].as_object() {
+                                    if let Some(code) = custom_err.get("Custom") {
+                                        let error_code = code.as_u64().unwrap_or(0);
+                                        error!("   🔴 Custom Error Code: {}", error_code);
+
+                                        // Pump.fun error codes
+                                        match error_code {
+                                            2006 => error!("      → Likely: BondingCurveComplete or InvalidState"),
+                                            6001 => error!("      → Slippage tolerance exceeded"),
+                                            1 => error!("      → Insufficient funds"),
+                                            _ => error!("      → Unknown Pump.fun error"),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if let Some(logs) = &sim_result.logs {
-                    error!("   📜 Logs:");
-                    for log in logs.iter().take(20) {
+                    error!("   📜 Full Logs:");
+                    for log in logs {
                         error!("      {}", log);
                     }
                 }
                 error!("   💡 This is why Jito drops your bundle!");
+                error!("   💡 Suggestion: This token might be graduated to Raydium already");
                 return Ok(());
             }
 
@@ -607,8 +660,8 @@ async fn run_jito_buy_sell_test(
                 }
             }
             if let Some(logs) = &sim_result.logs {
-                info!("   📜 Sample logs:");
-                for log in logs.iter().take(5) {
+                info!("   📜 Transaction logs:");
+                for log in logs.iter().take(10) {
                     info!("      {}", log);
                 }
             }
