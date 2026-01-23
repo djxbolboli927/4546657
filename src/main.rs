@@ -498,7 +498,7 @@ async fn run_jito_buy_sell_test(
     // ═══════════════════════════════════════════════════════════
     let test_buy_amount = 10_000;      // 0.00001 SOL
     let test_token_amount = 1000;      // مقدار دلخواه token
-    let test_tip = 100_000;            // 0.0001 SOL
+    let test_tip = 5_000_000;          // 0.005 SOL (50x higher for better landing)
 
     info!("💰 Test amounts:");
     info!("   • Buy: {} SOL", test_buy_amount as f64 / LAMPORTS_PER_SOL as f64);
