@@ -915,13 +915,19 @@ async fn run_jito_bundle_test(
     let calculated_token_amount = calculate_token_out_with_fee(
         buy_sol_amount, pool_state.virtual_sol_reserves, pool_state.virtual_token_reserves);
 
-    // ✅ برای فروش، 99% استفاده کن تا مطمئن باشیم کافی است
-    let sell_token_amount = (calculated_token_amount as f64 * 0.99) as u64;
+    // ✅ فروش دقیقاً 100% (نه 99%)
+    // دلیل: در Pump.fun ما "تعداد توکن خروجی" را مشخص می‌کنیم
+    // پس دقیقاً همان مقدار را می‌گیریم
+    // اگر کمتر از 100% بفروشیم:
+    //   - dust (باقیمانده) در account می‌ماند
+    //   - close_account fail می‌کند (balance != 0)
+    //   - کل bundle fail می‌شود!
+    let sell_token_amount = calculated_token_amount;  // 100%
 
     info!("💰 Amounts:");
     info!("   • Buy: 0.0001 SOL | Max: 0.0002 SOL | Tip: 0.0001 SOL");
-    info!("   • Calculated tokens: {}", calculated_token_amount);
-    info!("   • Sell tokens (99%): {} ← safer!", sell_token_amount);
+    info!("   • Buy tokens: {}", calculated_token_amount);
+    info!("   • Sell tokens: {} (100% - required for CloseAccount)", sell_token_amount);
 
     let blockhash = tx_builder.get_recent_blockhash().await?;
     let jito_tip_account = JITO_TIP_ACCOUNTS[0].parse::<Pubkey>()?;
