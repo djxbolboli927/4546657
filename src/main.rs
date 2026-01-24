@@ -860,6 +860,192 @@ async fn run_jito_two_step_test(
 }
 
 // ═══════════════════════════════════════════════════════════
+// 🧪 BUNDLE TEST: Buy + Sell در یک bundle
+// ═══════════════════════════════════════════════════════════
+
+async fn run_jito_bundle_test(
+    jito_client: &Arc<JitoClient>,
+    wallet_manager: &Arc<WalletManager>,
+    tx_builder: &Arc<TransactionBuilder>,
+    oracle: &Arc<LeaderOracle>,
+    tx_info: &TransactionInfo,
+    pool_tracker: &PoolTracker,
+) -> Result<()> {
+    info!("═══════════════════════════════════════════════════════");
+    info!("🧪 Bundle Test: Buy + Sell در یک bundle");
+    info!("═══════════════════════════════════════════════════════");
+    info!("📦 Victim TX: ...{}", &tx_info.signature[tx_info.signature.len()-8..]);
+    info!("🪙 Mint: {}", tx_info.mint);
+
+    // Parse accounts
+    let mint = Pubkey::from_str(&tx_info.mint)?;
+    let creator_vault = match &tx_info.creator_vault {
+        Some(cv) => Pubkey::from_str(cv)?,
+        None => { warn!("No creator vault"); return Ok(()); }
+    };
+    let token_program_id_str = match &tx_info.token_program_id {
+        Some(tp) => tp,
+        None => { warn!("No token program"); return Ok(()); }
+    };
+    let token_program_type = if token_program_id_str == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" {
+        TokenProgramType::Token2022Program
+    } else {
+        TokenProgramType::TokenProgram
+    };
+    let token_program_id = Pubkey::from_str(token_program_id_str)?;
+
+    info!("🔍 Token Program: {:?} ({})", token_program_type, token_program_id);
+
+    // Derive bonding curve
+    let bonding_curve = derive_bonding_curve(&mint);
+    let bonding_curve_str = bonding_curve.to_string();
+
+    // Get pool state
+    let pool_state = match pool_tracker.get(&bonding_curve_str) {
+        Some(pool) => pool.clone(),
+        None => { warn!("No pool state"); return Ok(()); }
+    };
+
+    // Calculate amounts
+    let buy_sol_amount = 100_000_u64;  // 0.0001 SOL
+    let max_sol_amount = 200_000_u64;  // 0.0002 SOL
+    let tip_amount = 100_000_u64;      // 0.0001 SOL
+
+    // محاسبه token amount بر اساس bonding curve
+    let calculated_token_amount = calculate_token_out_with_fee(
+        buy_sol_amount, pool_state.virtual_sol_reserves, pool_state.virtual_token_reserves);
+
+    // ✅ برای فروش، 99% استفاده کن تا مطمئن باشیم کافی است
+    let sell_token_amount = (calculated_token_amount as f64 * 0.99) as u64;
+
+    info!("💰 Amounts:");
+    info!("   • Buy: 0.0001 SOL | Max: 0.0002 SOL | Tip: 0.0001 SOL");
+    info!("   • Calculated tokens: {}", calculated_token_amount);
+    info!("   • Sell tokens (99%): {} ← safer!", sell_token_amount);
+
+    let blockhash = tx_builder.get_recent_blockhash().await?;
+    let jito_tip_account = JITO_TIP_ACCOUNTS[0].parse::<Pubkey>()?;
+
+    // ═══════════════════════════════════════════════════════════
+    // Build BUY transaction
+    // ═══════════════════════════════════════════════════════════
+    let buy_tx = tx_builder.build_front_run_transaction(
+        &wallet_manager.front_runner, &mint, &creator_vault, calculated_token_amount,
+        max_sol_amount, 50_000, blockhash, token_program_type, &token_program_id).await?;
+
+    let buy_signature = bs58::encode(&buy_tx.signatures[0]).into_string();
+    info!("✅ Buy TX: ...{}", &buy_signature[buy_signature.len()-8..]);
+
+    // Simulate buy
+    match jito_client.simulate_transaction(&buy_tx).await {
+        Ok(sim_result) => {
+            if let Some(err) = &sim_result.err {
+                error!("❌ BUY SIM FAILED: {:?}", err);
+                return Ok(());
+            }
+            info!("   ✅ Buy simulation SUCCESS");
+        }
+        Err(e) => {
+            error!("Buy sim error: {}", e);
+            return Ok(());
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Build SELL transaction (با tip)
+    // ═══════════════════════════════════════════════════════════
+    let sell_tx = tx_builder.build_back_run_transaction(
+        &wallet_manager.front_runner, &mint, &creator_vault,
+        sell_token_amount,  // ✅ 99% برای اطمینان
+        0, 50_000, tip_amount, &jito_tip_account, blockhash,
+        token_program_type, &token_program_id).await?;
+
+    let sell_signature = bs58::encode(&sell_tx.signatures[0]).into_string();
+    info!("✅ Sell TX: ...{}", &sell_signature[sell_signature.len()-8..]);
+
+    // Simulate sell
+    info!("🕵️ Simulating SELL...");
+    match jito_client.simulate_transaction(&sell_tx).await {
+        Ok(sim_result) => {
+            if let Some(err) = &sim_result.err {
+                error!("❌ SELL SIM FAILED!");
+                error!("   Error: {:?}", err);
+                if let Some(logs) = &sim_result.logs {
+                    error!("   📜 Logs:");
+                    for log in logs.iter().take(15) {
+                        error!("      {}", log);
+                    }
+                }
+                error!("\n💡 Sell simulation با 99% هم fail کرد!");
+                error!("   Sell amount: {}", sell_token_amount);
+                return Ok(());
+            }
+            info!("   ✅ Sell simulation SUCCESS!");
+        }
+        Err(e) => {
+            error!("Sell sim error: {}", e);
+            return Ok(());
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Send BUNDLE to Jito
+    // ═══════════════════════════════════════════════════════════
+    let bundle = vec![
+        VersionedTransaction::from(buy_tx),
+        VersionedTransaction::from(sell_tx),
+    ];
+
+    let optimal_endpoint = oracle.get_optimal_jito_endpoint(tx_info.slot).await;
+    info!("📍 Target Jito Engine: {}", optimal_endpoint);
+    info!("🚀 Sending BUNDLE [buy + sell+tip] to Jito...");
+
+    match jito_client.send_bundle_real(bundle, &optimal_endpoint).await {
+        Ok(uuid) => {
+            info!("   ✅ Jito ACCEPTED BUNDLE!");
+            info!("   🎫 UUID: {}", uuid);
+            info!("   ⏳ Waiting 10s to check confirmation...");
+
+            tokio::time::sleep(Duration::from_secs(10)).await;
+
+            // Check buy status
+            match jito_client.check_target_transaction_status(&buy_signature).await {
+                Ok(TargetTxStatus::AlreadyConfirmed) | Ok(TargetTxStatus::Processed) => {
+                    info!("   🎉 BUY CONFIRMED!");
+
+                    // Check sell status
+                    match jito_client.check_target_transaction_status(&sell_signature).await {
+                        Ok(TargetTxStatus::AlreadyConfirmed) | Ok(TargetTxStatus::Processed) => {
+                            info!("   🎉 SELL CONFIRMED!");
+                            info!("\n✅✅✅ BUNDLE TEST PASSED! Both transactions landed!");
+                        }
+                        Ok(TargetTxStatus::NotFound) => {
+                            warn!("   ⚠️  BUY confirmed but SELL not found");
+                        }
+                        _ => {
+                            warn!("   ❓ SELL status unknown");
+                        }
+                    }
+                }
+                Ok(TargetTxStatus::NotFound) => {
+                    warn!("   ⏳ Bundle accepted but not found on chain yet");
+                }
+                _ => {
+                    warn!("   ❓ Transaction status unknown");
+                }
+            }
+        }
+        Err(e) => {
+            error!("   ❌ Jito REJECTED BUNDLE!");
+            error!("   📋 Reason: {}", e);
+        }
+    }
+
+    info!("═══════════════════════════════════════════════════════");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════
 // 🧪 JITO CONNECTIVITY TEST (Zero-Risk Bundle)
 // ═══════════════════════════════════════════════════════════
 
@@ -978,8 +1164,8 @@ async fn unified_worker_thread(
     recent_activity: RecentActivity,
     leader_oracle: Arc<LeaderOracle>,
 ) {
-    info!("Worker {} started 🚀 (Buy/Sell Test Mode)", worker_id);
-    info!("⚠️  Worker {} will test buy/sell every 30 seconds", worker_id);
+    info!("Worker {} started 🚀 (Bundle Test Mode)", worker_id);
+    info!("⚠️  Worker {} will test buy+sell bundle every 30 seconds", worker_id);
 
     let mut last_test_time = Instant::now();
     let test_interval = Duration::from_secs(30);
@@ -1231,15 +1417,15 @@ async fn unified_worker_thread(
     END OF DISABLED MEV LOGIC
     ═══════════════════════════════════════════════════════════ */
 
-    // 🧪 TEST MODE: دریافت transactions و اجرای two-step test هر 30 ثانیه
+    // 🧪 TEST MODE: دریافت transactions و اجرای bundle test هر 30 ثانیه
     // فقط worker 0 تست می‌کند تا از خریدهای متعدد جلوگیری شود
     for tx_info in rx.iter() {
         // چک کردن آیا 30 ثانیه گذشته
         if worker_id == 0 && last_test_time.elapsed() >= test_interval {
-            info!("⏰ Worker {}: 30 seconds passed, running two-step test...", worker_id);
+            info!("⏰ Worker {}: 30 seconds passed, running bundle test...", worker_id);
 
             // اجرای تست با این transaction
-            if let Err(e) = run_jito_two_step_test(
+            if let Err(e) = run_jito_bundle_test(
                 &jito_client,
                 &wallet_manager,
                 &tx_builder,
