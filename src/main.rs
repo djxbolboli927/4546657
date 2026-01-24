@@ -963,30 +963,12 @@ async fn run_jito_bundle_test(
     let sell_signature = bs58::encode(&sell_tx.signatures[0]).into_string();
     info!("✅ Sell TX: ...{}", &sell_signature[sell_signature.len()-8..]);
 
-    // Simulate sell
-    info!("🕵️ Simulating SELL...");
-    match jito_client.simulate_transaction(&sell_tx).await {
-        Ok(sim_result) => {
-            if let Some(err) = &sim_result.err {
-                error!("❌ SELL SIM FAILED!");
-                error!("   Error: {:?}", err);
-                if let Some(logs) = &sim_result.logs {
-                    error!("   📜 Logs:");
-                    for log in logs.iter().take(15) {
-                        error!("      {}", log);
-                    }
-                }
-                error!("\n💡 Sell simulation با 99% هم fail کرد!");
-                error!("   Sell amount: {}", sell_token_amount);
-                return Ok(());
-            }
-            info!("   ✅ Sell simulation SUCCESS!");
-        }
-        Err(e) => {
-            error!("Sell sim error: {}", e);
-            return Ok(());
-        }
-    }
+    // ⚠️  نمی‌توانیم sell را simulate کنیم!
+    // دلیل: token account هنوز وجود ندارد (در buy transaction ساخته می‌شود)
+    // Simulation با error 3012 (AccountNotInitialized) fail می‌کند
+    // پس sell را بدون simulation در bundle می‌فرستیم
+    info!("⚠️  Skipping SELL simulation (token account not yet created)");
+    info!("   SELL will execute after BUY creates the account");
 
     // ═══════════════════════════════════════════════════════════
     // Send BUNDLE to Jito
