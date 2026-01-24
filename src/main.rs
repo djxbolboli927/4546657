@@ -476,6 +476,7 @@ async fn run_jito_buy_only_test(
         }
     };
 
+    // ✅ استخراج token_program_id از victim transaction (بدون detection!)
     let token_program_id_str = match &tx_info.token_program_id {
         Some(tp) => tp,
         None => {
@@ -484,18 +485,13 @@ async fn run_jito_buy_only_test(
         }
     };
 
-    let token_program_type = if token_program_id_str == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" {
-        TokenProgramType::Token2022Program
-    } else {
-        TokenProgramType::TokenProgram
-    };
-
     let token_program_id = Pubkey::from_str(token_program_id_str)
         .map_err(|e| anyhow::anyhow!("Invalid token program: {}", e))?;
+    let token_program_type = TokenProgramType::TokenProgram;  // dummy value (not used)
 
     info!("📍 Accounts from Victim:");
     info!("   • Creator Vault: {}", creator_vault);
-    info!("   • Token Program: {:?}", token_program_type);
+    info!("   • Token Program ID: {}", token_program_id);
 
     // ═══════════════════════════════════════════════════════════
     // ✅ CRITICAL: Derive bonding_curve از mint (نه کپی از victim!)
@@ -683,20 +679,15 @@ async fn run_jito_two_step_test(
         Some(cv) => Pubkey::from_str(cv)?,
         None => { warn!("No creator vault"); return Ok(()); }
     };
+    // ✅ استخراج token_program_id از victim transaction (بدون detection!)
     let token_program_id_str = match &tx_info.token_program_id {
         Some(tp) => tp,
         None => { warn!("No token program"); return Ok(()); }
     };
-    let token_program_type = if token_program_id_str == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" {
-        TokenProgramType::Token2022Program
-    } else {
-        TokenProgramType::TokenProgram
-    };
     let token_program_id = Pubkey::from_str(token_program_id_str)?;
+    let token_program_type = TokenProgramType::TokenProgram;  // dummy value (not used)
 
-    info!("🔍 Token Program Debug:");
-    info!("   • Type: {:?}", token_program_type);
-    info!("   • ID: {}", token_program_id);
+    info!("🔍 Token Program ID (from victim tx): {}", token_program_id);
 
     // Derive bonding curve
     let bonding_curve = derive_bonding_curve(&mint);
@@ -883,18 +874,20 @@ async fn run_jito_bundle_test(
         Some(cv) => Pubkey::from_str(cv)?,
         None => { warn!("No creator vault"); return Ok(()); }
     };
+    // ✅ استخراج token_program_id از victim transaction (بدون detection!)
+    // دلیل: token_program_id باید دقیقاً همان چیزی باشد که در تراکنش victim بود
+    // این برای هر دو TokenProgram و Token2022Program کار می‌کند
     let token_program_id_str = match &tx_info.token_program_id {
         Some(tp) => tp,
         None => { warn!("No token program"); return Ok(()); }
     };
-    let token_program_type = if token_program_id_str == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" {
-        TokenProgramType::Token2022Program
-    } else {
-        TokenProgramType::TokenProgram
-    };
     let token_program_id = Pubkey::from_str(token_program_id_str)?;
 
-    info!("🔍 Token Program: {:?} ({})", token_program_type, token_program_id);
+    // ⚠️  token_program_type در واقع استفاده نمی‌شود (dummy parameter)
+    // فقط token_program_id (Pubkey) مهم است که از victim transaction استخراج شده
+    let token_program_type = TokenProgramType::TokenProgram;  // dummy value
+
+    info!("🔍 Token Program ID (from victim tx): {}", token_program_id);
 
     // Derive bonding curve
     let bonding_curve = derive_bonding_curve(&mint);
@@ -1257,18 +1250,13 @@ async fn unified_worker_thread(
             }
         };
 
+        // ✅ استخراج token_program_id از victim transaction (بدون detection!)
         let token_program_id_str = match &tx_info.token_program_id {
             Some(tp) => tp,
             None => {
                 error!("   ❌ [Bundle] No token program ID");
                 continue;
             }
-        };
-
-        let token_program_type = if token_program_id_str == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" {
-            TokenProgramType::Token2022Program
-        } else {
-            TokenProgramType::TokenProgram
         };
 
         let token_program_id_pubkey = match Pubkey::from_str(token_program_id_str) {
@@ -1278,6 +1266,7 @@ async fn unified_worker_thread(
                 continue;
             }
         };
+        let token_program_type = TokenProgramType::TokenProgram;  // dummy value (not used)
 
         let safe_front_run_sol = (simulation.front_run_sol as f64 * 1.70) as u64;
 
