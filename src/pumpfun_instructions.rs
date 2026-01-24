@@ -31,6 +31,7 @@ pub fn derive_bonding_curve(mint: &Pubkey) -> Pubkey {
 }
 
 // ✅ BUY: همان کد قدیمی که کار می‌کرد (16 accounts)
+// ✅ fee_recipient از victim transaction استخراج می‌شود
 pub fn create_buy_instruction(
     buyer: &Pubkey,
     mint: &Pubkey,
@@ -41,9 +42,9 @@ pub fn create_buy_instruction(
     max_sol_cost: u64,
     token_program_id: &Pubkey,
     creator_vault: &Pubkey,
+    fee_recipient: &Pubkey,  // ✅ اضافه شد: از victim tx
 ) -> Result<Instruction> {
     let global_config = Pubkey::from_str(GLOBAL_CONFIG)?;
-    let fee_recipient = Pubkey::from_str(FEE_RECIPIENT)?;
     let event_authority = Pubkey::from_str(EVENT_AUTHORITY)?;
     let program_id = Pubkey::from_str(PUMP_FUN_PROGRAM)?;
     let global_volume = Pubkey::from_str(GLOBAL_VOLUME_ACCUMULATOR)?;
@@ -54,7 +55,7 @@ pub fn create_buy_instruction(
 
     let accounts = vec![
         AccountMeta::new_readonly(global_config, false),
-        AccountMeta::new(fee_recipient, false),
+        AccountMeta::new(*fee_recipient, false),  // ✅ از victim tx
         AccountMeta::new_readonly(*mint, false),
         AccountMeta::new(*bonding_curve, false),
         AccountMeta::new(*bonding_curve_token_account, false),
@@ -84,6 +85,7 @@ pub fn create_buy_instruction(
 }
 
 // ✅ SELL: 14 accounts طبق تصویر Solscan
+// ✅ fee_recipient از victim transaction استخراج می‌شود
 pub fn create_sell_instruction(
     seller: &Pubkey,
     mint: &Pubkey,
@@ -94,9 +96,9 @@ pub fn create_sell_instruction(
     min_sol_output: u64,
     token_program_id: &Pubkey,
     creator_vault: &Pubkey,
+    fee_recipient: &Pubkey,  // ✅ اضافه شد: از victim tx
 ) -> Result<Instruction> {
     let global_config = Pubkey::from_str(GLOBAL_CONFIG)?;
-    let fee_recipient = Pubkey::from_str(FEE_RECIPIENT)?;
     let event_authority = Pubkey::from_str(EVENT_AUTHORITY)?;
     let program_id = Pubkey::from_str(PUMP_FUN_PROGRAM)?;
     let fee_config = Pubkey::from_str(FEE_CONFIG)?;
@@ -105,7 +107,7 @@ pub fn create_sell_instruction(
     // ✅ SELL: فقط 14 accounts (بدون volume tracking و associated token program)
     let accounts = vec![
         AccountMeta::new_readonly(global_config, false),           // #1 - Global
-        AccountMeta::new(fee_recipient, false),                    // #2 - Fee Recipient
+        AccountMeta::new(*fee_recipient, false),                   // #2 - Fee Recipient (از victim tx)
         AccountMeta::new_readonly(*mint, false),                   // #3 - Mint
         AccountMeta::new(*bonding_curve, false),                   // #4 - Bonding Curve
         AccountMeta::new(*bonding_curve_token_account, false),     // #5 - Associated Bonding Curve

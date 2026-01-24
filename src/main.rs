@@ -476,6 +476,16 @@ async fn run_jito_buy_only_test(
         }
     };
 
+    // ✅ استخراج fee_recipient از victim transaction
+    let fee_recipient = match &tx_info.fee_recipient {
+        Some(fr) => Pubkey::from_str(fr)
+            .map_err(|e| anyhow::anyhow!("Invalid fee recipient: {}", e))?,
+        None => {
+            warn!("   ⚠️  No fee recipient, skipping test");
+            return Ok(());
+        }
+    };
+
     // ✅ استخراج token_program_id از victim transaction (بدون detection!)
     let token_program_id_str = match &tx_info.token_program_id {
         Some(tp) => tp,
@@ -570,6 +580,7 @@ async fn run_jito_buy_only_test(
         blockhash,
         token_program_type,
         &token_program_id,
+        &fee_recipient,  // ✅ از victim tx
     ).await {
         Ok(tx) => tx,
         Err(e) => {
@@ -679,6 +690,11 @@ async fn run_jito_two_step_test(
         Some(cv) => Pubkey::from_str(cv)?,
         None => { warn!("No creator vault"); return Ok(()); }
     };
+    // ✅ استخراج fee_recipient از victim transaction
+    let fee_recipient = match &tx_info.fee_recipient {
+        Some(fr) => Pubkey::from_str(fr)?,
+        None => { warn!("No fee recipient"); return Ok(()); }
+    };
     // ✅ استخراج token_program_id از victim transaction (بدون detection!)
     let token_program_id_str = match &tx_info.token_program_id {
         Some(tp) => tp,
@@ -719,7 +735,7 @@ async fn run_jito_two_step_test(
     let buy_tx = tx_builder.build_front_run_transaction_with_tip(
         &wallet_manager.front_runner, &mint, &creator_vault, estimated_token_amount,
         max_sol_amount, 50_000, tip_amount, &jito_tip_account, blockhash,
-        token_program_type, &token_program_id).await?;
+        token_program_type, &token_program_id, &fee_recipient).await?;
 
     let buy_signature = bs58::encode(&buy_tx.signatures[0]).into_string();
     info!("✅ Buy TX: ...{}", &buy_signature[buy_signature.len()-8..]);
@@ -799,7 +815,7 @@ async fn run_jito_two_step_test(
         &wallet_manager.front_runner, &mint, &creator_vault,
         actual_token_balance,  // ✅ واقعی!
         0, 50_000, tip_amount, &jito_tip_account, sell_blockhash,
-        token_program_type, &token_program_id).await?;
+        token_program_type, &token_program_id, &fee_recipient).await?;
 
     let sell_signature = bs58::encode(&sell_tx.signatures[0]).into_string();
     info!("✅ Sell TX: ...{}", &sell_signature[sell_signature.len()-8..]);
@@ -874,6 +890,11 @@ async fn run_jito_bundle_test(
         Some(cv) => Pubkey::from_str(cv)?,
         None => { warn!("No creator vault"); return Ok(()); }
     };
+    // ✅ استخراج fee_recipient از victim transaction
+    let fee_recipient = match &tx_info.fee_recipient {
+        Some(fr) => Pubkey::from_str(fr)?,
+        None => { warn!("No fee recipient"); return Ok(()); }
+    };
     // ✅ استخراج token_program_id از victim transaction (بدون detection!)
     // دلیل: token_program_id باید دقیقاً همان چیزی باشد که در تراکنش victim بود
     // این برای هر دو TokenProgram و Token2022Program کار می‌کند
@@ -930,7 +951,7 @@ async fn run_jito_bundle_test(
     // ═══════════════════════════════════════════════════════════
     let buy_tx = tx_builder.build_front_run_transaction(
         &wallet_manager.front_runner, &mint, &creator_vault, calculated_token_amount,
-        max_sol_amount, 50_000, blockhash, token_program_type, &token_program_id).await?;
+        max_sol_amount, 50_000, blockhash, token_program_type, &token_program_id, &fee_recipient).await?;
 
     let buy_signature = bs58::encode(&buy_tx.signatures[0]).into_string();
     info!("✅ Buy TX: ...{}", &buy_signature[buy_signature.len()-8..]);
@@ -955,9 +976,9 @@ async fn run_jito_bundle_test(
     // ═══════════════════════════════════════════════════════════
     let sell_tx = tx_builder.build_back_run_transaction(
         &wallet_manager.front_runner, &mint, &creator_vault,
-        sell_token_amount,  // ✅ 99% برای اطمینان
+        sell_token_amount,  // ✅ 100% (not 99%)
         0, 50_000, tip_amount, &jito_tip_account, blockhash,
-        token_program_type, &token_program_id).await?;
+        token_program_type, &token_program_id, &fee_recipient).await?;
 
     let sell_signature = bs58::encode(&sell_tx.signatures[0]).into_string();
     info!("✅ Sell TX: ...{}", &sell_signature[sell_signature.len()-8..]);
@@ -1250,6 +1271,22 @@ async fn unified_worker_thread(
             }
         };
 
+        // ✅ استخراج fee_recipient از victim transaction
+        let fee_recipient_str = match &tx_info.fee_recipient {
+            Some(fr) => fr,
+            None => {
+                error!("   ❌ [Bundle] No fee recipient");
+                continue;
+            }
+        };
+        let fee_recipient = match Pubkey::from_str(fee_recipient_str) {
+            Ok(fr) => fr,
+            Err(_) => {
+                error!("   ❌ [Bundle] Fee recipient parse failed");
+                continue;
+            }
+        };
+
         // ✅ استخراج token_program_id از victim transaction (بدون detection!)
         let token_program_id_str = match &tx_info.token_program_id {
             Some(tp) => tp,
@@ -1284,6 +1321,7 @@ async fn unified_worker_thread(
             blockhash,
             token_program_type,
             &token_program_id_pubkey,
+            &fee_recipient,  // ✅ از victim tx
         ).await {
             Ok(tx) => tx,
             Err(e) => {
@@ -1321,6 +1359,7 @@ async fn unified_worker_thread(
             blockhash,
             token_program_type,
             &token_program_id_pubkey,
+            &fee_recipient,  // ✅ از victim tx
         ).await {
             Ok(tx) => tx,
             Err(e) => {

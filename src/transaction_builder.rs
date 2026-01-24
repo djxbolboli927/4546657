@@ -50,6 +50,7 @@ impl TransactionBuilder {
         recent_blockhash: Hash,
         token_program_type: TokenProgramType,
         token_program_id: &Pubkey,
+        fee_recipient: &Pubkey,  // ✅ از victim tx
     ) -> Result<Transaction> {
 
         let bonding_curve = derive_bonding_curve(mint);
@@ -96,6 +97,7 @@ impl TransactionBuilder {
                 max_sol_cost,
                 token_program_id,
                 creator_vault,
+                fee_recipient,  // ✅ از victim tx
             )?
         );
 
@@ -126,6 +128,7 @@ impl TransactionBuilder {
         recent_blockhash: Hash,
         token_program_type: TokenProgramType,
         token_program_id: &Pubkey,
+        fee_recipient: &Pubkey,  // ✅ از victim tx
     ) -> Result<Transaction> {
 
         let bonding_curve = derive_bonding_curve(mint);
@@ -172,6 +175,7 @@ impl TransactionBuilder {
                 max_sol_cost,
                 token_program_id,
                 creator_vault,
+                fee_recipient,  // ✅ از victim tx
             )?
         );
 
@@ -211,6 +215,7 @@ impl TransactionBuilder {
         recent_blockhash: Hash,
         _token_program_type: TokenProgramType,
         token_program_id: &Pubkey,
+        fee_recipient: &Pubkey,  // ✅ از victim tx
     ) -> Result<Transaction> {
         let bonding_curve = derive_bonding_curve(mint);
         let bonding_curve_token_account = get_associated_token_address_with_program_id(
@@ -246,6 +251,7 @@ impl TransactionBuilder {
                 min_sol_output,
                 token_program_id,
                 creator_vault,
+                fee_recipient,  // ✅ از victim tx
             )?
         );
 
