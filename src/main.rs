@@ -498,9 +498,17 @@ async fn run_jito_buy_sell_test(
     info!("   • Token Program: {:?}", token_program_type);
 
     // ═══════════════════════════════════════════════════════════
+    // ✅ CRITICAL: Derive bonding_curve از mint (نه کپی از victim!)
+    // ═══════════════════════════════════════════════════════════
+    let bonding_curve = derive_bonding_curve(&mint);
+    let bonding_curve_str = bonding_curve.to_string();
+
+    info!("   • Bonding Curve (derived): {}", bonding_curve_str);
+
+    // ═══════════════════════════════════════════════════════════
     // 2️⃣ دریافت pool state از gRPC
     // ═══════════════════════════════════════════════════════════
-    let pool_state = match pool_tracker.get(&tx_info.bonding_curve) {
+    let pool_state = match pool_tracker.get(&bonding_curve_str) {
         Some(pool) => pool.clone(),
         None => {
             warn!("   ⚠️  No pool state available, skipping test");
@@ -817,8 +825,12 @@ async fn unified_worker_thread(
             continue;
         }
 
+        // ✅ Derive bonding_curve از mint (نه کپی از victim!)
+        let bonding_curve = derive_bonding_curve(&Pubkey::from_str(&tx_info.mint).unwrap());
+        let bonding_curve_str = bonding_curve.to_string();
+
         // Pool check
-        let pool_state = match pool_tracker.get(&tx_info.bonding_curve) {
+        let pool_state = match pool_tracker.get(&bonding_curve_str) {
             Some(pool) => pool.clone(),
             None => {
                 stats.skipped_no_pool.fetch_add(1, Ordering::Relaxed);
