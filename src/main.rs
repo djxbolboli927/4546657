@@ -694,6 +694,10 @@ async fn run_jito_two_step_test(
     };
     let token_program_id = Pubkey::from_str(token_program_id_str)?;
 
+    info!("🔍 Token Program Debug:");
+    info!("   • Type: {:?}", token_program_type);
+    info!("   • ID: {}", token_program_id);
+
     // Derive bonding curve
     let bonding_curve = derive_bonding_curve(&mint);
     let bonding_curve_str = bonding_curve.to_string();
@@ -704,15 +708,17 @@ async fn run_jito_two_step_test(
         None => { warn!("No pool state"); return Ok(()); }
     };
 
-    // Calculate amounts
-    let buy_sol_amount = 4_000_000_u64;
-    let max_sol_amount = 6_000_000_u64;
-    let tip_amount = 5_000_000_u64;
+    // Calculate amounts (reduced for testing)
+    let buy_sol_amount = 100_000_u64;  // 0.0001 SOL
+    let max_sol_amount = 200_000_u64;  // 0.0002 SOL
+    let tip_amount = 100_000_u64;      // 0.0001 SOL
 
     let estimated_token_amount = calculate_token_out_with_fee(
         buy_sol_amount, pool_state.virtual_sol_reserves, pool_state.virtual_token_reserves);
 
-    info!("💰 Estimated tokens: {}", estimated_token_amount);
+    info!("💰 Test amounts:");
+    info!("   • Buy: 0.0001 SOL | Max: 0.0002 SOL | Tip: 0.0001 SOL");
+    info!("   • Estimated tokens: {}", estimated_token_amount);
 
     // STEP 1: BUY
     info!("\n📍 STEP 1: BUY");
@@ -789,6 +795,13 @@ async fn run_jito_two_step_test(
 
     // STEP 3: SELL
     info!("\n📍 STEP 3: SELL (با token واقعی)");
+
+    info!("🔍 Sell Debug:");
+    info!("   • Token amount: {}", actual_token_balance);
+    info!("   • Token program type: {:?}", token_program_type);
+    info!("   • Token program ID: {}", token_program_id);
+    info!("   • Creator vault: {}", creator_vault);
+
     let sell_blockhash = tx_builder.get_recent_blockhash().await?;
 
     let sell_tx = tx_builder.build_back_run_transaction(
@@ -1219,9 +1232,10 @@ async fn unified_worker_thread(
     ═══════════════════════════════════════════════════════════ */
 
     // 🧪 TEST MODE: دریافت transactions و اجرای two-step test هر 30 ثانیه
+    // فقط worker 0 تست می‌کند تا از خریدهای متعدد جلوگیری شود
     for tx_info in rx.iter() {
         // چک کردن آیا 30 ثانیه گذشته
-        if last_test_time.elapsed() >= test_interval {
+        if worker_id == 0 && last_test_time.elapsed() >= test_interval {
             info!("⏰ Worker {}: 30 seconds passed, running two-step test...", worker_id);
 
             // اجرای تست با این transaction
