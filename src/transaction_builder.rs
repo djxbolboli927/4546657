@@ -111,6 +111,91 @@ impl TransactionBuilder {
         Ok(transaction)
     }
 
+    /// ساخت تراکنش خرید با انعام جیتو (Front-Run + Tip)
+    #[allow(clippy::too_many_arguments)]
+    pub async fn build_front_run_transaction_with_tip(
+        &self,
+        buyer: &Keypair,
+        mint: &Pubkey,
+        creator_vault: &Pubkey,
+        token_amount: u64,
+        max_sol_cost: u64,
+        priority_fee_microlamports: u64,
+        jito_tip_lamports: u64,
+        jito_tip_account: &Pubkey,
+        recent_blockhash: Hash,
+        token_program_type: TokenProgramType,
+        token_program_id: &Pubkey,
+    ) -> Result<Transaction> {
+
+        let bonding_curve = derive_bonding_curve(mint);
+
+        let bonding_curve_token_account = get_associated_token_address_with_program_id(
+            &bonding_curve,
+            mint,
+            token_program_id,
+        );
+
+        let user_token_account = get_associated_token_address_with_program_id(
+            &buyer.pubkey(),
+            mint,
+            token_program_id,
+        );
+
+        let mut instructions = Vec::new();
+
+        // ✅ افزایش CU limit برای تراکنش‌های سنگین Pump.fun
+        instructions.push(
+            ComputeBudgetInstruction::set_compute_unit_limit(400_000)
+        );
+
+        instructions.push(
+            ComputeBudgetInstruction::set_compute_unit_price(priority_fee_microlamports)
+        );
+
+        let create_ata_ix = create_associated_token_account_with_program_id(
+            &buyer.pubkey(),
+            &buyer.pubkey(),
+            mint,
+            token_program_id,
+        );
+        instructions.push(create_ata_ix);
+
+        instructions.push(
+            create_buy_instruction(
+                &buyer.pubkey(),
+                mint,
+                &bonding_curve,
+                &bonding_curve_token_account,
+                &user_token_account,
+                token_amount,
+                max_sol_cost,
+                token_program_id,
+                creator_vault,
+            )?
+        );
+
+        // ✅ اضافه کردن انعام جیتو
+        instructions.push(
+            system_instruction::transfer(
+                &buyer.pubkey(),
+                jito_tip_account,
+                jito_tip_lamports,
+            )
+        );
+
+        let message = Message::new_with_blockhash(
+            &instructions,
+            Some(&buyer.pubkey()),
+            &recent_blockhash,
+        );
+
+        let mut transaction = Transaction::new_unsigned(message);
+        transaction.sign(&[buyer], recent_blockhash);
+
+        Ok(transaction)
+    }
+
     /// ساخت تراکنش فروش (Back-Run)
     #[allow(clippy::too_many_arguments)]
     pub async fn build_back_run_transaction(

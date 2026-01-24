@@ -447,7 +447,7 @@ fn print_simulation_result(sim: &SandwichSimulation, worker_id: usize, profitabl
 // 🧪 JITO BUY/SELL TEST (No Pool Required)
 // ═══════════════════════════════════════════════════════════
 
-async fn run_jito_buy_sell_test(
+async fn run_jito_buy_only_test(
     jito_client: &Arc<JitoClient>,
     wallet_manager: &Arc<WalletManager>,
     tx_builder: &Arc<TransactionBuilder>,
@@ -456,7 +456,7 @@ async fn run_jito_buy_sell_test(
     pool_tracker: &PoolTracker,
 ) -> Result<()> {
     info!("═══════════════════════════════════════════════════════");
-    info!("🧪 Starting Buy/Sell Test (با استفاده از Pool Price)");
+    info!("🧪 Starting Buy Only Test (فقط خرید + انعام جیتو)");
     info!("═══════════════════════════════════════════════════════");
     info!("📦 Victim Transaction: ...{}", &tx_info.signature[tx_info.signature.len()-8..]);
     info!("🪙 Mint: {}", tx_info.mint);
@@ -557,15 +557,20 @@ async fn run_jito_buy_sell_test(
     };
 
     // ═══════════════════════════════════════════════════════════
-    // 5️⃣ ساخت Buy Transaction
+    // 5️⃣ ساخت Buy Transaction با انعام جیتو
     // ═══════════════════════════════════════════════════════════
-    let buy_tx = match tx_builder.build_front_run_transaction(
+    let jito_tip_account = JITO_TIP_ACCOUNTS[0].parse::<Pubkey>()
+        .map_err(|e| anyhow::anyhow!("Invalid tip account: {}", e))?;
+
+    let buy_tx = match tx_builder.build_front_run_transaction_with_tip(
         &wallet_manager.front_runner,
         &mint,
         &creator_vault,
         token_amount,
         max_sol_amount,
         50_000, // priority fee
+        tip_amount,
+        &jito_tip_account,
         blockhash,
         token_program_type,
         &token_program_id,
@@ -578,39 +583,10 @@ async fn run_jito_buy_sell_test(
     };
 
     let buy_signature = bs58::encode(&buy_tx.signatures[0]).into_string();
-    info!("✅ Buy transaction built: ...{}", &buy_signature[buy_signature.len()-8..]);
+    info!("✅ Buy transaction built (with tip): ...{}", &buy_signature[buy_signature.len()-8..]);
 
     // ═══════════════════════════════════════════════════════════
-    // 6️⃣ ساخت Sell Transaction با Tip
-    // ═══════════════════════════════════════════════════════════
-    let jito_tip_account = JITO_TIP_ACCOUNTS[0].parse::<Pubkey>()
-        .map_err(|e| anyhow::anyhow!("Invalid tip account: {}", e))?;
-
-    let sell_tx = match tx_builder.build_back_run_transaction(
-        &wallet_manager.front_runner,
-        &mint,
-        &creator_vault,
-        token_amount,
-        0, // min_sol_output (accept any)
-        50_000, // priority fee
-        tip_amount,
-        &jito_tip_account,
-        blockhash,
-        token_program_type,
-        &token_program_id,
-    ).await {
-        Ok(tx) => tx,
-        Err(e) => {
-            error!("   ❌ Sell transaction build failed: {}", e);
-            return Ok(());
-        }
-    };
-
-    let sell_signature = bs58::encode(&sell_tx.signatures[0]).into_string();
-    info!("✅ Sell transaction built: ...{}", &sell_signature[sell_signature.len()-8..]);
-
-    // ═══════════════════════════════════════════════════════════
-    // 7️⃣ شبیه‌سازی Buy Transaction با RPC
+    // 6️⃣ شبیه‌سازی Buy Transaction با RPC
     // ═══════════════════════════════════════════════════════════
     info!("🕵️ Simulating BUY transaction...");
 
@@ -640,16 +616,15 @@ async fn run_jito_buy_sell_test(
     }
 
     // ═══════════════════════════════════════════════════════════
-    // 8️⃣ ارسال Bundle به Jito
+    // 7️⃣ ارسال Bundle به Jito (فقط تراکنش خرید)
     // ═══════════════════════════════════════════════════════════
     let bundle = vec![
         VersionedTransaction::from(buy_tx),
-        VersionedTransaction::from(sell_tx),
     ];
 
     let optimal_endpoint = oracle.get_optimal_jito_endpoint(tx_info.slot).await;
     info!("📍 Target Jito Engine: {}", optimal_endpoint);
-    info!("🚀 Sending 2-tx bundle [buy + sell+tip] to Jito...");
+    info!("🚀 Sending 1-tx bundle [buy+tip] to Jito...");
 
     match jito_client.send_bundle_real(bundle, &optimal_endpoint).await {
         Ok(uuid) => {
@@ -1056,14 +1031,14 @@ async fn unified_worker_thread(
     END OF DISABLED MEV LOGIC
     ═══════════════════════════════════════════════════════════ */
 
-    // 🧪 TEST MODE: دریافت transactions و اجرای buy/sell test هر 30 ثانیه
+    // 🧪 TEST MODE: دریافت transactions و اجرای buy only test هر 30 ثانیه
     for tx_info in rx.iter() {
         // چک کردن آیا 30 ثانیه گذشته
         if last_test_time.elapsed() >= test_interval {
-            info!("⏰ Worker {}: 30 seconds passed, running buy/sell test...", worker_id);
+            info!("⏰ Worker {}: 30 seconds passed, running buy only test...", worker_id);
 
             // اجرای تست با این transaction
-            if let Err(e) = run_jito_buy_sell_test(
+            if let Err(e) = run_jito_buy_only_test(
                 &jito_client,
                 &wallet_manager,
                 &tx_builder,
