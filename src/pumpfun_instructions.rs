@@ -30,6 +30,7 @@ pub fn derive_bonding_curve(mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(seeds, &program_id).0
 }
 
+// ✅ BUY: همان کد قدیمی که کار می‌کرد (16 accounts)
 pub fn create_buy_instruction(
     buyer: &Pubkey,
     mint: &Pubkey,
@@ -61,7 +62,7 @@ pub fn create_buy_instruction(
         AccountMeta::new(*buyer, true),
         AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
         AccountMeta::new_readonly(*token_program_id, false),
-        AccountMeta::new(*creator_vault, false), // Account 10: Creator Vault
+        AccountMeta::new(*creator_vault, false),
         AccountMeta::new_readonly(event_authority, false),
         AccountMeta::new_readonly(program_id, false),
         AccountMeta::new(global_volume, false),
@@ -82,6 +83,7 @@ pub fn create_buy_instruction(
     })
 }
 
+// ✅ SELL: 14 accounts طبق تصویر Solscan
 pub fn create_sell_instruction(
     seller: &Pubkey,
     mint: &Pubkey,
@@ -100,23 +102,22 @@ pub fn create_sell_instruction(
     let fee_config = Pubkey::from_str(FEE_CONFIG)?;
     let fee_program = Pubkey::from_str(FEE_PROGRAM)?;
 
-    // ✅ ترتیب دقیق از Solscan برای SELL
-    // SELL فقط 14 account دارد (نه 17 مثل BUY!)
+    // ✅ SELL: فقط 14 accounts (بدون volume tracking و associated token program)
     let accounts = vec![
-        AccountMeta::new_readonly(global_config, false),           // 0 - Global
-        AccountMeta::new(fee_recipient, false),                    // 1 - Fee Recipient
-        AccountMeta::new_readonly(*mint, false),                   // 2 - Mint
-        AccountMeta::new(*bonding_curve, false),                   // 3 - Bonding Curve
-        AccountMeta::new(*bonding_curve_token_account, false),     // 4 - Associated Bonding Curve
-        AccountMeta::new(*user_token_account, false),              // 5 - Associated User
-        AccountMeta::new(*seller, true),                           // 6 - User (signer)
-        AccountMeta::new_readonly(solana_sdk::system_program::id(), false), // 7 - System Program
-        AccountMeta::new(*creator_vault, false),                   // 8 - Creator Vault
-        AccountMeta::new_readonly(*token_program_id, false),       // 9 - Token Program
-        AccountMeta::new_readonly(event_authority, false),         // 10 - Event Authority
-        AccountMeta::new_readonly(program_id, false),              // 11 - Program
-        AccountMeta::new_readonly(fee_config, false),              // 12 - Fee Config
-        AccountMeta::new_readonly(fee_program, false),             // 13 - Fee Program
+        AccountMeta::new_readonly(global_config, false),           // #1 - Global
+        AccountMeta::new(fee_recipient, false),                    // #2 - Fee Recipient
+        AccountMeta::new_readonly(*mint, false),                   // #3 - Mint
+        AccountMeta::new(*bonding_curve, false),                   // #4 - Bonding Curve
+        AccountMeta::new(*bonding_curve_token_account, false),     // #5 - Associated Bonding Curve
+        AccountMeta::new(*user_token_account, false),              // #6 - Associated User
+        AccountMeta::new(*seller, true),                           // #7 - User
+        AccountMeta::new_readonly(solana_sdk::system_program::id(), false), // #8 - System Program
+        AccountMeta::new(*creator_vault, false),                   // #9 - Creator Vault
+        AccountMeta::new_readonly(*token_program_id, false),       // #10 - Token Program
+        AccountMeta::new_readonly(event_authority, false),         // #11 - Event Authority
+        AccountMeta::new_readonly(program_id, false),              // #12 - Program
+        AccountMeta::new_readonly(fee_config, false),              // #13 - Fee Config
+        AccountMeta::new_readonly(fee_program, false),             // #14 - Fee Program
     ];
 
     let mut data = Vec::new();
