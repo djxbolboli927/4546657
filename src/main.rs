@@ -660,6 +660,193 @@ async fn run_jito_buy_only_test(
 }
 
 // ═══════════════════════════════════════════════════════════
+// 🧪 TWO-STEP TEST: Buy → Read Balance → Sell
+// ═══════════════════════════════════════════════════════════
+
+async fn run_jito_two_step_test(
+    jito_client: &Arc<JitoClient>,
+    wallet_manager: &Arc<WalletManager>,
+    tx_builder: &Arc<TransactionBuilder>,
+    oracle: &Arc<LeaderOracle>,
+    tx_info: &TransactionInfo,
+    pool_tracker: &PoolTracker,
+) -> Result<()> {
+    info!("═══════════════════════════════════════════════════════");
+    info!("🧪 Two-Step Test: Buy → Wait → Read Balance → Sell");
+    info!("═══════════════════════════════════════════════════════");
+    info!("📦 Victim TX: ...{}", &tx_info.signature[tx_info.signature.len()-8..]);
+    info!("🪙 Mint: {}", tx_info.mint);
+
+    // Parse accounts
+    let mint = Pubkey::from_str(&tx_info.mint)?;
+    let creator_vault = match &tx_info.creator_vault {
+        Some(cv) => Pubkey::from_str(cv)?,
+        None => { warn!("No creator vault"); return Ok(()); }
+    };
+    let token_program_id_str = match &tx_info.token_program_id {
+        Some(tp) => tp,
+        None => { warn!("No token program"); return Ok(()); }
+    };
+    let token_program_type = if token_program_id_str == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" {
+        TokenProgramType::Token2022Program
+    } else {
+        TokenProgramType::TokenProgram
+    };
+    let token_program_id = Pubkey::from_str(token_program_id_str)?;
+
+    // Derive bonding curve
+    let bonding_curve = derive_bonding_curve(&mint);
+    let bonding_curve_str = bonding_curve.to_string();
+
+    // Get pool state
+    let pool_state = match pool_tracker.get(&bonding_curve_str) {
+        Some(pool) => pool.clone(),
+        None => { warn!("No pool state"); return Ok(()); }
+    };
+
+    // Calculate amounts
+    let buy_sol_amount = 4_000_000_u64;
+    let max_sol_amount = 6_000_000_u64;
+    let tip_amount = 5_000_000_u64;
+
+    let estimated_token_amount = calculate_token_out_with_fee(
+        buy_sol_amount, pool_state.virtual_sol_reserves, pool_state.virtual_token_reserves);
+
+    info!("💰 Estimated tokens: {}", estimated_token_amount);
+
+    // STEP 1: BUY
+    info!("\n📍 STEP 1: BUY");
+    let blockhash = tx_builder.get_recent_blockhash().await?;
+    let jito_tip_account = JITO_TIP_ACCOUNTS[0].parse::<Pubkey>()?;
+
+    let buy_tx = tx_builder.build_front_run_transaction_with_tip(
+        &wallet_manager.front_runner, &mint, &creator_vault, estimated_token_amount,
+        max_sol_amount, 50_000, tip_amount, &jito_tip_account, blockhash,
+        token_program_type, &token_program_id).await?;
+
+    let buy_signature = bs58::encode(&buy_tx.signatures[0]).into_string();
+    info!("✅ Buy TX: ...{}", &buy_signature[buy_signature.len()-8..]);
+
+    // Simulate buy
+    match jito_client.simulate_transaction(&buy_tx).await {
+        Ok(sim_result) => {
+            if let Some(err) = &sim_result.err {
+                error!("❌ BUY SIM FAILED: {:?}", err);
+                return Ok(());
+            }
+            info!("   ✅ Buy sim SUCCESS");
+        }
+        Err(e) => { error!("Buy sim error: {}", e); return Ok(()); }
+    }
+
+    // Send buy bundle
+    let bundle = vec![VersionedTransaction::from(buy_tx)];
+    let optimal_endpoint = oracle.get_optimal_jito_endpoint(tx_info.slot).await;
+
+    info!("🚀 Sending BUY...");
+    match jito_client.send_bundle_real(bundle, &optimal_endpoint).await {
+        Ok(uuid) => info!("   ✅ Jito OK! UUID: {}", uuid),
+        Err(e) => { error!("❌ Jito REJECT: {}", e); return Ok(()); }
+    }
+
+    // Wait
+    info!("   ⏳ Waiting 10s...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    match jito_client.check_target_transaction_status(&buy_signature).await {
+        Ok(TargetTxStatus::AlreadyConfirmed) | Ok(TargetTxStatus::Processed) => {
+            info!("   ✅ BUY CONFIRMED!");
+        }
+        _ => { warn!("❌ BUY not confirmed"); return Ok(()); }
+    }
+
+    // STEP 2: READ Token Balance
+    info!("\n📍 STEP 2: READ Balance");
+    use crate::spl_utils::get_associated_token_address_with_program_id;
+    let user_token_account = get_associated_token_address_with_program_id(
+        &wallet_manager.front_runner.pubkey(), &mint, &token_program_id);
+
+    let account_data = match tx_builder.rpc_client.get_account(&user_token_account) {
+        Ok(account) => account,
+        Err(e) => { error!("Failed to read account: {}", e); return Ok(()); }
+    };
+
+    if account_data.data.len() < 72 {
+        error!("Invalid account data");
+        return Ok(());
+    }
+
+    let actual_token_balance = u64::from_le_bytes(account_data.data[64..72].try_into()?);
+
+    info!("✅ Balance:");
+    info!("   • Estimated: {}", estimated_token_amount);
+    info!("   • Actual:    {} ← Use this!", actual_token_balance);
+
+    if actual_token_balance == 0 {
+        error!("❌ Balance is 0");
+        return Ok(());
+    }
+
+    // STEP 3: SELL
+    info!("\n📍 STEP 3: SELL (با token واقعی)");
+    let sell_blockhash = tx_builder.get_recent_blockhash().await?;
+
+    let sell_tx = tx_builder.build_back_run_transaction(
+        &wallet_manager.front_runner, &mint, &creator_vault,
+        actual_token_balance,  // ✅ واقعی!
+        0, 50_000, tip_amount, &jito_tip_account, sell_blockhash,
+        token_program_type, &token_program_id).await?;
+
+    let sell_signature = bs58::encode(&sell_tx.signatures[0]).into_string();
+    info!("✅ Sell TX: ...{}", &sell_signature[sell_signature.len()-8..]);
+
+    // Simulate sell
+    info!("🕵️ Simulating SELL...");
+    match jito_client.simulate_transaction(&sell_tx).await {
+        Ok(sim_result) => {
+            if let Some(err) = &sim_result.err {
+                error!("❌ SELL SIM FAILED!");
+                error!("   Error: {:?}", err);
+                if let Some(logs) = &sim_result.logs {
+                    error!("   📜 Logs:");
+                    for log in logs.iter().take(15) {
+                        error!("      {}", log);
+                    }
+                }
+                error!("\n💡 مشکل! فروش با token واقعی هم fail!");
+                error!("   Token: {}", actual_token_balance);
+                return Ok(());
+            }
+            info!("   ✅ Sell sim SUCCESS!");
+        }
+        Err(e) => { error!("Sell sim error: {}", e); return Ok(()); }
+    }
+
+    // Send sell
+    let sell_bundle = vec![VersionedTransaction::from(sell_tx)];
+    info!("🚀 Sending SELL...");
+
+    match jito_client.send_bundle_real(sell_bundle, &optimal_endpoint).await {
+        Ok(uuid) => {
+            info!("   ✅ Jito OK! UUID: {}", uuid);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
+            match jito_client.check_target_transaction_status(&sell_signature).await {
+                Ok(TargetTxStatus::AlreadyConfirmed) | Ok(TargetTxStatus::Processed) => {
+                    info!("   🎉 SELL CONFIRMED!");
+                    info!("\n✅✅✅ TWO-STEP TEST PASSED!");
+                }
+                _ => warn!("⏳ SELL not confirmed yet"),
+            }
+        }
+        Err(e) => error!("❌ Jito REJECT SELL: {}", e),
+    }
+
+    info!("═══════════════════════════════════════════════════════");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════
 // 🧪 JITO CONNECTIVITY TEST (Zero-Risk Bundle)
 // ═══════════════════════════════════════════════════════════
 
@@ -1031,14 +1218,14 @@ async fn unified_worker_thread(
     END OF DISABLED MEV LOGIC
     ═══════════════════════════════════════════════════════════ */
 
-    // 🧪 TEST MODE: دریافت transactions و اجرای buy only test هر 30 ثانیه
+    // 🧪 TEST MODE: دریافت transactions و اجرای two-step test هر 30 ثانیه
     for tx_info in rx.iter() {
         // چک کردن آیا 30 ثانیه گذشته
         if last_test_time.elapsed() >= test_interval {
-            info!("⏰ Worker {}: 30 seconds passed, running buy only test...", worker_id);
+            info!("⏰ Worker {}: 30 seconds passed, running two-step test...", worker_id);
 
             // اجرای تست با این transaction
-            if let Err(e) = run_jito_buy_only_test(
+            if let Err(e) = run_jito_two_step_test(
                 &jito_client,
                 &wallet_manager,
                 &tx_builder,
