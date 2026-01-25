@@ -60,6 +60,10 @@ mod spl_utils;
 mod leader_oracle;
 use leader_oracle::{LeaderOracle, GeoConfig, start_leader_schedule_updater};
 
+// 🎯 NEW: Multi-MEV Client Module
+mod multi_mev_client;
+use multi_mev_client::MultiMEVClient;
+
 // ═══════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════
@@ -82,6 +86,12 @@ const SANDWICH_SAFETY_MARGIN: f64 = 0.90;
 const JITO_TIP_LAMPORTS: u64 = 1_000_000;  // 0.001 SOL
 const BUY_AMOUNT_LAMPORTS: u64 = 100_000;   // 0.0001 SOL (ثابت)
 
+// ═══════════════════════════════════════════════════════════════
+// 🎯 MULTI-PATH TIP ACCOUNTS (6 MEV Services)
+// ═══════════════════════════════════════════════════════════════
+
+// 🟢 Group 1: Jito-Compatible (Jito + NextBlock + Bloom)
+// این سه سرویس از آدرس‌های tip مشترک استفاده می‌کنند
 const JITO_TIP_ACCOUNTS: [&str; 8] = [
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
     "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
@@ -92,6 +102,39 @@ const JITO_TIP_ACCOUNTS: [&str; 8] = [
     "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 ];
+
+// 🔵 Group 2: Nozomi (Temporal) - آدرس‌های اختصاصی
+const NOZOMI_TIP_ACCOUNTS: [&str; 3] = [
+    "TEMPaMeCRFAS9EKF53Jd6KpHxgL47uWLcpFArU1Fanq",
+    "noz3jAjPiHuBPqiSPkkugaJDkJscPuRhYnSpbi8UvC4",
+    "noz3str9KXfpKknefHji8L1mPgimezaiUyCHYMDv1GE",
+];
+
+// 🔴 Group 3: BloXroute - آدرس‌های اختصاصی
+const BLOXROUTE_TIP_ACCOUNTS: [&str; 2] = [
+    "HWEoBxYs7ssKuudEjzjmpfJVX7Dvi7wescFsVx2L5yoY",
+    "95cfoy472fcQHaw4tPGBTKpn6ZQnfEPfBgDQx6gcRmRg",
+];
+
+// 🟣 Group 4: 0slot - آدرس‌های اختصاصی
+const ZEROSLOT_TIP_ACCOUNTS: [&str; 2] = [
+    "8U1JPQh3mVQ4F5jwRdFTBzvNRQaYFQppHQYoH38DJGSQ",
+    "ENxTEjSQ1YabmUpXAdCgevnHQ9MHdLv8tzFiuiYJqa13",
+];
+
+// ═══════════════════════════════════════════════════════════════
+// 🌐 MEV SERVICE ENDPOINTS (Frankfurt Optimized)
+// ═══════════════════════════════════════════════════════════════
+
+const JITO_FRANKFURT_ENDPOINT: &str = "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles";
+const NEXTBLOCK_ENDPOINT: &str = "http://fra.nextblock.io/api/v1/bundles";  // Frankfurt
+const NEXTBLOCK_API_KEY: &str = "trial1769369425-numcWHZ99zxsupeMkjuaNlOQo2GBI2c4UalZIIpfTzA%3D";
+const BLOXROUTE_ENDPOINT: &str = "https://germany.solana.dex.blxrbdn.com/api/v2/submit-batch";
+const BLOXROUTE_AUTH: &str = "NjcyZWM5NTktYWY0Yi00MTU4LTk3YWYtZDNhZTk3N2M0NGE3OmNmMjIxOWI0YjkxYTNiYTc1NDNkMDgwMGVkODc4Mzc4";
+const BLOOM_ENDPOINT: &str = "https://mev.bloom.host/api/v1/bundles";
+const NOZOMI_ENDPOINT: &str = "https://nozomi.temporal.xyz/mainnet/secure/v1";
+const ZEROSLOT_ENDPOINT: &str = "https://api.0slot.trade/api/v1/bundles";
+
 // کارمزد متوسط شبکه از Solscan: 0.00003322 SOL
 const ESTIMATED_NETWORK_FEE: u64 = 33220;
 
@@ -251,7 +294,8 @@ impl WorkerPool {
         wallet_manager: Arc<WalletManager>,
         tx_builder: Arc<TransactionBuilder>,
         recent_activity: RecentActivity,
-        leader_oracle: Arc<LeaderOracle>, // 🌍 NEW
+        leader_oracle: Arc<LeaderOracle>, // 🌍 Leader Oracle
+        multi_mev_client: Arc<MultiMEVClient>, // 🎯 Multi-MEV Client
     ) -> Self {
         let mut workers = Vec::new();
 
@@ -265,7 +309,8 @@ impl WorkerPool {
             let wallet_clone = wallet_manager.clone();
             let builder_clone = tx_builder.clone();
             let activity_clone = recent_activity.clone();
-            let oracle_clone = leader_oracle.clone(); // 🌍 NEW
+            let oracle_clone = leader_oracle.clone(); // 🌍
+            let multi_mev_clone = multi_mev_client.clone(); // 🎯
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
@@ -279,7 +324,8 @@ impl WorkerPool {
                         wallet_clone,
                         builder_clone,
                         activity_clone,
-                        oracle_clone, // 🌍 NEW
+                        oracle_clone, // 🌍 Leader Oracle
+                        multi_mev_clone, // 🎯 Multi-MEV Client
                     ).await;
                 });
             });
@@ -1170,6 +1216,7 @@ async fn unified_worker_thread(
     tx_builder: Arc<TransactionBuilder>,
     recent_activity: RecentActivity,
     leader_oracle: Arc<LeaderOracle>,
+    multi_mev_client: Arc<MultiMEVClient>, // 🎯 Multi-MEV Client
 ) {
     info!("Worker {} started 🚀", worker_id);
 
@@ -1371,22 +1418,21 @@ async fn unified_worker_thread(
         // ⏸️ غیرفعال: شبیه‌سازی RPC قبل از ارسال (مستقیماً ارسال می‌کنیم)
         // if ENABLE_RPC_SIMULATION { ... }
 
-        // Send bundle to Jito Block Engine
-        let bundle_uuid = match jito_client.send_bundle_real(bundle, &optimal_jito_endpoint).await {
-            Ok(uuid) => {
-                // ⏸️ Debug: info!("✅ Bundle sent | UUID: {}", uuid);
-                uuid
+        // 🎯 SHOTGUN BROADCASTING - ارسال همزمان به ۶ سرویس MEV
+        // اولین سرویسی که bundle را قبول کند برنده است
+        let (winner_service, bundle_uuid) = match multi_mev_client.submit_bundle_parallel(bundle).await {
+            Ok((service, uuid)) => {
+                info!("🏆 Bundle accepted by {}: {}", service, uuid);
+                (service, uuid)
             }
             Err(e) => {
-                // 📊 Failed Bundle Analysis: Jito رد کرد
+                // 📊 Failed Bundle Analysis: همه سرویس‌ها رد کردند
                 stats.bundle_rejected_jito.fetch_add(1, Ordering::Relaxed);
                 stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
 
-                // لاگ فقط برای خطاهای غیرمعمول (نه 400)
-                if !e.to_string().contains("400") {
-                    let mint_str = mint.to_string();
-                    warn!("Bundle rejected: {} | Mint: ...{}", e, &mint_str[mint_str.len()-8..]);
-                }
+                let mint_str = mint.to_string();
+                warn!("❌ ALL MEV services rejected bundle | Mint: ...{}", &mint_str[mint_str.len()-8..]);
+                debug!("   Error: {}", e);
                 continue;
             }
         };
@@ -1844,6 +1890,20 @@ async fn main() -> Result<()> {
     let tx_builder = Arc::new(TransactionBuilder::new(&rpc_endpoint));
     let recent_activity = Arc::new(DashMap::new());
 
+    // 🎯 Initialize Multi-MEV Client for parallel broadcasting
+    info!("🌐 Initializing Multi-MEV Client (6 services)...");
+    let multi_mev_client = Arc::new(MultiMEVClient::new(
+        JITO_FRANKFURT_ENDPOINT.to_string(),
+        NEXTBLOCK_ENDPOINT.to_string(),
+        NEXTBLOCK_API_KEY.to_string(),
+        BLOXROUTE_ENDPOINT.to_string(),
+        BLOXROUTE_AUTH.to_string(),
+        BLOOM_ENDPOINT.to_string(),
+        NOZOMI_ENDPOINT.to_string(),
+        ZEROSLOT_ENDPOINT.to_string(),
+    ));
+    info!("✅ Multi-MEV Client ready (Jito + NextBlock + BloXroute + Bloom + Nozomi + 0slot)");
+
     // 🌍 Get current slot from RPC to initialize Leader Oracle
     info!("🔍 Fetching current slot from RPC...");
     let initial_slot = match tx_builder.rpc_client.get_slot() {
@@ -1871,7 +1931,8 @@ async fn main() -> Result<()> {
         wallet_manager.clone(),
         tx_builder.clone(),
         recent_activity.clone(),
-        leader_oracle.clone(), // 🌍 Pass oracle to workers
+        leader_oracle.clone(), // 🌍 Leader Oracle
+        multi_mev_client.clone(), // 🎯 Multi-MEV Client
     ));
 
     let (shreds_tx, shreds_rx) = unbounded::<ShredsData>();
