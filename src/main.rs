@@ -476,12 +476,11 @@ async fn run_jito_buy_only_test(
     // ═══════════════════════════════════════════════════════════
     // 1️⃣ دریافت اطلاعات از victim transaction (از shreds)
     // ═══════════════════════════════════════════════════════════
-    let mint = Pubkey::from_str(&tx_info.mint)
-        .map_err(|e| anyhow::anyhow!("Invalid mint: {}", e))?;
+    // ✅ Use pre-parsed Pubkey directly
+    let mint = tx_info.mint;
 
-    let creator_vault = match &tx_info.creator_vault {
-        Some(cv) => Pubkey::from_str(cv)
-            .map_err(|e| anyhow::anyhow!("Invalid creator vault: {}", e))?,
+    let creator_vault = match tx_info.creator_vault {
+        Some(cv) => cv,
         None => {
             warn!("   ⚠️  No creator vault, skipping test");
             return Ok(());
@@ -489,9 +488,8 @@ async fn run_jito_buy_only_test(
     };
 
     // ✅ استخراج fee_recipient از victim transaction
-    let fee_recipient = match &tx_info.fee_recipient {
-        Some(fr) => Pubkey::from_str(fr)
-            .map_err(|e| anyhow::anyhow!("Invalid fee recipient: {}", e))?,
+    let fee_recipient = match tx_info.fee_recipient {
+        Some(fr) => fr,
         None => {
             warn!("   ⚠️  No fee recipient, skipping test");
             return Ok(());
@@ -499,16 +497,13 @@ async fn run_jito_buy_only_test(
     };
 
     // ✅ استخراج token_program_id از victim transaction (بدون detection!)
-    let token_program_id_str = match &tx_info.token_program_id {
+    let token_program_id = match tx_info.token_program_id {
         Some(tp) => tp,
         None => {
             warn!("   ⚠️  No token program ID, skipping test");
             return Ok(());
         }
     };
-
-    let token_program_id = Pubkey::from_str(token_program_id_str)
-        .map_err(|e| anyhow::anyhow!("Invalid token program: {}", e))?;
     let token_program_type = TokenProgramType::TokenProgram;  // dummy value (not used)
 
     info!("📍 Accounts from Victim:");
@@ -696,23 +691,22 @@ async fn run_jito_two_step_test(
     info!("📦 Victim TX: ...{}", &tx_info.signature[tx_info.signature.len()-8..]);
     info!("🪙 Mint: {}", tx_info.mint);
 
-    // Parse accounts
-    let mint = Pubkey::from_str(&tx_info.mint)?;
-    let creator_vault = match &tx_info.creator_vault {
-        Some(cv) => Pubkey::from_str(cv)?,
+    // ✅ Use pre-parsed Pubkeys directly
+    let mint = tx_info.mint;
+    let creator_vault = match tx_info.creator_vault {
+        Some(cv) => cv,
         None => { warn!("No creator vault"); return Ok(()); }
     };
     // ✅ استخراج fee_recipient از victim transaction
-    let fee_recipient = match &tx_info.fee_recipient {
-        Some(fr) => Pubkey::from_str(fr)?,
+    let fee_recipient = match tx_info.fee_recipient {
+        Some(fr) => fr,
         None => { warn!("No fee recipient"); return Ok(()); }
     };
     // ✅ استخراج token_program_id از victim transaction (بدون detection!)
-    let token_program_id_str = match &tx_info.token_program_id {
+    let token_program_id = match tx_info.token_program_id {
         Some(tp) => tp,
         None => { warn!("No token program"); return Ok(()); }
     };
-    let token_program_id = Pubkey::from_str(token_program_id_str)?;
     let token_program_type = TokenProgramType::TokenProgram;  // dummy value (not used)
 
     info!("🔍 Token Program ID (from victim tx): {}", token_program_id);
@@ -896,25 +890,24 @@ async fn run_jito_bundle_test(
     info!("📦 Victim TX: ...{}", &tx_info.signature[tx_info.signature.len()-8..]);
     info!("🪙 Mint: {}", tx_info.mint);
 
-    // Parse accounts
-    let mint = Pubkey::from_str(&tx_info.mint)?;
-    let creator_vault = match &tx_info.creator_vault {
-        Some(cv) => Pubkey::from_str(cv)?,
+    // ✅ Use pre-parsed Pubkeys directly
+    let mint = tx_info.mint;
+    let creator_vault = match tx_info.creator_vault {
+        Some(cv) => cv,
         None => { warn!("No creator vault"); return Ok(()); }
     };
     // ✅ استخراج fee_recipient از victim transaction
-    let fee_recipient = match &tx_info.fee_recipient {
-        Some(fr) => Pubkey::from_str(fr)?,
+    let fee_recipient = match tx_info.fee_recipient {
+        Some(fr) => fr,
         None => { warn!("No fee recipient"); return Ok(()); }
     };
     // ✅ استخراج token_program_id از victim transaction (بدون detection!)
     // دلیل: token_program_id باید دقیقاً همان چیزی باشد که در تراکنش victim بود
     // این برای هر دو TokenProgram و Token2022Program کار می‌کند
-    let token_program_id_str = match &tx_info.token_program_id {
+    let token_program_id = match tx_info.token_program_id {
         Some(tp) => tp,
         None => { warn!("No token program"); return Ok(()); }
     };
-    let token_program_id = Pubkey::from_str(token_program_id_str)?;
 
     // ⚠️  token_program_type در واقع استفاده نمی‌شود (dummy parameter)
     // فقط token_program_id (Pubkey) مهم است که از victim transaction استخراج شده
