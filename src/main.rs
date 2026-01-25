@@ -146,7 +146,7 @@ struct ShredsData {
 #[derive(Debug, Clone)]
 struct TransactionInfo {
     buyer: String,
-    mint: String,
+    mint: Pubkey,  // ✅ Pre-parsed (no conversion needed in hot path)
     bonding_curve: String,
     max_sol: u64,
     token_amount: u64,
@@ -154,10 +154,10 @@ struct TransactionInfo {
     signature: String,
     timestamp: Instant,
     slot: u64,
-    creator_vault: Option<String>,
-    fee_recipient: Option<String>,
+    creator_vault: Option<Pubkey>,  // ✅ Pre-parsed
+    fee_recipient: Option<Pubkey>,  // ✅ Pre-parsed
     bonding_curve_token_account: Option<String>,
-    token_program_id: Option<String>,
+    token_program_id: Option<Pubkey>,  // ✅ Pre-parsed
     // ✅ استخراج blockhash از victim transaction (صفر latency!)
     blockhash: solana_sdk::hash::Hash,
     // ✅ ذخیره کل تراکنش برای شبیه‌سازی victim
@@ -1184,16 +1184,19 @@ async fn unified_worker_thread(
         stats.total_tx_processed.fetch_add(1, Ordering::Relaxed);
 
         // ═══════════════════════════════════════════════════════════
-        // 🌍 LEADER ORACLE CHECK (HIGHEST PRIORITY)
+        // 🌍 PREDICTIVE LEADER ORACLE CHECK (HIGHEST PRIORITY)
         // ═══════════════════════════════════════════════════════════
-        if !leader_oracle.can_trade(tx_info.slot).await {
+        // ✅ چک کردن لیدر بلاک‌های آینده (نه بلاک فعلی)
+        // چون bundle ما در slot+1 یا slot+2 land می‌شود
+        if !leader_oracle.can_trade_next(tx_info.slot).await {
             stats.skipped_leader_outside_europe.fetch_add(1, Ordering::Relaxed);
-            debug!("⛔ Slot {}: Leader outside Europe - SKIPPING", tx_info.slot);
+            // ⏸️ Debug disabled to reduce spam:
+            // debug!("⛔ Slot {}: Next leaders outside Europe - SKIPPING", tx_info.slot);
             continue;
         }
 
-        // ✅ Derive bonding_curve از mint (نه کپی از victim!)
-        let bonding_curve = derive_bonding_curve(&Pubkey::from_str(&tx_info.mint).unwrap());
+        // ✅ Derive bonding_curve از mint (نه کپی از victim!) - using pre-parsed Pubkey
+        let bonding_curve = derive_bonding_curve(&tx_info.mint);
         let bonding_curve_str = bonding_curve.to_string();
 
         // Pool check
@@ -1221,7 +1224,8 @@ async fn unified_worker_thread(
         }
 
         // Same block check
-        if has_same_block_buy_sell(&tx_info.buyer, &tx_info.mint, tx_info.slot, &recent_activity) {
+        let mint_str = tx_info.mint.to_string();
+        if has_same_block_buy_sell(&tx_info.buyer, &mint_str, tx_info.slot, &recent_activity) {
             stats.skipped_same_block.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -1244,19 +1248,14 @@ async fn unified_worker_thread(
 
         stats.profitable_count.fetch_add(1, Ordering::Relaxed);
 
-        // Prepare Data
-        let mint = match Pubkey::from_str(&tx_info.mint) {
-            Ok(m) => m,
-            Err(_) => {
-                error!("   ❌ [Bundle] Mint parse failed");
-                continue;
-            }
-        };
+        // ✅ Use pre-parsed Pubkeys (zero latency!)
+        let mint = tx_info.mint;  // Already parsed
 
         // 🚀 استفاده از blockhash از victim transaction (صفر latency - بدون RPC call!)
         let blockhash = tx_info.blockhash;
 
-        let creator_vault_str = match &tx_info.creator_vault {
+        // ✅ Use pre-parsed creator_vault
+        let creator_vault = match tx_info.creator_vault {
             Some(cv) => cv,
             None => {
                 error!("   ❌ [Bundle] No creator vault");
@@ -1264,43 +1263,21 @@ async fn unified_worker_thread(
                 continue;
             }
         };
-        let creator_vault = match Pubkey::from_str(creator_vault_str) {
-            Ok(cv) => cv,
-            Err(_) => {
-                error!("   ❌ [Bundle] Creator vault parse failed");
-                continue;
-            }
-        };
 
-        // ✅ استخراج fee_recipient از victim transaction
-        let fee_recipient_str = match &tx_info.fee_recipient {
+        // ✅ Use pre-parsed fee_recipient
+        let fee_recipient = match tx_info.fee_recipient {
             Some(fr) => fr,
             None => {
                 error!("   ❌ [Bundle] No fee recipient");
                 continue;
             }
         };
-        let fee_recipient = match Pubkey::from_str(fee_recipient_str) {
-            Ok(fr) => fr,
-            Err(_) => {
-                error!("   ❌ [Bundle] Fee recipient parse failed");
-                continue;
-            }
-        };
 
-        // ✅ استخراج token_program_id از victim transaction (بدون detection!)
-        let token_program_id_str = match &tx_info.token_program_id {
+        // ✅ Use pre-parsed token_program_id
+        let token_program_id_pubkey = match tx_info.token_program_id {
             Some(tp) => tp,
             None => {
                 error!("   ❌ [Bundle] No token program ID");
-                continue;
-            }
-        };
-
-        let token_program_id_pubkey = match Pubkey::from_str(token_program_id_str) {
-            Ok(pk) => pk,
-            Err(_) => {
-                error!("   ❌ [Bundle] Token program ID parse failed");
                 continue;
             }
         };
@@ -1326,29 +1303,6 @@ async fn unified_worker_thread(
 
         let optimal_jito_endpoint = leader_oracle.get_optimal_jito_endpoint(tx_info.slot).await;
 
-        // Build BUY transaction
-        let front_tx = match tx_builder.build_front_run_transaction(
-            &wallet_manager.front_runner,
-            &mint,
-            &creator_vault,
-            buy_token_amount,      // ✅ تعداد توکن محاسبه شده
-            max_sol_amount,         // ✅ max: 0.0002 SOL
-            50_000,                 // priority fee
-            blockhash,
-            token_program_type,
-            &token_program_id_pubkey,
-            &fee_recipient,
-        ).await {
-            Ok(tx) => tx,
-            Err(e) => {
-                error!("   ❌ Front-Run Build Failed: {}", e);
-                continue;
-            }
-        };
-
-        // ✅ استخراج signature قبل از move کردن front_tx
-        let my_signature = bs58::encode(&front_tx.signatures[0]).into_string();
-
         // ═══════════════════════════════════════════════════════════
         // 🚀 REAL JITO BUNDLE SENDING (ارسال واقعی به Block Engine)
         // ═══════════════════════════════════════════════════════════
@@ -1362,27 +1316,55 @@ async fn unified_worker_thread(
             }
         };
 
-        // Build SELL transaction with Jito tip
-        let back_tx = match tx_builder.build_back_run_transaction(
-            &wallet_manager.front_runner,
-            &mint,
-            &creator_vault,
-            sell_token_amount,      // ✅ فروش 100% توکن‌ها
-            0,                       // min_sol_output
-            50_000,                  // priority fee
-            JITO_TIP_LAMPORTS,       // ✅ 0.001 SOL tip
-            &jito_tip_account,
-            blockhash,
-            token_program_type,
-            &token_program_id_pubkey,
-            &fee_recipient,
-        ).await {
+        // ⚡ Build BUY and SELL transactions IN PARALLEL (save ~5-10ms!)
+        let (front_result, back_result) = tokio::join!(
+            tx_builder.build_front_run_transaction(
+                &wallet_manager.front_runner,
+                &mint,
+                &creator_vault,
+                buy_token_amount,      // ✅ تعداد توکن محاسبه شده
+                max_sol_amount,         // ✅ max: 0.0002 SOL
+                50_000,                 // priority fee
+                blockhash,
+                token_program_type,
+                &token_program_id_pubkey,
+                &fee_recipient,
+            ),
+            tx_builder.build_back_run_transaction(
+                &wallet_manager.front_runner,
+                &mint,
+                &creator_vault,
+                sell_token_amount,      // ✅ فروش 100% توکن‌ها
+                0,                       // min_sol_output
+                50_000,                  // priority fee
+                JITO_TIP_LAMPORTS,       // ✅ 0.001 SOL tip
+                &jito_tip_account,
+                blockhash,
+                token_program_type,
+                &token_program_id_pubkey,
+                &fee_recipient,
+            )
+        );
+
+        // Check results
+        let front_tx = match front_result {
+            Ok(tx) => tx,
+            Err(e) => {
+                error!("   ❌ Front-Run Build Failed: {}", e);
+                continue;
+            }
+        };
+
+        let back_tx = match back_result {
             Ok(tx) => tx,
             Err(e) => {
                 error!("   ❌ Back-run build failed: {}", e);
                 continue;
             }
         };
+
+        // ✅ استخراج signature بعد از ساخت هر دو تراکنش
+        let my_signature = bs58::encode(&front_tx.signatures[0]).into_string();
 
         // ✅ Create 3-tx bundle [front-run, victim, back-run+tip]
         let bundle = vec![
@@ -1409,7 +1391,8 @@ async fn unified_worker_thread(
 
                 // لاگ فقط برای خطاهای غیرمعمول (نه 400)
                 if !e.to_string().contains("400") {
-                    warn!("Bundle rejected: {} | Mint: ...{}", e, &tx_info.mint[tx_info.mint.len()-8..]);
+                    let mint_str = mint.to_string();
+                    warn!("Bundle rejected: {} | Mint: ...{}", e, &mint_str[mint_str.len()-8..]);
                 }
                 continue;
             }
@@ -1421,10 +1404,11 @@ async fn unified_worker_thread(
         match jito_client.check_target_transaction_status(&my_signature).await {
             Ok(TargetTxStatus::AlreadyConfirmed) | Ok(TargetTxStatus::Processed) => {
                 // 🎯 SUCCESS - Bundle landed!
+                let mint_str = mint.to_string();
                 info!("✅ LANDED | UUID: {} | Profit: {:.6} SOL | Mint: ...{}",
                     bundle_uuid,
                     simulation.net_profit as f64 / LAMPORTS_PER_SOL as f64,
-                    &tx_info.mint[tx_info.mint.len()-8..]
+                    &mint_str[mint_str.len()-8..]
                 );
                 stats.bundles_landed.fetch_add(1, Ordering::Relaxed);
                 stats.total_profit_lamports.fetch_add(simulation.net_profit as u64, Ordering::Relaxed);
@@ -1521,22 +1505,22 @@ fn extract_transaction_info(tx: VersionedTransaction, pump_fun_program_id: &Pubk
                     if args.max_sol >= MIN_SOL_COST && args.max_sol <= MAX_SOL_COST {
                         let buyer_pubkey = account_keys.get(0);
                         let mint_pubkey = instruction.accounts.get(2).and_then(|&idx| account_keys.get(idx as usize));
-                        let fee_recipient = instruction.accounts.get(1).and_then(|&idx| account_keys.get(idx as usize)).map(|pk| pk.to_string());
+                        let fee_recipient = instruction.accounts.get(1).and_then(|&idx| account_keys.get(idx as usize)).copied();  // ✅ Keep as Pubkey
                         let bonding_curve = instruction.accounts.get(3).and_then(|&idx| account_keys.get(idx as usize)).map(|pk| pk.to_string());
                         let bonding_curve_token_account = instruction.accounts.get(4).and_then(|&idx| account_keys.get(idx as usize)).map(|pk| pk.to_string());
-                        let creator_vault = instruction.accounts.get(9).and_then(|&idx| account_keys.get(idx as usize)).map(|pk| pk.to_string());
+                        let creator_vault = instruction.accounts.get(9).and_then(|&idx| account_keys.get(idx as usize)).copied();  // ✅ Keep as Pubkey
                         let priority_fee = get_priority_fee(&tx);
 
                         // 🔍 SMART TOKEN PROGRAM DETECTION
                         // Try multiple account indices and search through all accounts
-                        let mut token_program_id: Option<String> = None;
+                        let mut token_program_id: Option<Pubkey> = None;  // ✅ Keep as Pubkey
 
                         // Strategy 1: Check common indices (7, 8, 10)
                         for idx in [7, 8, 10].iter() {
                             if let Some(account_idx) = instruction.accounts.get(*idx) {
                                 if let Some(pubkey) = account_keys.get(*account_idx as usize) {
                                     if pubkey == &token_program || pubkey == &token_2022_program {
-                                        token_program_id = Some(pubkey.to_string());
+                                        token_program_id = Some(*pubkey);  // ✅ Store Pubkey directly
                                         break;
                                     }
                                 }
@@ -1548,7 +1532,7 @@ fn extract_transaction_info(tx: VersionedTransaction, pump_fun_program_id: &Pubk
                             for account_idx in &instruction.accounts {
                                 if let Some(pubkey) = account_keys.get(*account_idx as usize) {
                                     if pubkey == &token_program || pubkey == &token_2022_program {
-                                        token_program_id = Some(pubkey.to_string());
+                                        token_program_id = Some(*pubkey);  // ✅ Store Pubkey directly
                                         break;
                                     }
                                 }
@@ -1557,7 +1541,7 @@ fn extract_transaction_info(tx: VersionedTransaction, pump_fun_program_id: &Pubk
 
                         // Strategy 3: Default to standard Token Program
                         if token_program_id.is_none() {
-                            token_program_id = Some(token_program.to_string());
+                            token_program_id = Some(token_program);  // ✅ Store Pubkey directly
                         }
 
                         if let (Some(buyer), Some(mint), Some(bonding_curve)) = (buyer_pubkey, mint_pubkey, &bonding_curve) {
@@ -1565,10 +1549,16 @@ fn extract_transaction_info(tx: VersionedTransaction, pump_fun_program_id: &Pubk
                             let blockhash = *tx.message.recent_blockhash();
 
                             return Some(TransactionInfo {
-                                buyer: buyer.to_string(), mint: mint.to_string(), bonding_curve: bonding_curve.clone(),
+                                buyer: buyer.to_string(),
+                                mint: *mint,  // ✅ Store Pubkey directly (no to_string())
+                                bonding_curve: bonding_curve.clone(),
                                 max_sol: args.max_sol, token_amount: args.token_amount, priority_fee,
                                 signature: bs58::encode(&tx.signatures[0]).into_string(), timestamp: Instant::now(),
-                                slot: current_slot, creator_vault, fee_recipient, bonding_curve_token_account, token_program_id,
+                                slot: current_slot,
+                                creator_vault,  // ✅ Already Pubkey
+                                fee_recipient,  // ✅ Already Pubkey
+                                bonding_curve_token_account,
+                                token_program_id,  // ✅ Already Pubkey
                                 blockhash,  // ✅ استفاده از blockhash victim
                                 full_transaction: tx,  // ✅ ذخیره کل تراکنش
                             });

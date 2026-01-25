@@ -290,6 +290,7 @@ impl LeaderOracle {
         Ok(added_count)
     }
 
+    /// ⚠️ DEPRECATED: Use can_trade_next() instead
     /// بررسی اینکه آیا می‌توانیم در این slot معامله کنیم یا نه
     ///
     /// این متد اصلی‌ترین تابع برای ربات شماست.
@@ -353,6 +354,70 @@ impl LeaderOracle {
 
         // اگر اطلاعات در کش نیست، سیاست محافظه‌کارانه: عدم معامله
         debug!("⚠️  Slot {}: NO DATA IN CACHE - Trade blocked (safety)", current_slot);
+        false
+    }
+
+    /// ✅ PREDICTIVE LEADER CHECKING - بررسی لیدر بلاک‌های آینده (استراتژی صحیح)
+    ///
+    /// این متد بلاک‌های آینده را چک می‌کند (نه بلاک فعلی).
+    /// چون bundle ما در بلاک‌های بعدی land می‌شود، نه بلاک فعلی.
+    ///
+    /// استراتژی:
+    /// - وقتی تراکنش victim در slot N می‌رسد
+    /// - ما bundle می‌سازیم و ارسال می‌کنیم
+    /// - Bundle در slot N+1 یا N+2 land می‌شود
+    /// - پس باید لیدر slot N+1 و N+2 را چک کنیم
+    ///
+    /// # Arguments
+    /// * `current_slot` - اسلات فعلی (که transaction در آن رسیده)
+    ///
+    /// # Returns
+    /// * `true` - حداقل یکی از بلاک‌های آینده لیدر اروپایی دارد → می‌توان trade کرد
+    /// * `false` - هیچ بلاک آینده‌ای لیدر اروپایی ندارد → نباید trade کرد
+    pub async fn can_trade_next(&self, current_slot: u64) -> bool {
+        let cache = self.cache.read().await;
+
+        // بررسی 3 slot آینده (N+1, N+2, N+3)
+        // چون bundle معمولاً در یکی از این slot‌ها land می‌شود
+        for offset in 1..=3 {
+            let future_slot = current_slot + offset;
+
+            if let Some(info) = cache.get(&future_slot) {
+                // همان منطق فیلتر جغرافیایی که در can_trade هست
+
+                // 1️⃣ بررسی PING
+                if let Some(ping) = info.ping {
+                    if ping <= self.config.max_latency_ms as f64 {
+                        debug!("✅ Slot {} (+{}): NEXT LEADER OK - Low Ping: {:.2} ms",
+                            future_slot, offset, ping);
+                        return true;
+                    }
+                }
+
+                // 2️⃣ بررسی کد کشور
+                if let Some(ref country) = info.country {
+                    if self.config.allowed_countries.contains(country) {
+                        debug!("✅ Slot {} (+{}): NEXT LEADER OK - Country: {}",
+                            future_slot, offset, country);
+                        return true;
+                    }
+                }
+
+                // 3️⃣ بررسی منطقه (Region)
+                if let Some(ref region) = info.region {
+                    for allowed in &self.config.allowed_regions {
+                        if region.to_lowercase().contains(&allowed.to_lowercase()) {
+                            debug!("✅ Slot {} (+{}): NEXT LEADER OK - Region: {}",
+                                future_slot, offset, region);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ❌ هیچ کدام از 3 slot آینده لیدر اروپایی ندارند
+        debug!("⛔ Slot {}: NO EUROPEAN LEADER in next 3 slots - SKIPPING", current_slot);
         false
     }
 
