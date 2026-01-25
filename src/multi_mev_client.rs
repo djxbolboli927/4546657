@@ -123,7 +123,7 @@ impl MultiMEVClient {
         }
     }
 
-    /// ارسال bundle به یک سرویس خاص
+    /// ارسال bundle به یک سرویس خاص (با retry برای rate limiting)
     async fn submit_to_service(
         &self,
         service: MEVService,
@@ -163,52 +163,80 @@ impl MultiMEVClient {
             params: vec![serde_json::json!(encoded_txs)],
         };
 
-        // ساخت HTTP request
-        let mut req = self.http_client.post(&endpoint).json(&request);
+        // Retry logic برای rate limiting (فقط برای Jito)
+        let max_retries = if matches!(service, MEVService::Jito) { 2 } else { 0 };
 
-        // اضافه کردن headers بر اساس سرویس
-        if let Some(auth) = auth_header {
-            req = req.header("Authorization", auth);
+        for attempt in 0..=max_retries {
+            // ساخت HTTP request
+            let mut req = self.http_client.post(&endpoint).json(&request);
+
+            // اضافه کردن headers بر اساس سرویس
+            if let Some(ref auth) = auth_header {
+                req = req.header("Authorization", auth.clone());
+            }
+            if let Some(ref key) = api_key {
+                req = req.header("X-API-KEY", key.clone());
+            }
+
+            // ارسال
+            let response = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    if attempt == max_retries {
+                        return Err(anyhow!("{} connection failed: {}", service.name(), e));
+                    }
+                    tokio::time::sleep(Duration::from_millis(100 * (attempt + 1))).await;
+                    continue;
+                }
+            };
+
+            // بررسی HTTP status
+            if !response.status().is_success() {
+                let status = response.status();
+                let error_text = response.text().await.unwrap_or_default();
+
+                // اگر rate limited شدیم و هنوز retry داریم، منتظر بمانیم
+                if status.as_u16() == 429 && attempt < max_retries {
+                    debug!("{} rate limited, retrying in {}ms...", service.name(), 200 * (attempt + 1));
+                    tokio::time::sleep(Duration::from_millis(200 * (attempt + 1))).await;
+                    continue;
+                }
+
+                return Err(anyhow!(
+                    "{} HTTP error {}: {}",
+                    service.name(),
+                    status,
+                    error_text
+                ));
+            }
+
+            // پارس response
+            let response_text = response.text().await?;
+            let parsed: SendBundleResponse = serde_json::from_str(&response_text)
+                .map_err(|e| anyhow!("{} JSON parse error: {}", service.name(), e))?;
+
+            // بررسی خطا در response
+            if let Some(error) = parsed.error {
+                // اگر rate limited شدیم و هنوز retry داریم
+                if error.to_string().contains("rate limit") && attempt < max_retries {
+                    debug!("{} rate limited (API error), retrying...", service.name());
+                    tokio::time::sleep(Duration::from_millis(200 * (attempt + 1))).await;
+                    continue;
+                }
+                return Err(anyhow!("{} API error: {:?}", service.name(), error));
+            }
+
+            // استخراج bundle UUID
+            let bundle_uuid = parsed
+                .result
+                .ok_or_else(|| anyhow!("{} empty result", service.name()))?;
+
+            debug!("✅ {} accepted bundle: {}", service.name(), bundle_uuid);
+            return Ok(bundle_uuid);
         }
-        if let Some(key) = api_key {
-            req = req.header("X-API-KEY", key);
-        }
 
-        // ارسال
-        let response = req
-            .send()
-            .await
-            .map_err(|e| anyhow!("{} connection failed: {}", service.name(), e))?;
-
-        // بررسی HTTP status
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "{} HTTP error {}: {}",
-                service.name(),
-                status,
-                error_text
-            ));
-        }
-
-        // پارس response
-        let response_text = response.text().await?;
-        let parsed: SendBundleResponse = serde_json::from_str(&response_text)
-            .map_err(|e| anyhow!("{} JSON parse error: {}", service.name(), e))?;
-
-        // بررسی خطا در response
-        if let Some(error) = parsed.error {
-            return Err(anyhow!("{} API error: {:?}", service.name(), error));
-        }
-
-        // استخراج bundle UUID
-        let bundle_uuid = parsed
-            .result
-            .ok_or_else(|| anyhow!("{} empty result", service.name()))?;
-
-        debug!("✅ {} accepted bundle: {}", service.name(), bundle_uuid);
-        Ok(bundle_uuid)
+        // اگر تمام retry ها شکست خوردند
+        Err(anyhow!("{} failed after {} retries", service.name(), max_retries))
     }
 
     /// 🎯 SHOTGUN BROADCASTING - ارسال موازی به همه سرویس‌ها
@@ -223,30 +251,37 @@ impl MultiMEVClient {
         &self,
         bundle: Vec<VersionedTransaction>,
     ) -> Result<(String, String)> {
-        info!("🚀 Shotgun Broadcasting: Sending bundle to 6 MEV services...");
+        info!("🚀 Shotgun Broadcasting: Sending bundle to MEV services...");
 
         // ارسال موازی به همه سرویس‌ها
         let bundle_arc = Arc::new(bundle);
 
-        let (r1, r2, r3, r4, r5, r6) = tokio::join!(
+        // ⚠️ TEMPORARY: فقط Jito فعال است تا endpoint های دیگر را debug کنیم
+        let (r1,) = tokio::join!(
             self.submit_to_service(MEVService::Jito, &bundle_arc),
-            self.submit_to_service(MEVService::NextBlock, &bundle_arc),
-            self.submit_to_service(MEVService::BloXroute, &bundle_arc),
-            self.submit_to_service(MEVService::Bloom, &bundle_arc),
-            self.submit_to_service(MEVService::Nozomi, &bundle_arc),
-            self.submit_to_service(MEVService::ZeroSlot, &bundle_arc),
+            // ❌ Disabled temporarily - needs endpoint fix:
+            // self.submit_to_service(MEVService::NextBlock, &bundle_arc),
+            // ❌ Disabled temporarily - needs custom format:
+            // self.submit_to_service(MEVService::BloXroute, &bundle_arc),
+            // ❌ Disabled temporarily - DNS error:
+            // self.submit_to_service(MEVService::Bloom, &bundle_arc),
+            // ❌ Disabled temporarily - needs auth:
+            // self.submit_to_service(MEVService::Nozomi, &bundle_arc),
+            // ❌ Disabled temporarily - DNS error:
+            // self.submit_to_service(MEVService::ZeroSlot, &bundle_arc),
         );
 
         // بررسی نتایج - اولین موفقیت را برمی‌گردانیم
         let results = vec![
             ("Jito", r1),
-            ("NextBlock", r2),
-            ("BloXroute", r3),
-            ("Bloom", r4),
-            ("Nozomi", r5),
-            ("0slot", r6),
+            // ("NextBlock", r2),
+            // ("BloXroute", r3),
+            // ("Bloom", r4),
+            // ("Nozomi", r5),
+            // ("0slot", r6),
         ];
 
+        let total_services = results.len();
         let mut success_count = 0;
         let mut first_success: Option<(String, String)> = None;
         let mut errors = Vec::new();
@@ -268,8 +303,8 @@ impl MultiMEVClient {
         }
 
         info!(
-            "📊 Broadcasting result: {}/6 services accepted bundle",
-            success_count
+            "📊 Broadcasting result: {}/{} services accepted bundle",
+            success_count, total_services
         );
 
         // اگر حداقل یک سرویس موفق شد
@@ -279,7 +314,7 @@ impl MultiMEVClient {
         }
 
         // اگر همه شکست خوردند
-        error!("❌ ALL 6 services rejected bundle!");
+        error!("❌ ALL {} services rejected bundle!", total_services);
         for err in &errors {
             error!("   • {}", err);
         }

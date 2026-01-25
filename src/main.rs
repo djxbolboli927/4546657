@@ -83,7 +83,7 @@ const SANDWICH_MIN_PROFIT_LAMPORTS: u64 = LAMPORTS_PER_SOL / 500;
 const SANDWICH_SAFETY_MARGIN: f64 = 0.90;
 
 // ✅ تنظیمات جدید برای production
-const JITO_TIP_LAMPORTS: u64 = 1_000_000;  // 0.001 SOL
+const JITO_TIP_LAMPORTS: u64 = 50_000_000;  // 0.05 SOL (افزایش یافته برای رقابت بهتر)
 const BUY_AMOUNT_LAMPORTS: u64 = 100_000;   // 0.0001 SOL (ثابت)
 
 // ═══════════════════════════════════════════════════════════════
