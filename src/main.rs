@@ -196,9 +196,14 @@ struct GlobalStats {
     skipped_target_confirmed: AtomicUsize,
     skipped_simulation_failed: AtomicUsize,
     // ⏱️ Timing Filter
-    skipped_late_tx: AtomicUsize, // تراکنش‌های بیش از 150ms قدیمی
+    skipped_late_tx: AtomicUsize,
     // 🌍 Leader Oracle Stats
     skipped_leader_outside_europe: AtomicUsize,
+    // 📊 Failed Bundle Analysis
+    bundle_accepted_not_landed: AtomicUsize,   // Bundle قبول شد ولی land نشد
+    bundle_status_not_found: AtomicUsize,      // Status: not found
+    bundle_status_unknown: AtomicUsize,        // Status: unknown
+    bundle_rejected_jito: AtomicUsize,         // Jito رد کرد (مثل خطای 400)
 }
 
 impl GlobalStats {
@@ -222,6 +227,10 @@ impl GlobalStats {
             skipped_simulation_failed: AtomicUsize::new(0),
             skipped_late_tx: AtomicUsize::new(0),
             skipped_leader_outside_europe: AtomicUsize::new(0),
+            bundle_accepted_not_landed: AtomicUsize::new(0),
+            bundle_status_not_found: AtomicUsize::new(0),
+            bundle_status_unknown: AtomicUsize::new(0),
+            bundle_rejected_jito: AtomicUsize::new(0),
         }
     }
 }
@@ -1388,13 +1397,20 @@ async fn unified_worker_thread(
         // if ENABLE_RPC_SIMULATION { ... }
 
         // Send bundle to Jito Block Engine
-        match jito_client.send_bundle_real(bundle, &optimal_jito_endpoint).await {
+        let bundle_uuid = match jito_client.send_bundle_real(bundle, &optimal_jito_endpoint).await {
             Ok(uuid) => {
-                info!("✅ Bundle sent | UUID: {} | Tip: {} SOL", uuid, JITO_TIP_LAMPORTS as f64 / LAMPORTS_PER_SOL as f64);
+                // ⏸️ Debug: info!("✅ Bundle sent | UUID: {}", uuid);
+                uuid
             }
             Err(e) => {
-                debug!("❌ Bundle rejected: {}", e);
+                // 📊 Failed Bundle Analysis: Jito رد کرد
+                stats.bundle_rejected_jito.fetch_add(1, Ordering::Relaxed);
                 stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+
+                // لاگ فقط برای خطاهای غیرمعمول (نه 400)
+                if !e.to_string().contains("400") {
+                    warn!("Bundle rejected: {} | Mint: ...{}", e, &tx_info.mint[tx_info.mint.len()-8..]);
+                }
                 continue;
             }
         };
@@ -1404,11 +1420,35 @@ async fn unified_worker_thread(
 
         match jito_client.check_target_transaction_status(&my_signature).await {
             Ok(TargetTxStatus::AlreadyConfirmed) | Ok(TargetTxStatus::Processed) => {
-                info!("🎯 LANDED | Profit: {:.6} SOL", simulation.net_profit as f64 / LAMPORTS_PER_SOL as f64);
+                // 🎯 SUCCESS - Bundle landed!
+                info!("✅ LANDED | UUID: {} | Profit: {:.6} SOL | Mint: ...{}",
+                    bundle_uuid,
+                    simulation.net_profit as f64 / LAMPORTS_PER_SOL as f64,
+                    &tx_info.mint[tx_info.mint.len()-8..]
+                );
                 stats.bundles_landed.fetch_add(1, Ordering::Relaxed);
                 stats.total_profit_lamports.fetch_add(simulation.net_profit as u64, Ordering::Relaxed);
             }
-            _ => {}
+            Ok(TargetTxStatus::NotFound) => {
+                // 📊 Failed Bundle Analysis: Bundle قبول شد ولی land نشد
+                stats.bundle_accepted_not_landed.fetch_add(1, Ordering::Relaxed);
+                stats.bundle_status_not_found.fetch_add(1, Ordering::Relaxed);
+
+                // ⏸️ Debug: warn!("Bundle accepted but NOT FOUND | UUID: {}", bundle_uuid);
+            }
+            Ok(TargetTxStatus::Unknown) => {
+                // 📊 Failed Bundle Analysis: وضعیت نامشخص
+                stats.bundle_accepted_not_landed.fetch_add(1, Ordering::Relaxed);
+                stats.bundle_status_unknown.fetch_add(1, Ordering::Relaxed);
+
+                // ⏸️ Debug: warn!("Bundle status UNKNOWN | UUID: {}", bundle_uuid);
+            }
+            Err(e) => {
+                // 📊 Failed Bundle Analysis: خطا در check status
+                stats.bundle_accepted_not_landed.fetch_add(1, Ordering::Relaxed);
+
+                // ⏸️ Debug: warn!("Status check error: {}", e);
+            }
         }
     }
 
@@ -1992,6 +2032,34 @@ async fn print_detailed_report(stats: &Arc<GlobalStats>, oracle: &Arc<LeaderOrac
     info!("║     • Bundles Sent:          {:>10}                                       ║", bundles_sent);
     info!("║     • Bundles Landed:        {:>10} ({:>5.1}%)                           ║", bundles_landed, bundle_success_rate);
     info!("║     • Bundles Failed:        {:>10}                                       ║", bundles_failed);
+    info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
+
+    // 📊 Failed Bundle Analysis
+    let accepted_not_landed = stats.bundle_accepted_not_landed.load(Ordering::Relaxed);
+    let status_not_found = stats.bundle_status_not_found.load(Ordering::Relaxed);
+    let status_unknown = stats.bundle_status_unknown.load(Ordering::Relaxed);
+    let rejected_jito = stats.bundle_rejected_jito.load(Ordering::Relaxed);
+
+    let acceptance_rate = if bundles_sent > 0 {
+        ((bundles_sent - bundles_failed) as f64 / bundles_sent as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let landing_rate = if bundles_sent - bundles_failed > 0 {
+        (bundles_landed as f64 / (bundles_sent - bundles_failed) as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    info!("║  📊 FAILED BUNDLE ANALYSIS                                                    ║");
+    info!("║     • Accepted by Jito:      {:>10} ({:>5.1}% of sent)                   ║", bundles_sent - bundles_failed, acceptance_rate);
+    info!("║     • Landed on Chain:       {:>10} ({:>5.1}% of accepted)               ║", bundles_landed, landing_rate);
+    info!("║     • Accepted NOT Landed:   {:>10}                                       ║", accepted_not_landed);
+    info!("║       ├─ Status Not Found:   {:>10}                                       ║", status_not_found);
+    info!("║       ├─ Status Unknown:     {:>10}                                       ║", status_unknown);
+    info!("║       └─ Other:              {:>10}                                       ║", accepted_not_landed - status_not_found - status_unknown);
+    info!("║     • Rejected by Jito:      {:>10}                                       ║", rejected_jito);
     info!("╠═══════════════════════════════════════════════════════════════════════════════╣");
 
     // Skip Reasons
