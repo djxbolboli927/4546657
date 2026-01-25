@@ -77,8 +77,11 @@ const FEE_DENOMINATOR: u64 = 10000;
 
 const SANDWICH_MIN_PROFIT_LAMPORTS: u64 = LAMPORTS_PER_SOL / 500;
 const SANDWICH_SAFETY_MARGIN: f64 = 0.90;
-// ✅ Jito tip: 0.005 SOL (5,000,000 lamports)
-const JITO_TIP_LAMPORTS: u64 = LAMPORTS_PER_SOL / 200;
+
+// ✅ تنظیمات جدید برای production
+const JITO_TIP_LAMPORTS: u64 = 1_000_000;  // 0.001 SOL
+const BUY_AMOUNT_LAMPORTS: u64 = 100_000;   // 0.0001 SOL (ثابت)
+
 const JITO_TIP_ACCOUNTS: [&str; 8] = [
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
     "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
@@ -1166,15 +1169,7 @@ async fn unified_worker_thread(
     recent_activity: RecentActivity,
     leader_oracle: Arc<LeaderOracle>,
 ) {
-    info!("Worker {} started 🚀 (Bundle Test Mode)", worker_id);
-    info!("⚠️  Worker {} will test buy+sell bundle every 30 seconds", worker_id);
-
-    let mut last_test_time = Instant::now();
-    let test_interval = Duration::from_secs(30);
-
-    /* ═══════════════════════════════════════════════════════════
-       🔒 TEMPORARILY DISABLED: Full MEV sandwich logic
-       ═══════════════════════════════════════════════════════════
+    info!("Worker {} started 🚀", worker_id);
 
     for tx_info in rx.iter() {
         stats.total_tx_processed.fetch_add(1, Ordering::Relaxed);
@@ -1223,9 +1218,8 @@ async fn unified_worker_thread(
         }
 
         // ═══════════════════════════════════════════════════════════
-        // 🧮 LOCAL PROFITABILITY SIMULATION (فقط محاسبه محلی)
+        // 🧮 LOCAL PROFITABILITY SIMULATION
         // ═══════════════════════════════════════════════════════════
-        // Local Simulation
         let simulation = simulate_sandwich_attack(&tx_info, &pool_state);
 
         if simulation.front_run_sol == 0 || simulation.front_run_tokens == 0 {
@@ -1233,15 +1227,13 @@ async fn unified_worker_thread(
             continue;
         }
 
-        let is_profit = simulation.is_profitable;
-        if is_profit {
-            stats.profitable_count.fetch_add(1, Ordering::Relaxed);
-            print_simulation_result(&simulation, worker_id, true);
-        } else {
+        // ✅ چک سودآوری - فقط profitable ها ارسال می‌شوند
+        if !simulation.is_profitable {
             stats.unprofitable_count.fetch_add(1, Ordering::Relaxed);
-            // ⏭️ فقط profitable ها را می‌فرستیم
             continue;
         }
+
+        stats.profitable_count.fetch_add(1, Ordering::Relaxed);
 
         // Prepare Data
         let mint = match Pubkey::from_str(&tx_info.mint) {
@@ -1305,23 +1297,38 @@ async fn unified_worker_thread(
         };
         let token_program_type = TokenProgramType::TokenProgram;  // dummy value (not used)
 
-        let safe_front_run_sol = (simulation.front_run_sol as f64 * 1.70) as u64;
+        // ✅ مقادیر ثابت برای خرید و فروش
+        let buy_sol_amount = BUY_AMOUNT_LAMPORTS;  // 0.0001 SOL (ثابت)
+        let max_sol_amount = BUY_AMOUNT_LAMPORTS * 2;  // 0.0002 SOL (2x buy برای safety)
 
-        // 🌍 انتخاب Jito endpoint بهینه (Frankfurt = بهترین برای سرور ما)
+        // محاسبه تعداد توکن با 0.0001 SOL
+        let buy_token_amount = calculate_token_out_with_fee(
+            buy_sol_amount,
+            pool_state.virtual_sol_reserves,
+            pool_state.virtual_token_reserves
+        );
+
+        if buy_token_amount == 0 {
+            continue;  // نمی‌توانیم توکن بخریم
+        }
+
+        // فروش همان تعداد توکن (100%)
+        let sell_token_amount = buy_token_amount;
+
         let optimal_jito_endpoint = leader_oracle.get_optimal_jito_endpoint(tx_info.slot).await;
 
-        // Build Transactions
+        // Build BUY transaction
         let front_tx = match tx_builder.build_front_run_transaction(
             &wallet_manager.front_runner,
             &mint,
             &creator_vault,
-            simulation.front_run_tokens,
-            safe_front_run_sol,
-            50_000,
+            buy_token_amount,      // ✅ تعداد توکن محاسبه شده
+            max_sol_amount,         // ✅ max: 0.0002 SOL
+            50_000,                 // priority fee
             blockhash,
             token_program_type,
             &token_program_id_pubkey,
-            &fee_recipient,  // ✅ از victim tx
+            &fee_recipient,
         ).await {
             Ok(tx) => tx,
             Err(e) => {
@@ -1346,20 +1353,20 @@ async fn unified_worker_thread(
             }
         };
 
-        // Build back-run transaction with Jito tip
+        // Build SELL transaction with Jito tip
         let back_tx = match tx_builder.build_back_run_transaction(
             &wallet_manager.front_runner,
             &mint,
             &creator_vault,
-            simulation.front_run_tokens,
-            0, // min_sol_output
-            50_000, // priority fee
-            JITO_TIP_LAMPORTS, // 0.005 SOL tip
+            sell_token_amount,      // ✅ فروش 100% توکن‌ها
+            0,                       // min_sol_output
+            50_000,                  // priority fee
+            JITO_TIP_LAMPORTS,       // ✅ 0.001 SOL tip
             &jito_tip_account,
             blockhash,
             token_program_type,
             &token_program_id_pubkey,
-            &fee_recipient,  // ✅ از victim tx
+            &fee_recipient,
         ).await {
             Ok(tx) => tx,
             Err(e) => {
@@ -1368,99 +1375,40 @@ async fn unified_worker_thread(
             }
         };
 
-        // 🧪 TEST: Create 3-tx bundle [front-run, victim, back-run+tip]
-        // قبلاً این خطای 400 می‌داد، اما حالا با blockhash از victim می‌خواهیم تست کنیم
+        // ✅ Create 3-tx bundle [front-run, victim, back-run+tip]
         let bundle = vec![
             VersionedTransaction::from(front_tx),
             tx_info.full_transaction.clone(),  // ✅ Victim transaction
             VersionedTransaction::from(back_tx),
         ];
 
-        // Send bundle to Jito Block Engine
-        info!("🚀 Sending 3-tx bundle [front+victim+back] to Jito (tip: {} SOL)...", JITO_TIP_LAMPORTS as f64 / LAMPORTS_PER_SOL as f64);
-
-        // Count as attempted (before send to track all tries)
         stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
 
-        match jito_client.send_bundle_real(
-            bundle,
-            &optimal_jito_endpoint,
-        ).await {
+        // ⏸️ غیرفعال: شبیه‌سازی RPC قبل از ارسال (مستقیماً ارسال می‌کنیم)
+        // if ENABLE_RPC_SIMULATION { ... }
+
+        // Send bundle to Jito Block Engine
+        match jito_client.send_bundle_real(bundle, &optimal_jito_endpoint).await {
             Ok(uuid) => {
-                info!("   ✅ Bundle accepted by Jito! UUID: {}", uuid);
+                info!("✅ Bundle sent | UUID: {} | Tip: {} SOL", uuid, JITO_TIP_LAMPORTS as f64 / LAMPORTS_PER_SOL as f64);
             }
             Err(e) => {
-                error!("   ❌ Bundle rejected by Jito: {}", e);
+                debug!("❌ Bundle rejected: {}", e);
                 stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         };
 
-        // ⚡ چک کردن وضعیت از ERPC (بدون 429 error!)
-        // دلیل: ERPC whitelist دارد و rate limit ندارد
-        // ما از signature تراکنش استفاده می‌کنیم بجای Jito UUID
-
-        // صبر کوتاه برای پردازش تراکنش (500ms)
+        // Check status via ERPC (500ms delay)
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-        // چک کردن از ERPC که آیا تراکنش ما در blockchain قرار گرفت
         match jito_client.check_target_transaction_status(&my_signature).await {
             Ok(TargetTxStatus::AlreadyConfirmed) | Ok(TargetTxStatus::Processed) => {
-                info!("   🎯 Transaction LANDED! (verified via ERPC)");
+                info!("🎯 LANDED | Profit: {:.6} SOL", simulation.net_profit as f64 / LAMPORTS_PER_SOL as f64);
                 stats.bundles_landed.fetch_add(1, Ordering::Relaxed);
-                if is_profit {
-                    stats.total_profit_lamports.fetch_add(
-                        simulation.net_profit as u64,
-                        Ordering::Relaxed
-                    );
-                }
+                stats.total_profit_lamports.fetch_add(simulation.net_profit as u64, Ordering::Relaxed);
             }
-            Ok(TargetTxStatus::NotFound) => {
-                // تراکنش هنوز در blockchain نیست - احتمالاً bundle land نشد
-                debug!("   ⏳ Transaction not found yet (may land in next slots)");
-            }
-            Ok(TargetTxStatus::Unknown) => {
-                // وضعیت نامشخص - احتمالاً در حال پردازش است
-                debug!("   ❓ Transaction status unknown");
-            }
-            Err(e) => {
-                debug!("   ⚠️  ERPC check error: {}", e);
-            }
-        }
-    }
-
-    ═══════════════════════════════════════════════════════════
-    END OF DISABLED MEV LOGIC
-    ═══════════════════════════════════════════════════════════ */
-
-    // 🧪 TEST MODE: دریافت transactions و اجرای bundle test هر 30 ثانیه
-    // فقط worker 0 تست می‌کند تا از خریدهای متعدد جلوگیری شود
-    for tx_info in rx.iter() {
-        // چک کردن آیا 30 ثانیه گذشته
-        if worker_id == 0 && last_test_time.elapsed() >= test_interval {
-            info!("⏰ Worker {}: 30 seconds passed, running bundle test...", worker_id);
-
-            // اجرای تست با این transaction
-            if let Err(e) = run_jito_bundle_test(
-                &jito_client,
-                &wallet_manager,
-                &tx_builder,
-                &leader_oracle,
-                &tx_info,
-                &pool_tracker,
-            ).await {
-                error!("🧪 Worker {} test error: {}", worker_id, e);
-            }
-
-            // Reset timer
-            last_test_time = Instant::now();
-            info!("⏰ Worker {}: Next test in 30 seconds...\n", worker_id);
-        } else {
-            // Transaction دریافت شد اما هنوز وقت تست نیست
-            debug!("Worker {}: Received tx ...{} (waiting for test interval)",
-                worker_id,
-                &tx_info.signature[tx_info.signature.len()-8..]
-            );
+            _ => {}
         }
     }
 
