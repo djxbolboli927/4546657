@@ -1225,16 +1225,15 @@ async fn unified_worker_thread(
         stats.total_tx_processed.fetch_add(1, Ordering::Relaxed);
 
         // ═══════════════════════════════════════════════════════════
-        // 🌍 PREDICTIVE LEADER ORACLE CHECK (HIGHEST PRIORITY)
+        // 🌍 LEADER ORACLE - Already Filtered at Data Reception
         // ═══════════════════════════════════════════════════════════
-        // ✅ چک کردن لیدر بلاک‌های آینده (نه بلاک فعلی)
-        // چون bundle ما در slot+1 یا slot+2 land می‌شود
-        if !leader_oracle.can_trade_next(tx_info.slot).await {
-            stats.skipped_leader_outside_europe.fetch_add(1, Ordering::Relaxed);
-            // ⏸️ Debug disabled to reduce spam:
-            // debug!("⛔ Slot {}: Next leaders outside Europe - SKIPPING", tx_info.slot);
-            continue;
-        }
+        // ✅ Leader Oracle قبلاً فیلتر کرده (قبل از دریافت data)
+        // اگر victim transaction به اینجا رسیده = leader فعلی اروپایی است
+        // Bundle ما در همان slot فعلی اجرا می‌شود (نه slot بعدی!)
+        // پس نیازی به چک اضافی نیست
+        //
+        // Note: Leader Oracle در background thread کار می‌کند و
+        // فقط data از block هایی که leader اروپایی دارند را می‌گیرد
 
         // ✅ Derive bonding_curve از mint (نه کپی از victim!) - using pre-parsed Pubkey
         let bonding_curve = derive_bonding_curve(&tx_info.mint);
