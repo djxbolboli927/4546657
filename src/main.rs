@@ -83,7 +83,7 @@ const SANDWICH_MIN_PROFIT_LAMPORTS: u64 = LAMPORTS_PER_SOL / 500;
 const SANDWICH_SAFETY_MARGIN: f64 = 0.90;
 
 // ✅ تنظیمات جدید برای production
-const JITO_TIP_LAMPORTS: u64 = 50_000_000;  // 0.05 SOL
+const JITO_TIP_LAMPORTS: u64 = 100_000;  // 0.0001 SOL
 const BUY_AMOUNT_LAMPORTS: u64 = 100_000;   // 0.0001 SOL
 const MAX_SOL_PAYMENT: u64 = 900_000;       // 0.0009 SOL (slippage بالا)
 
@@ -1402,10 +1402,10 @@ async fn unified_worker_thread(
         // ✅ استخراج signature بعد از ساخت هر دو تراکنش
         let my_signature = bs58::encode(&front_tx.signatures[0]).into_string();
 
-        // ✅ Create 3-tx bundle [front-run, victim, back-run+tip]
+        // ✅ Create 2-tx bundle [front-run, back-run+tip]
+        // ⚠️ حذف تراکنش قربانی - فقط تراکنش‌های خودمان
         let bundle = vec![
             VersionedTransaction::from(front_tx),
-            tx_info.full_transaction.clone(),  // ✅ Victim transaction
             VersionedTransaction::from(back_tx),
         ];
 
