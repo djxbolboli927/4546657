@@ -83,7 +83,7 @@ const SANDWICH_MIN_PROFIT_LAMPORTS: u64 = LAMPORTS_PER_SOL / 500;
 const SANDWICH_SAFETY_MARGIN: f64 = 0.90;
 
 // ✅ تنظیمات جدید برای production
-const JITO_TIP_LAMPORTS: u64 = 100_000;  // 0.0001 SOL
+const JITO_TIP_LAMPORTS: u64 = 9_000_000;  // 0.009 SOL
 const BUY_AMOUNT_LAMPORTS: u64 = 100_000;   // 0.0001 SOL
 const MAX_SOL_PAYMENT: u64 = 900_000;       // 0.0009 SOL (slippage بالا)
 
@@ -1402,10 +1402,10 @@ async fn unified_worker_thread(
         // ✅ استخراج signature بعد از ساخت هر دو تراکنش
         let my_signature = bs58::encode(&front_tx.signatures[0]).into_string();
 
-        // ✅ Create 2-tx bundle [front-run, back-run+tip]
-        // ⚠️ حذف تراکنش قربانی - فقط تراکنش‌های خودمان
+        // ✅ Create 3-tx bundle [front-run, victim, back-run+tip]
         let bundle = vec![
             VersionedTransaction::from(front_tx),
+            tx_info.full_transaction.clone(),  // ✅ Victim transaction
             VersionedTransaction::from(back_tx),
         ];
 
@@ -1416,6 +1416,17 @@ async fn unified_worker_thread(
 
         // 🎯 JITO BUNDLE SUBMISSION - ارسال به جیتو (فایل jito_client.rs قدیمی)
         let optimal_jito_endpoint = leader_oracle.get_optimal_jito_endpoint(tx_info.slot).await;
+
+        // 📊 Debug: Bundle details
+        let mint_str = mint.to_string();
+        info!("📦 Sending bundle | Mint: ...{} | Endpoint: {} | Tip: {} SOL",
+            &mint_str[mint_str.len()-8..],
+            optimal_jito_endpoint,
+            JITO_TIP_LAMPORTS as f64 / LAMPORTS_PER_SOL as f64
+        );
+        debug!("   Bundle size: {} transactions", bundle.len());
+        debug!("   Blockhash: {}", blockhash);
+        debug!("   Slot: {}", tx_info.slot);
 
         let bundle_uuid = match jito_client.send_bundle_real(bundle, &optimal_jito_endpoint).await {
             Ok(uuid) => {
