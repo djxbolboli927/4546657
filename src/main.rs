@@ -60,9 +60,9 @@ mod spl_utils;
 mod leader_oracle;
 use leader_oracle::{LeaderOracle, GeoConfig, start_leader_schedule_updater};
 
-// 🎯 NEW: Multi-MEV Client Module
-mod multi_mev_client;
-use multi_mev_client::MultiMEVClient;
+// 🎯 Multi-MEV Client Module (موقتاً غیرفعال)
+// mod multi_mev_client;
+// use multi_mev_client::MultiMEVClient;
 
 // ═══════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -296,7 +296,6 @@ impl WorkerPool {
         tx_builder: Arc<TransactionBuilder>,
         recent_activity: RecentActivity,
         leader_oracle: Arc<LeaderOracle>, // 🌍 Leader Oracle
-        multi_mev_client: Arc<MultiMEVClient>, // 🎯 Multi-MEV Client
     ) -> Self {
         let mut workers = Vec::new();
 
@@ -311,7 +310,6 @@ impl WorkerPool {
             let builder_clone = tx_builder.clone();
             let activity_clone = recent_activity.clone();
             let oracle_clone = leader_oracle.clone(); // 🌍
-            let multi_mev_clone = multi_mev_client.clone(); // 🎯
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
@@ -326,7 +324,6 @@ impl WorkerPool {
                         builder_clone,
                         activity_clone,
                         oracle_clone, // 🌍 Leader Oracle
-                        multi_mev_clone, // 🎯 Multi-MEV Client
                     ).await;
                 });
             });
@@ -1217,7 +1214,6 @@ async fn unified_worker_thread(
     tx_builder: Arc<TransactionBuilder>,
     recent_activity: RecentActivity,
     leader_oracle: Arc<LeaderOracle>,
-    multi_mev_client: Arc<MultiMEVClient>, // 🎯 Multi-MEV Client
 ) {
     info!("Worker {} started 🚀", worker_id);
 
@@ -1418,20 +1414,21 @@ async fn unified_worker_thread(
         // ⏸️ غیرفعال: شبیه‌سازی RPC قبل از ارسال (مستقیماً ارسال می‌کنیم)
         // if ENABLE_RPC_SIMULATION { ... }
 
-        // 🎯 SHOTGUN BROADCASTING - ارسال همزمان به ۶ سرویس MEV
-        // اولین سرویسی که bundle را قبول کند برنده است
-        let (winner_service, bundle_uuid) = match multi_mev_client.submit_bundle_parallel(bundle).await {
-            Ok((service, uuid)) => {
-                info!("🏆 Bundle accepted by {}: {}", service, uuid);
-                (service, uuid)
+        // 🎯 JITO BUNDLE SUBMISSION - ارسال به جیتو (فایل jito_client.rs قدیمی)
+        let optimal_jito_endpoint = leader_oracle.get_optimal_jito_endpoint(tx_info.slot).await;
+
+        let bundle_uuid = match jito_client.send_bundle_real(bundle, &optimal_jito_endpoint).await {
+            Ok(uuid) => {
+                info!("🏆 Bundle accepted by Jito: {}", uuid);
+                uuid
             }
             Err(e) => {
-                // 📊 Failed Bundle Analysis: همه سرویس‌ها رد کردند
+                // 📊 Failed Bundle Analysis: جیتو bundle را رد کرد
                 stats.bundle_rejected_jito.fetch_add(1, Ordering::Relaxed);
                 stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
 
                 let mint_str = mint.to_string();
-                warn!("❌ ALL MEV services rejected bundle | Mint: ...{}", &mint_str[mint_str.len()-8..]);
+                warn!("❌ Jito rejected bundle | Mint: ...{}", &mint_str[mint_str.len()-8..]);
                 debug!("   Error: {}", e);
                 continue;
             }
@@ -1890,19 +1887,19 @@ async fn main() -> Result<()> {
     let tx_builder = Arc::new(TransactionBuilder::new(&rpc_endpoint));
     let recent_activity = Arc::new(DashMap::new());
 
-    // 🎯 Initialize Multi-MEV Client for parallel broadcasting
-    info!("🌐 Initializing Multi-MEV Client (6 services)...");
-    let multi_mev_client = Arc::new(MultiMEVClient::new(
-        JITO_FRANKFURT_ENDPOINT.to_string(),
-        NEXTBLOCK_ENDPOINT.to_string(),
-        NEXTBLOCK_API_KEY.to_string(),
-        BLOXROUTE_ENDPOINT.to_string(),
-        BLOXROUTE_AUTH.to_string(),
-        BLOOM_ENDPOINT.to_string(),
-        NOZOMI_ENDPOINT.to_string(),
-        ZEROSLOT_ENDPOINT.to_string(),
-    ));
-    info!("✅ Multi-MEV Client ready (Jito + NextBlock + BloXroute + Bloom + Nozomi + 0slot)");
+    // 🎯 Multi-MEV Client (موقتاً غیرفعال - برگشت به jito_client قدیمی)
+    // info!("🌐 Initializing Multi-MEV Client (6 services)...");
+    // let multi_mev_client = Arc::new(MultiMEVClient::new(
+    //     JITO_FRANKFURT_ENDPOINT.to_string(),
+    //     NEXTBLOCK_ENDPOINT.to_string(),
+    //     NEXTBLOCK_API_KEY.to_string(),
+    //     BLOXROUTE_ENDPOINT.to_string(),
+    //     BLOXROUTE_AUTH.to_string(),
+    //     BLOOM_ENDPOINT.to_string(),
+    //     NOZOMI_ENDPOINT.to_string(),
+    //     ZEROSLOT_ENDPOINT.to_string(),
+    // ));
+    // info!("✅ Multi-MEV Client ready (Jito + NextBlock + BloXroute + Bloom + Nozomi + 0slot)");
 
     // 🌍 Get current slot from RPC to initialize Leader Oracle
     info!("🔍 Fetching current slot from RPC...");
@@ -1932,7 +1929,6 @@ async fn main() -> Result<()> {
         tx_builder.clone(),
         recent_activity.clone(),
         leader_oracle.clone(), // 🌍 Leader Oracle
-        multi_mev_client.clone(), // 🎯 Multi-MEV Client
     ));
 
     let (shreds_tx, shreds_rx) = unbounded::<ShredsData>();
