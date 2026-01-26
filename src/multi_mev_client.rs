@@ -163,80 +163,52 @@ impl MultiMEVClient {
             params: vec![serde_json::json!(encoded_txs)],
         };
 
-        // Retry logic برای rate limiting (فقط برای Jito)
-        let max_retries = if matches!(service, MEVService::Jito) { 2 } else { 0 };
+        // ⚡ NO RETRY - فقط یک بار سریع ارسال (طبق درخواست کاربر)
+        let mut req = self.http_client.post(&endpoint).json(&request);
 
-        for attempt in 0..=max_retries {
-            // ساخت HTTP request
-            let mut req = self.http_client.post(&endpoint).json(&request);
-
-            // اضافه کردن headers بر اساس سرویس
-            if let Some(ref auth) = auth_header {
-                req = req.header("Authorization", auth.clone());
-            }
-            if let Some(ref key) = api_key {
-                req = req.header("X-API-KEY", key.clone());
-            }
-
-            // ارسال
-            let response = match req.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    if attempt == max_retries {
-                        return Err(anyhow!("{} connection failed: {}", service.name(), e));
-                    }
-                    tokio::time::sleep(Duration::from_millis(100 * (attempt + 1))).await;
-                    continue;
-                }
-            };
-
-            // بررسی HTTP status
-            if !response.status().is_success() {
-                let status = response.status();
-                let error_text = response.text().await.unwrap_or_default();
-
-                // اگر rate limited شدیم و هنوز retry داریم، منتظر بمانیم
-                if status.as_u16() == 429 && attempt < max_retries {
-                    debug!("{} rate limited, retrying in {}ms...", service.name(), 200 * (attempt + 1));
-                    tokio::time::sleep(Duration::from_millis(200 * (attempt + 1))).await;
-                    continue;
-                }
-
-                return Err(anyhow!(
-                    "{} HTTP error {}: {}",
-                    service.name(),
-                    status,
-                    error_text
-                ));
-            }
-
-            // پارس response
-            let response_text = response.text().await?;
-            let parsed: SendBundleResponse = serde_json::from_str(&response_text)
-                .map_err(|e| anyhow!("{} JSON parse error: {}", service.name(), e))?;
-
-            // بررسی خطا در response
-            if let Some(error) = parsed.error {
-                // اگر rate limited شدیم و هنوز retry داریم
-                if error.to_string().contains("rate limit") && attempt < max_retries {
-                    debug!("{} rate limited (API error), retrying...", service.name());
-                    tokio::time::sleep(Duration::from_millis(200 * (attempt + 1))).await;
-                    continue;
-                }
-                return Err(anyhow!("{} API error: {:?}", service.name(), error));
-            }
-
-            // استخراج bundle UUID
-            let bundle_uuid = parsed
-                .result
-                .ok_or_else(|| anyhow!("{} empty result", service.name()))?;
-
-            debug!("✅ {} accepted bundle: {}", service.name(), bundle_uuid);
-            return Ok(bundle_uuid);
+        // اضافه کردن headers بر اساس سرویس
+        if let Some(auth) = auth_header {
+            req = req.header("Authorization", auth);
+        }
+        if let Some(key) = api_key {
+            req = req.header("X-API-KEY", key);
         }
 
-        // اگر تمام retry ها شکست خوردند
-        Err(anyhow!("{} failed after {} retries", service.name(), max_retries))
+        // ارسال (فقط یک بار)
+        let response = req
+            .send()
+            .await
+            .map_err(|e| anyhow!("{} connection failed: {}", service.name(), e))?;
+
+        // بررسی HTTP status
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "{} HTTP error {}: {}",
+                service.name(),
+                status,
+                error_text
+            ));
+        }
+
+        // پارس response
+        let response_text = response.text().await?;
+        let parsed: SendBundleResponse = serde_json::from_str(&response_text)
+            .map_err(|e| anyhow!("{} JSON parse error: {}", service.name(), e))?;
+
+        // بررسی خطا در response
+        if let Some(error) = parsed.error {
+            return Err(anyhow!("{} API error: {:?}", service.name(), error));
+        }
+
+        // استخراج bundle UUID
+        let bundle_uuid = parsed
+            .result
+            .ok_or_else(|| anyhow!("{} empty result", service.name()))?;
+
+        debug!("✅ {} accepted bundle: {}", service.name(), bundle_uuid);
+        Ok(bundle_uuid)
     }
 
     /// 🎯 SHOTGUN BROADCASTING - ارسال موازی به همه سرویس‌ها

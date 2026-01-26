@@ -83,8 +83,9 @@ const SANDWICH_MIN_PROFIT_LAMPORTS: u64 = LAMPORTS_PER_SOL / 500;
 const SANDWICH_SAFETY_MARGIN: f64 = 0.90;
 
 // ✅ تنظیمات جدید برای production
-const JITO_TIP_LAMPORTS: u64 = 50_000_000;  // 0.05 SOL (افزایش یافته برای رقابت بهتر)
-const BUY_AMOUNT_LAMPORTS: u64 = 100_000;   // 0.0001 SOL (ثابت)
+const JITO_TIP_LAMPORTS: u64 = 50_000_000;  // 0.05 SOL
+const BUY_AMOUNT_LAMPORTS: u64 = 100_000;   // 0.0001 SOL
+const MAX_SOL_PAYMENT: u64 = 900_000;       // 0.0009 SOL (slippage بالا)
 
 // ═══════════════════════════════════════════════════════════════
 // 🎯 MULTI-PATH TIP ACCOUNTS (6 MEV Services)
@@ -1324,8 +1325,8 @@ async fn unified_worker_thread(
         let token_program_type = TokenProgramType::TokenProgram;  // dummy value (not used)
 
         // ✅ مقادیر ثابت برای خرید و فروش
-        let buy_sol_amount = BUY_AMOUNT_LAMPORTS;  // 0.0001 SOL (ثابت)
-        let max_sol_amount = BUY_AMOUNT_LAMPORTS * 2;  // 0.0002 SOL (2x buy برای safety)
+        let buy_sol_amount = BUY_AMOUNT_LAMPORTS;  // 0.0001 SOL
+        let max_sol_amount = MAX_SOL_PAYMENT;      // 0.0009 SOL (slippage بالا)
 
         // محاسبه تعداد توکن با 0.0001 SOL
         let buy_token_amount = calculate_token_out_with_fee(
