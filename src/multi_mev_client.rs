@@ -11,7 +11,7 @@
 //! استراتژی: Shotgun Broadcasting - اولین سرویسی که bundle را confirm کند برنده است
 
 use anyhow::{Result, anyhow};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use bs58;  // ✅ Base58 encoding (not Base64!)
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use solana_sdk::{
@@ -146,12 +146,13 @@ impl MultiMEVClient {
             MEVService::ZeroSlot => (self.zeroslot_endpoint.clone(), None, None),
         };
 
-        // تبدیل bundle به base64
+        // ✅ تبدیل bundle به Base58 (NOT Base64!)
+        // Jito انتظار Base58 encoding دارد (مثل Solana RPC)
         let encoded_txs: Vec<String> = bundle
             .iter()
             .map(|tx| {
                 let serialized = bincode::serialize(tx).unwrap();
-                BASE64.encode(&serialized)
+                bs58::encode(&serialized).into_string()  // ✅ Base58
             })
             .collect();
 
