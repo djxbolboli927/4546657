@@ -572,6 +572,71 @@ pub struct BundleStatusResult {
 
 impl JitoClient {
     /// ✅ ارسال واقعی bundle به Jito Block Engine (Frankfurt/Amsterdam)
+    /// ✅ ارسال bundle با Authorization header (برای NextBlock)
+    /// برای سرویس‌هایی که نیاز به API key در header دارند
+    pub async fn send_bundle_with_auth(
+        &self,
+        transactions: Vec<VersionedTransaction>,
+        endpoint: &str,
+        api_key: &str,
+    ) -> Result<String> {
+        // تبدیل به Base58 (Jito-compatible)
+        let encoded_txs: Vec<String> = transactions
+            .iter()
+            .map(|tx| {
+                let serialized = bincode::serialize(tx)
+                    .expect("Failed to serialize transaction");
+                bs58::encode(&serialized).into_string()
+            })
+            .collect();
+
+        let params_vec = vec![encoded_txs];
+
+        let request_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendBundle",
+            "params": params_vec
+        });
+
+        // endpoint already includes /api/v1/bundles? If not, add it
+        let url = if endpoint.ends_with("/bundles") {
+            endpoint.to_string()
+        } else {
+            format!("{}/api/v1/bundles", endpoint)
+        };
+
+        use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(api_key)
+                .map_err(|e| anyhow!("Invalid API key format: {}", e))?
+        );
+
+        let response = self.http_client
+            .post(&url)
+            .headers(headers)
+            .json(&request_body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| anyhow!("Bundle send error: {}", e))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("Bundle rejected ({}): {}", status, error_text));
+        }
+
+        let response_text = response.text().await.unwrap_or_default();
+        let result: SendBundleRealResponse = serde_json::from_str(&response_text)
+            .map_err(|e| anyhow!("Parse error: {} - Raw: {}", e, response_text))?;
+
+        Ok(result.result)
+    }
+
     /// با استفاده از VersionedTransaction و Base58 encoding
     pub async fn send_bundle_real(
         &self,

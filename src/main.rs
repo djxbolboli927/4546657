@@ -301,7 +301,6 @@ impl WorkerPool {
         pool_tracker: PoolTracker,
         stats: Arc<GlobalStats>,
         jito_client: Arc<JitoClient>,
-        nextblock_endpoint: Arc<String>, // 🎯 NextBlock endpoint with API key
         wallet_manager: Arc<WalletManager>,
         tx_builder: Arc<TransactionBuilder>,
         recent_activity: RecentActivity,
@@ -316,7 +315,6 @@ impl WorkerPool {
             let tracker = pool_tracker.clone();
             let stats_clone = stats.clone();
             let jito_clone = jito_client.clone();
-            let nextblock_endpoint_clone = nextblock_endpoint.clone(); // 🎯
             let wallet_clone = wallet_manager.clone();
             let builder_clone = tx_builder.clone();
             let activity_clone = recent_activity.clone();
@@ -331,7 +329,6 @@ impl WorkerPool {
                         tracker,
                         stats_clone,
                         jito_clone,
-                        nextblock_endpoint_clone, // 🎯 NextBlock endpoint
                         wallet_clone,
                         builder_clone,
                         activity_clone,
@@ -1222,7 +1219,6 @@ async fn unified_worker_thread(
     pool_tracker: PoolTracker,
     stats: Arc<GlobalStats>,
     jito_client: Arc<JitoClient>,
-    nextblock_endpoint: Arc<String>, // 🎯 NextBlock endpoint with API key
     wallet_manager: Arc<WalletManager>,
     tx_builder: Arc<TransactionBuilder>,
     recent_activity: RecentActivity,
@@ -1450,7 +1446,6 @@ async fn unified_worker_thread(
         let jito_client_clone = jito_client.clone();
         let jito_client_for_nextblock = jito_client.clone();
         let optimal_endpoint_clone = optimal_jito_endpoint.clone();
-        let nextblock_endpoint_clone = nextblock_endpoint.as_str().to_string();
 
         let start_time = Instant::now();
 
@@ -1461,12 +1456,16 @@ async fn unified_worker_thread(
                 let result = jito_client_clone.send_bundle_real(bundle, &optimal_endpoint_clone).await;
                 (result, task_start.elapsed())
             },
-            // Task 2: Send to NextBlock (Base58 encoding via send_bundle_real - Jito-compatible API)
+            // Task 2: Send to NextBlock (Base58 encoding with Authorization header)
             async move {
                 let task_start = Instant::now();
-                // NextBlock uses same API as Jito (URL already includes ?api_key=...)
-                // send_bundle_real will add /api/v1/bundles automatically
-                let result = jito_client_for_nextblock.send_bundle_real(bundle_for_nextblock, &nextblock_endpoint_clone).await;
+                // NextBlock requires Authorization header (not query param!)
+                // send_bundle_with_auth adds /api/v1/bundles and Authorization header
+                let result = jito_client_for_nextblock.send_bundle_with_auth(
+                    bundle_for_nextblock,
+                    NEXTBLOCK_BASE_ENDPOINT,
+                    NEXTBLOCK_API_KEY
+                ).await;
                 (result, task_start.elapsed())
             }
         );
@@ -1965,11 +1964,12 @@ async fn main() -> Result<()> {
     let tx_builder = Arc::new(TransactionBuilder::new(&rpc_endpoint));
     let recent_activity = Arc::new(DashMap::new());
 
-    // 🎯 Initialize NextBlock endpoint with auth (uses same JitoClient for sending)
-    info!("🌐 Initializing NextBlock endpoint...");
-    // NextBlock uses Jito-compatible API - add API key as query parameter
-    let nextblock_endpoint_with_auth = Arc::new(format!("{}?api_key={}", NEXTBLOCK_BASE_ENDPOINT, NEXTBLOCK_API_KEY));
-    info!("✅ NextBlock endpoint ready | Base: {} | Min tip: 0.001 SOL", NEXTBLOCK_BASE_ENDPOINT);
+    // 🎯 NextBlock configuration (uses same JitoClient with Authorization header)
+    info!("🌐 NextBlock configured");
+    info!("   Base endpoint: {}", NEXTBLOCK_BASE_ENDPOINT);
+    info!("   API: /api/v1/bundles (Jito-compatible)");
+    info!("   Auth: Authorization header");
+    info!("   Min tip: 0.001 SOL");
 
     // 🌍 Get current slot from RPC to initialize Leader Oracle
     info!("🔍 Fetching current slot from RPC...");
@@ -1995,7 +1995,6 @@ async fn main() -> Result<()> {
         pool_tracker.clone(),
         stats.clone(),
         jito_client.clone(),
-        nextblock_endpoint_with_auth.clone(), // 🎯 NextBlock endpoint with auth
         wallet_manager.clone(),
         tx_builder.clone(),
         recent_activity.clone(),
