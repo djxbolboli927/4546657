@@ -107,11 +107,17 @@ const JITO_TIP_ACCOUNTS: [&str; 8] = [
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 ];
 
-// 🟡 Group 2: NextBlock - آدرس‌های اختصاصی
-// NextBlock از Jito tip accounts هم پشتیبانی می‌کند اما این آدرس‌های اختصاصی دارد
-const NEXTBLOCK_TIP_ACCOUNTS: [&str; 2] = [
-    "NexTbLoCkWykbLuB1NkjXgFWkX9oAtcoagQegygXXA2",  // NextBlock 1
-    "nextBLoCkPMgmG8ZgJtABeScP35qLa2AMCNKntAP7Xc",   // NextBlock 2
+// 🟡 Group 2: NextBlock - آدرس‌های اختصاصی (8 addresses for load balancing)
+// NextBlock فقط از tip accounts خودش پشتیبانی می‌کند (نه Jito!)
+const NEXTBLOCK_TIP_ACCOUNTS: [&str; 8] = [
+    "NEXTbLoCkB51HpLBLojQfpyVAMorm3zzKg7w9NFdqid",
+    "nextBLoCkPMgmG8ZgJtABeScP35qLa2AMCNKntAP7Xc",
+    "NextbLoCkVtMGcV47JzewQdvBpLqT9TxQFozQkN98pE",
+    "NexTbLoCkWykbLuB1NkjXgFWkX9oAtcoagQegygXXA2",
+    "NeXTBLoCKs9F1y5PJS9CKrFNNLU1keHW71rfh7KgA1X",
+    "NexTBLockJYZ7QD7p2byrUa6df8ndV2WSd8GkbWqfbb",
+    "neXtBLock1LeC67jYd1QdAa32kbVeubsfPNTJC1V5At",
+    "nEXTBLockYgngeRmRrjDV31mGSekVPqZoMGhQEZtPVG",
 ];
 
 // 🔵 Group 2: Nozomi (Temporal) - آدرس‌های اختصاصی
@@ -1369,20 +1375,34 @@ async fn unified_worker_thread(
             }
         };
 
-        // ⚡ Build BUY and SELL transactions IN PARALLEL (save ~5-10ms!)
-        let (front_result, back_result) = tokio::join!(
-            tx_builder.build_front_run_transaction(
-                &wallet_manager.front_runner,
-                &mint,
-                &creator_vault,
-                buy_token_amount,      // ✅ تعداد توکن محاسبه شده
-                max_sol_amount,         // ✅ max: 0.0002 SOL
-                50_000,                 // priority fee
-                blockhash,
-                token_program_type,
-                &token_program_id_pubkey,
-                &fee_recipient,
-            ),
+        // Parse NextBlock tip account
+        let nextblock_tip_account = match NEXTBLOCK_TIP_ACCOUNTS[0].parse::<Pubkey>() {
+            Ok(pk) => pk,
+            Err(_) => {
+                error!("   ❌ Invalid NextBlock tip account");
+                continue;
+            }
+        };
+
+        // ⚡ Build front-run transaction once
+        let front_result = tx_builder.build_front_run_transaction(
+            &wallet_manager.front_runner,
+            &mint,
+            &creator_vault,
+            buy_token_amount,      // ✅ تعداد توکن محاسبه شده
+            max_sol_amount,         // ✅ max: 0.0002 SOL
+            50_000,                 // priority fee
+            blockhash,
+            token_program_type,
+            &token_program_id_pubkey,
+            &fee_recipient,
+        ).await;
+
+        // ⚡ Build TWO back-run transactions IN PARALLEL with different tips
+        // Strategy: Same bundle, different tip destination
+        // Winner takes the tip, loser fails (bundle already executed)
+        let (back_jito_result, back_nextblock_result) = tokio::join!(
+            // Back-run with Jito tip
             tx_builder.build_back_run_transaction(
                 &wallet_manager.front_runner,
                 &mint,
@@ -1390,8 +1410,23 @@ async fn unified_worker_thread(
                 sell_token_amount,      // ✅ فروش 100% توکن‌ها
                 0,                       // min_sol_output
                 50_000,                  // priority fee
-                JITO_TIP_LAMPORTS,       // ✅ 0.001 SOL tip
+                JITO_TIP_LAMPORTS,       // ✅ 0.009 SOL tip به Jito
                 &jito_tip_account,
+                blockhash,
+                token_program_type,
+                &token_program_id_pubkey,
+                &fee_recipient,
+            ),
+            // Back-run with NextBlock tip
+            tx_builder.build_back_run_transaction(
+                &wallet_manager.front_runner,
+                &mint,
+                &creator_vault,
+                sell_token_amount,      // ✅ فروش 100% توکن‌ها
+                0,                       // min_sol_output
+                50_000,                  // priority fee
+                JITO_TIP_LAMPORTS,       // ✅ 0.009 SOL tip به NextBlock
+                &nextblock_tip_account,
                 blockhash,
                 token_program_type,
                 &token_program_id_pubkey,
@@ -1408,22 +1443,38 @@ async fn unified_worker_thread(
             }
         };
 
-        let back_tx = match back_result {
+        let back_tx_jito = match back_jito_result {
             Ok(tx) => tx,
             Err(e) => {
-                error!("   ❌ Back-run build failed: {}", e);
+                error!("   ❌ Back-run (Jito tip) build failed: {}", e);
                 continue;
             }
         };
 
-        // ✅ استخراج signature بعد از ساخت هر دو تراکنش
+        let back_tx_nextblock = match back_nextblock_result {
+            Ok(tx) => tx,
+            Err(e) => {
+                error!("   ❌ Back-run (NextBlock tip) build failed: {}", e);
+                continue;
+            }
+        };
+
+        // ✅ استخراج signature بعد از ساخت تراکنش‌ها
         let my_signature = bs58::encode(&front_tx.signatures[0]).into_string();
 
-        // ✅ Create 3-tx bundle [front-run, victim, back-run+tip]
-        let bundle = vec![
-            VersionedTransaction::from(front_tx),
+        // ✅ Create TWO separate bundles with different tips
+        // Bundle 1: [front-run, victim, back-run+tip-to-Jito]
+        let bundle_jito = vec![
+            VersionedTransaction::from(front_tx.clone()),
             tx_info.full_transaction.clone(),  // ✅ Victim transaction
-            VersionedTransaction::from(back_tx),
+            VersionedTransaction::from(back_tx_jito),
+        ];
+
+        // Bundle 2: [front-run, victim, back-run+tip-to-NextBlock]
+        let bundle_nextblock = vec![
+            VersionedTransaction::from(front_tx),
+            tx_info.full_transaction.clone(),  // ✅ Victim transaction (same)
+            VersionedTransaction::from(back_tx_nextblock),
         ];
 
         stats.bundles_sent.fetch_add(1, Ordering::Relaxed);
@@ -1436,22 +1487,22 @@ async fn unified_worker_thread(
 
         // 📊 Debug: Bundle details
         let mint_str = mint.to_string();
-        info!("⚡ Sending bundle in PARALLEL | Mint: ...{} | Tip: {} SOL",
+        info!("⚡ Sending TWO BUNDLES in PARALLEL (Race Strategy!) | Mint: ...{} | Tip: {} SOL each",
             &mint_str[mint_str.len()-8..],
             JITO_TIP_LAMPORTS as f64 / LAMPORTS_PER_SOL as f64
         );
-        info!("   🔵 Jito endpoint: {}", optimal_jito_endpoint);
-        info!("   🟡 NextBlock endpoint: {}", NEXTBLOCK_ENDPOINT);
-        debug!("   Bundle size: {} transactions", bundle.len());
+        info!("   🔵 Bundle 1 → Jito: {} (tip to Jito wallet)", optimal_jito_endpoint);
+        info!("   🟡 Bundle 2 → NextBlock: {} (tip to NextBlock wallet)", NEXTBLOCK_ENDPOINT);
+        info!("   ⚡ Winner takes 0.009 SOL, loser fails (bundle already executed)");
+        debug!("   Bundle size: {} transactions each", bundle_jito.len());
         debug!("   Blockhash: {}", blockhash);
         debug!("   Slot: {}", tx_info.slot);
 
-        // Clone bundle for parallel submission
-        let bundle_for_nextblock = bundle.clone();
-
-        // 🚀 Race: Send to both services simultaneously!
-        // Jito: Base58 encoding + JSON-RPC sendBundle
-        // NextBlock: Base64 encoding + REST API (supports same Jito tip accounts!)
+        // 🚀 Race Strategy: Send TWO different bundles simultaneously!
+        // Bundle 1: tip to Jito → Jito network
+        // Bundle 2: tip to NextBlock → NextBlock network
+        // Same front-run and victim txs, only tip destination differs
+        // Whichever executes first wins the tip, the other fails (bundle already on-chain)
         let jito_client_clone = jito_client.clone();
         let nextblock_client_clone = nextblock_client.clone();
         let optimal_endpoint_clone = optimal_jito_endpoint.clone();
@@ -1459,16 +1510,16 @@ async fn unified_worker_thread(
         let start_time = Instant::now();
 
         let (jito_result, nextblock_result) = tokio::join!(
-            // Task 1: Send to Jito (Base58 encoding via send_bundle_real)
+            // Task 1: Send bundle with Jito tip (Base58 encoding)
             async move {
                 let task_start = Instant::now();
-                let result = jito_client_clone.send_bundle_real(bundle, &optimal_endpoint_clone).await;
+                let result = jito_client_clone.send_bundle_real(bundle_jito, &optimal_endpoint_clone).await;
                 (result, task_start.elapsed())
             },
-            // Task 2: Send to NextBlock (Base64 encoding with Authorization header)
+            // Task 2: Send bundle with NextBlock tip (Base64 encoding)
             async move {
                 let task_start = Instant::now();
-                let result = nextblock_client_clone.send_bundle(bundle_for_nextblock).await;
+                let result = nextblock_client_clone.send_bundle(bundle_nextblock).await;
                 (result, task_start.elapsed())
             }
         );
