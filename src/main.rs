@@ -48,6 +48,9 @@ use wallet_manager::WalletManager;
 mod jito_client;
 use jito_client::{JitoClient, TargetTxStatus, TokenProgramType};
 
+mod nextblock_client;
+use nextblock_client::NextBlockClient;
+
 mod transaction_builder;
 use transaction_builder::TransactionBuilder;
 
@@ -91,8 +94,8 @@ const MAX_SOL_PAYMENT: u64 = 900_000;       // 0.0009 SOL (slippage بالا)
 // 🎯 MULTI-PATH TIP ACCOUNTS (6 MEV Services)
 // ═══════════════════════════════════════════════════════════════
 
-// 🟢 Group 1: Jito-Compatible (Jito + NextBlock + Bloom)
-// این سه سرویس از آدرس‌های tip مشترک استفاده می‌کنند
+// 🟢 Group 1: Jito-Compatible (Jito + Bloom)
+// این سرویس‌ها از آدرس‌های tip مشترک استفاده می‌کنند
 const JITO_TIP_ACCOUNTS: [&str; 8] = [
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
     "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
@@ -102,6 +105,13 @@ const JITO_TIP_ACCOUNTS: [&str; 8] = [
     "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
     "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+];
+
+// 🟡 Group 2: NextBlock - آدرس‌های اختصاصی
+// NextBlock از Jito tip accounts هم پشتیبانی می‌کند اما این آدرس‌های اختصاصی دارد
+const NEXTBLOCK_TIP_ACCOUNTS: [&str; 2] = [
+    "NexTbLoCkWykbLuB1NkjXgFWkX9oAtcoagQegygXXA2",  // NextBlock 1
+    "nextBLoCkPMgmG8ZgJtABeScP35qLa2AMCNKntAP7Xc",   // NextBlock 2
 ];
 
 // 🔵 Group 2: Nozomi (Temporal) - آدرس‌های اختصاصی
@@ -128,8 +138,8 @@ const ZEROSLOT_TIP_ACCOUNTS: [&str; 2] = [
 // ═══════════════════════════════════════════════════════════════
 
 const JITO_FRANKFURT_ENDPOINT: &str = "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles";
-const NEXTBLOCK_ENDPOINT: &str = "http://fra.nextblock.io/api/v1/bundles";  // Frankfurt
-const NEXTBLOCK_API_KEY: &str = "trial1769369425-numcWHZ99zxsupeMkjuaNlOQo2GBI2c4UalZIIpfTzA%3D";
+const NEXTBLOCK_ENDPOINT: &str = "http://frankfurt.nextblock.io/api/v2/submit-batch";  // Frankfurt (v2 API!)
+const NEXTBLOCK_API_KEY: &str = "trial1769369425-numcWHZ99zxsupeMkjuaNlOQo2GBI2c4UalZIIpfTzA=";
 const BLOXROUTE_ENDPOINT: &str = "https://germany.solana.dex.blxrbdn.com/api/v2/submit-batch";
 const BLOXROUTE_AUTH: &str = "NjcyZWM5NTktYWY0Yi00MTU4LTk3YWYtZDNhZTk3N2M0NGE3OmNmMjIxOWI0YjkxYTNiYTc1NDNkMDgwMGVkODc4Mzc4";
 const BLOOM_ENDPOINT: &str = "https://mev.bloom.host/api/v1/bundles";
@@ -292,6 +302,7 @@ impl WorkerPool {
         pool_tracker: PoolTracker,
         stats: Arc<GlobalStats>,
         jito_client: Arc<JitoClient>,
+        nextblock_client: Arc<NextBlockClient>, // 🎯 NextBlock Client
         wallet_manager: Arc<WalletManager>,
         tx_builder: Arc<TransactionBuilder>,
         recent_activity: RecentActivity,
@@ -306,6 +317,7 @@ impl WorkerPool {
             let tracker = pool_tracker.clone();
             let stats_clone = stats.clone();
             let jito_clone = jito_client.clone();
+            let nextblock_clone = nextblock_client.clone(); // 🎯
             let wallet_clone = wallet_manager.clone();
             let builder_clone = tx_builder.clone();
             let activity_clone = recent_activity.clone();
@@ -320,6 +332,7 @@ impl WorkerPool {
                         tracker,
                         stats_clone,
                         jito_clone,
+                        nextblock_clone, // 🎯 NextBlock Client
                         wallet_clone,
                         builder_clone,
                         activity_clone,
@@ -1210,6 +1223,7 @@ async fn unified_worker_thread(
     pool_tracker: PoolTracker,
     stats: Arc<GlobalStats>,
     jito_client: Arc<JitoClient>,
+    nextblock_client: Arc<NextBlockClient>, // 🎯 NextBlock Client
     wallet_manager: Arc<WalletManager>,
     tx_builder: Arc<TransactionBuilder>,
     recent_activity: RecentActivity,
@@ -1414,36 +1428,86 @@ async fn unified_worker_thread(
         // ⏸️ غیرفعال: شبیه‌سازی RPC قبل از ارسال (مستقیماً ارسال می‌کنیم)
         // if ENABLE_RPC_SIMULATION { ... }
 
-        // 🎯 JITO BUNDLE SUBMISSION - ارسال به جیتو (فایل jito_client.rs قدیمی)
+        // 🎯 PARALLEL BUNDLE SUBMISSION - ارسال همزمان به Jito و NextBlock
         let optimal_jito_endpoint = leader_oracle.get_optimal_jito_endpoint(tx_info.slot).await;
 
         // 📊 Debug: Bundle details
         let mint_str = mint.to_string();
-        info!("📦 Sending bundle | Mint: ...{} | Endpoint: {} | Tip: {} SOL",
+        info!("⚡ Sending bundle in PARALLEL | Mint: ...{} | Tip: {} SOL",
             &mint_str[mint_str.len()-8..],
-            optimal_jito_endpoint,
             JITO_TIP_LAMPORTS as f64 / LAMPORTS_PER_SOL as f64
         );
+        info!("   🔵 Jito endpoint: {}", optimal_jito_endpoint);
+        info!("   🟡 NextBlock endpoint: {}", NEXTBLOCK_ENDPOINT);
         debug!("   Bundle size: {} transactions", bundle.len());
         debug!("   Blockhash: {}", blockhash);
         debug!("   Slot: {}", tx_info.slot);
 
-        let bundle_uuid = match jito_client.send_bundle_real(bundle, &optimal_jito_endpoint).await {
+        // Clone bundle for parallel submission
+        let bundle_for_nextblock = bundle.clone();
+
+        // 🚀 Race: Send to both services simultaneously!
+        let jito_client_clone = jito_client.clone();
+        let nextblock_client_clone = nextblock_client.clone();
+        let optimal_endpoint_clone = optimal_jito_endpoint.clone();
+
+        let start_time = Instant::now();
+
+        let (jito_result, nextblock_result) = tokio::join!(
+            // Task 1: Send to Jito (Base58 encoding)
+            async move {
+                let task_start = Instant::now();
+                let result = jito_client_clone.send_bundle_real(bundle, &optimal_endpoint_clone).await;
+                (result, task_start.elapsed())
+            },
+            // Task 2: Send to NextBlock (Base64 encoding)
+            async move {
+                let task_start = Instant::now();
+                let result = nextblock_client_clone.send_bundle(bundle_for_nextblock).await;
+                (result, task_start.elapsed())
+            }
+        );
+
+        let total_time = start_time.elapsed();
+
+        // 📊 Log results from both services
+        let mut bundle_uuid = String::new();
+        let mut any_accepted = false;
+
+        match jito_result.0 {
             Ok(uuid) => {
-                info!("🏆 Bundle accepted by Jito: {}", uuid);
-                uuid
+                info!("✅ Jito ACCEPTED in {:?} | UUID: {}", jito_result.1, uuid);
+                bundle_uuid = uuid;
+                any_accepted = true;
             }
             Err(e) => {
-                // 📊 Failed Bundle Analysis: جیتو bundle را رد کرد
+                warn!("❌ Jito REJECTED in {:?} | Error: {}", jito_result.1, e);
                 stats.bundle_rejected_jito.fetch_add(1, Ordering::Relaxed);
-                stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
-
-                let mint_str = mint.to_string();
-                warn!("❌ Jito rejected bundle | Mint: ...{}", &mint_str[mint_str.len()-8..]);
-                debug!("   Error: {}", e);
-                continue;
             }
-        };
+        }
+
+        match nextblock_result.0 {
+            Ok(signature) => {
+                info!("✅ NextBlock ACCEPTED in {:?} | Signature: {}", nextblock_result.1, signature);
+                if bundle_uuid.is_empty() {
+                    bundle_uuid = signature;
+                }
+                any_accepted = true;
+            }
+            Err(e) => {
+                warn!("❌ NextBlock REJECTED in {:?} | Error: {}", nextblock_result.1, e);
+            }
+        }
+
+        info!("⏱️  Total parallel submission time: {:?}", total_time);
+
+        // If both rejected, skip to next opportunity
+        if !any_accepted {
+            stats.bundles_failed.fetch_add(1, Ordering::Relaxed);
+            let mint_str = mint.to_string();
+            warn!("❌ BOTH services rejected bundle | Mint: ...{}", &mint_str[mint_str.len()-8..]);
+            continue;
+        }
 
         // Check status via ERPC (500ms delay)
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -1898,19 +1962,13 @@ async fn main() -> Result<()> {
     let tx_builder = Arc::new(TransactionBuilder::new(&rpc_endpoint));
     let recent_activity = Arc::new(DashMap::new());
 
-    // 🎯 Multi-MEV Client (موقتاً غیرفعال - برگشت به jito_client قدیمی)
-    // info!("🌐 Initializing Multi-MEV Client (6 services)...");
-    // let multi_mev_client = Arc::new(MultiMEVClient::new(
-    //     JITO_FRANKFURT_ENDPOINT.to_string(),
-    //     NEXTBLOCK_ENDPOINT.to_string(),
-    //     NEXTBLOCK_API_KEY.to_string(),
-    //     BLOXROUTE_ENDPOINT.to_string(),
-    //     BLOXROUTE_AUTH.to_string(),
-    //     BLOOM_ENDPOINT.to_string(),
-    //     NOZOMI_ENDPOINT.to_string(),
-    //     ZEROSLOT_ENDPOINT.to_string(),
-    // ));
-    // info!("✅ Multi-MEV Client ready (Jito + NextBlock + BloXroute + Bloom + Nozomi + 0slot)");
+    // 🎯 Initialize NextBlock Client (parallel submission with Jito)
+    info!("🌐 Initializing NextBlock Client...");
+    let nextblock_client = Arc::new(NextBlockClient::new(
+        NEXTBLOCK_ENDPOINT,
+        NEXTBLOCK_API_KEY
+    ));
+    info!("✅ NextBlock Client ready | Endpoint: {} | Min tip: 0.001 SOL", NEXTBLOCK_ENDPOINT);
 
     // 🌍 Get current slot from RPC to initialize Leader Oracle
     info!("🔍 Fetching current slot from RPC...");
@@ -1936,6 +1994,7 @@ async fn main() -> Result<()> {
         pool_tracker.clone(),
         stats.clone(),
         jito_client.clone(),
+        nextblock_client.clone(), // 🎯 NextBlock Client
         wallet_manager.clone(),
         tx_builder.clone(),
         recent_activity.clone(),
