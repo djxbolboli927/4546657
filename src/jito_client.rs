@@ -572,6 +572,55 @@ pub struct BundleStatusResult {
 
 impl JitoClient {
     /// ✅ ارسال واقعی bundle به Jito Block Engine (Frankfurt/Amsterdam)
+    /// ✅ ارسال bundle به URL کامل بدون تغییر (Raw URL)
+    /// این متد URL را دستکاری نمی‌کند - فقط درخواست می‌فرستد
+    /// برای NextBlock که API key در query parameter دارد
+    pub async fn send_bundle_raw_url(
+        &self,
+        transactions: Vec<VersionedTransaction>,
+        full_url: &str,
+    ) -> Result<String> {
+        // تبدیل به Base58 (Jito-compatible)
+        let encoded_txs: Vec<String> = transactions
+            .iter()
+            .map(|tx| {
+                let serialized = bincode::serialize(tx)
+                    .expect("Failed to serialize transaction");
+                bs58::encode(&serialized).into_string()
+            })
+            .collect();
+
+        let params_vec = vec![encoded_txs];
+
+        let request_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendBundle",
+            "params": params_vec
+        });
+
+        // ⚠️ مهم: URL را دستکاری نمی‌کنیم - همانطور که هست ارسال می‌کنیم
+        let response = self.http_client
+            .post(full_url)
+            .json(&request_body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| anyhow!("Bundle send error: {}", e))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("Bundle rejected ({}): {}", status, error_text));
+        }
+
+        let response_text = response.text().await.unwrap_or_default();
+        let result: SendBundleRealResponse = serde_json::from_str(&response_text)
+            .map_err(|e| anyhow!("Parse error: {} - Raw: {}", e, response_text))?;
+
+        Ok(result.result)
+    }
+
     /// ✅ ارسال bundle با Authorization header (برای NextBlock)
     /// برای سرویس‌هایی که نیاز به API key در header دارند
     pub async fn send_bundle_with_auth(

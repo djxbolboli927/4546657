@@ -134,11 +134,10 @@ const ZEROSLOT_TIP_ACCOUNTS: [&str; 2] = [
 // 🌐 MEV SERVICE ENDPOINTS (Frankfurt Optimized)
 // ═══════════════════════════════════════════════════════════════
 
-const JITO_FRANKFURT_ENDPOINT: &str = "https://frankfurt.mainnet.block-engine.jito.wtf";
-// 🟡 NextBlock uses Jito-compatible API (Base58 encoding, same JSON-RPC format)
-// Base URL with API key - send_bundle_real will add /api/v1/bundles automatically
-const NEXTBLOCK_BASE_ENDPOINT: &str = "http://fra.nextblock.io";  // ✅ Correct: fra not frankfurt!
-const NEXTBLOCK_API_KEY: &str = "trial1769369425-numcWHZ99zxsupeMkjuaNlOQo2GBI2c4UalZIIpfTzA=";
+// ✅ Complete URLs for parallel bundle submission (no URL manipulation needed!)
+// Both services use Base58 encoding + JSON-RPC sendBundle method
+const JITO_FRANKFURT_URL: &str = "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles";
+const NEXTBLOCK_FULL_URL: &str = "http://fra.nextblock.io/api/v1/bundles?api_key=trial1769369425-numcWHZ99zxsupeMkjuaNlOQo2GBI2c4UalZIIpfTzA=";
 const BLOXROUTE_ENDPOINT: &str = "https://germany.solana.dex.blxrbdn.com/api/v2/submit-batch";
 const BLOXROUTE_AUTH: &str = "NjcyZWM5NTktYWY0Yi00MTU4LTk3YWYtZDNhZTk3N2M0NGE3OmNmMjIxOWI0YjkxYTNiYTc1NDNkMDgwMGVkODc4Mzc4";
 const BLOOM_ENDPOINT: &str = "https://mev.bloom.host/api/v1/bundles";
@@ -1424,16 +1423,14 @@ async fn unified_worker_thread(
         // if ENABLE_RPC_SIMULATION { ... }
 
         // 🎯 PARALLEL BUNDLE SUBMISSION - ارسال همزمان به Jito و NextBlock
-        let optimal_jito_endpoint = leader_oracle.get_optimal_jito_endpoint(tx_info.slot).await;
-
         // 📊 Debug: Bundle details
         let mint_str = mint.to_string();
         info!("⚡ Sending bundle in PARALLEL | Mint: ...{} | Tip: {} SOL",
             &mint_str[mint_str.len()-8..],
             JITO_TIP_LAMPORTS as f64 / LAMPORTS_PER_SOL as f64
         );
-        info!("   🔵 Jito endpoint: {}", optimal_jito_endpoint);
-        info!("   🟡 NextBlock endpoint: {}", NEXTBLOCK_BASE_ENDPOINT);
+        info!("   🔵 Jito URL: {}", JITO_FRANKFURT_URL);
+        info!("   🟡 NextBlock URL: {}", NEXTBLOCK_FULL_URL);
         debug!("   Bundle size: {} transactions", bundle.len());
         debug!("   Blockhash: {}", blockhash);
         debug!("   Slot: {}", tx_info.slot);
@@ -1445,26 +1442,24 @@ async fn unified_worker_thread(
         // Both use Jito-compatible API (Base58 encoding, JSON-RPC format)
         let jito_client_clone = jito_client.clone();
         let jito_client_for_nextblock = jito_client.clone();
-        let optimal_endpoint_clone = optimal_jito_endpoint.clone();
 
         let start_time = Instant::now();
 
         let (jito_result, nextblock_result) = tokio::join!(
-            // Task 1: Send to Jito (Base58 encoding via send_bundle_real)
+            // Task 1: Send to Jito (Base58 encoding via send_bundle_raw_url)
             async move {
                 let task_start = Instant::now();
-                let result = jito_client_clone.send_bundle_real(bundle, &optimal_endpoint_clone).await;
+                let result = jito_client_clone.send_bundle_raw_url(bundle, JITO_FRANKFURT_URL).await;
                 (result, task_start.elapsed())
             },
-            // Task 2: Send to NextBlock (Base58 encoding with Authorization header)
+            // Task 2: Send to NextBlock (Base58 encoding with query param authentication)
             async move {
                 let task_start = Instant::now();
-                // NextBlock requires Authorization header (not query param!)
-                // send_bundle_with_auth adds /api/v1/bundles and Authorization header
-                let result = jito_client_for_nextblock.send_bundle_with_auth(
+                // ✅ NextBlock requires API key as query parameter in URL (not header!)
+                // send_bundle_raw_url sends URL as-is without manipulation
+                let result = jito_client_for_nextblock.send_bundle_raw_url(
                     bundle_for_nextblock,
-                    NEXTBLOCK_BASE_ENDPOINT,
-                    NEXTBLOCK_API_KEY
+                    NEXTBLOCK_FULL_URL
                 ).await;
                 (result, task_start.elapsed())
             }
@@ -1964,11 +1959,11 @@ async fn main() -> Result<()> {
     let tx_builder = Arc::new(TransactionBuilder::new(&rpc_endpoint));
     let recent_activity = Arc::new(DashMap::new());
 
-    // 🎯 NextBlock configuration (uses same JitoClient with Authorization header)
+    // 🎯 NextBlock configuration (uses same JitoClient with query param auth)
     info!("🌐 NextBlock configured");
-    info!("   Base endpoint: {}", NEXTBLOCK_BASE_ENDPOINT);
+    info!("   Full URL: {}", NEXTBLOCK_FULL_URL);
     info!("   API: /api/v1/bundles (Jito-compatible)");
-    info!("   Auth: Authorization header");
+    info!("   Auth: Query parameter (?api_key=...)");
     info!("   Min tip: 0.001 SOL");
 
     // 🌍 Get current slot from RPC to initialize Leader Oracle
