@@ -137,7 +137,7 @@ const ZEROSLOT_TIP_ACCOUNTS: [&str; 2] = [
 const JITO_FRANKFURT_ENDPOINT: &str = "https://frankfurt.mainnet.block-engine.jito.wtf";
 // 🟡 NextBlock uses Jito-compatible API (Base58 encoding, same JSON-RPC format)
 // Base URL with API key - send_bundle_real will add /api/v1/bundles automatically
-const NEXTBLOCK_BASE_ENDPOINT: &str = "http://frankfurt.nextblock.io";
+const NEXTBLOCK_BASE_ENDPOINT: &str = "http://fra.nextblock.io";  // ✅ Correct: fra not frankfurt!
 const NEXTBLOCK_API_KEY: &str = "trial1769369425-numcWHZ99zxsupeMkjuaNlOQo2GBI2c4UalZIIpfTzA=";
 const BLOXROUTE_ENDPOINT: &str = "https://germany.solana.dex.blxrbdn.com/api/v2/submit-batch";
 const BLOXROUTE_AUTH: &str = "NjcyZWM5NTktYWY0Yi00MTU4LTk3YWYtZDNhZTk3N2M0NGE3OmNmMjIxOWI0YjkxYTNiYTc1NDNkMDgwMGVkODc4Mzc4";
