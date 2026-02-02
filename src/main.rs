@@ -48,9 +48,6 @@ use wallet_manager::WalletManager;
 mod jito_client;
 use jito_client::{JitoClient, TargetTxStatus, TokenProgramType};
 
-mod nextblock_client;
-use nextblock_client::NextBlockClient;
-
 mod transaction_builder;
 use transaction_builder::TransactionBuilder;
 
@@ -137,8 +134,10 @@ const ZEROSLOT_TIP_ACCOUNTS: [&str; 2] = [
 // 🌐 MEV SERVICE ENDPOINTS (Frankfurt Optimized)
 // ═══════════════════════════════════════════════════════════════
 
-const JITO_FRANKFURT_ENDPOINT: &str = "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles";
-const NEXTBLOCK_ENDPOINT: &str = "http://frankfurt.nextblock.io/api/v2/submit-batch";  // Frankfurt (v2 API!)
+const JITO_FRANKFURT_ENDPOINT: &str = "https://frankfurt.mainnet.block-engine.jito.wtf";
+// 🟡 NextBlock uses Jito-compatible API (Base58 encoding, same JSON-RPC format)
+// Base URL with API key - send_bundle_real will add /api/v1/bundles automatically
+const NEXTBLOCK_BASE_ENDPOINT: &str = "http://frankfurt.nextblock.io";
 const NEXTBLOCK_API_KEY: &str = "trial1769369425-numcWHZ99zxsupeMkjuaNlOQo2GBI2c4UalZIIpfTzA=";
 const BLOXROUTE_ENDPOINT: &str = "https://germany.solana.dex.blxrbdn.com/api/v2/submit-batch";
 const BLOXROUTE_AUTH: &str = "NjcyZWM5NTktYWY0Yi00MTU4LTk3YWYtZDNhZTk3N2M0NGE3OmNmMjIxOWI0YjkxYTNiYTc1NDNkMDgwMGVkODc4Mzc4";
@@ -302,7 +301,7 @@ impl WorkerPool {
         pool_tracker: PoolTracker,
         stats: Arc<GlobalStats>,
         jito_client: Arc<JitoClient>,
-        nextblock_client: Arc<NextBlockClient>, // 🎯 NextBlock Client
+        nextblock_endpoint: Arc<String>, // 🎯 NextBlock endpoint with API key
         wallet_manager: Arc<WalletManager>,
         tx_builder: Arc<TransactionBuilder>,
         recent_activity: RecentActivity,
@@ -317,7 +316,7 @@ impl WorkerPool {
             let tracker = pool_tracker.clone();
             let stats_clone = stats.clone();
             let jito_clone = jito_client.clone();
-            let nextblock_clone = nextblock_client.clone(); // 🎯
+            let nextblock_endpoint_clone = nextblock_endpoint.clone(); // 🎯
             let wallet_clone = wallet_manager.clone();
             let builder_clone = tx_builder.clone();
             let activity_clone = recent_activity.clone();
@@ -332,7 +331,7 @@ impl WorkerPool {
                         tracker,
                         stats_clone,
                         jito_clone,
-                        nextblock_clone, // 🎯 NextBlock Client
+                        nextblock_endpoint_clone, // 🎯 NextBlock endpoint
                         wallet_clone,
                         builder_clone,
                         activity_clone,
@@ -1223,7 +1222,7 @@ async fn unified_worker_thread(
     pool_tracker: PoolTracker,
     stats: Arc<GlobalStats>,
     jito_client: Arc<JitoClient>,
-    nextblock_client: Arc<NextBlockClient>, // 🎯 NextBlock Client
+    nextblock_endpoint: Arc<String>, // 🎯 NextBlock endpoint with API key
     wallet_manager: Arc<WalletManager>,
     tx_builder: Arc<TransactionBuilder>,
     recent_activity: RecentActivity,
@@ -1438,7 +1437,7 @@ async fn unified_worker_thread(
             JITO_TIP_LAMPORTS as f64 / LAMPORTS_PER_SOL as f64
         );
         info!("   🔵 Jito endpoint: {}", optimal_jito_endpoint);
-        info!("   🟡 NextBlock endpoint: {}", NEXTBLOCK_ENDPOINT);
+        info!("   🟡 NextBlock endpoint: {}", NEXTBLOCK_BASE_ENDPOINT);
         debug!("   Bundle size: {} transactions", bundle.len());
         debug!("   Blockhash: {}", blockhash);
         debug!("   Slot: {}", tx_info.slot);
@@ -1447,23 +1446,27 @@ async fn unified_worker_thread(
         let bundle_for_nextblock = bundle.clone();
 
         // 🚀 Race: Send to both services simultaneously!
+        // Both use Jito-compatible API (Base58 encoding, JSON-RPC format)
         let jito_client_clone = jito_client.clone();
-        let nextblock_client_clone = nextblock_client.clone();
+        let jito_client_for_nextblock = jito_client.clone();
         let optimal_endpoint_clone = optimal_jito_endpoint.clone();
+        let nextblock_endpoint_clone = nextblock_endpoint.as_str().to_string();
 
         let start_time = Instant::now();
 
         let (jito_result, nextblock_result) = tokio::join!(
-            // Task 1: Send to Jito (Base58 encoding)
+            // Task 1: Send to Jito (Base58 encoding via send_bundle_real)
             async move {
                 let task_start = Instant::now();
                 let result = jito_client_clone.send_bundle_real(bundle, &optimal_endpoint_clone).await;
                 (result, task_start.elapsed())
             },
-            // Task 2: Send to NextBlock (Base64 encoding)
+            // Task 2: Send to NextBlock (Base58 encoding via send_bundle_real - Jito-compatible API)
             async move {
                 let task_start = Instant::now();
-                let result = nextblock_client_clone.send_bundle(bundle_for_nextblock).await;
+                // NextBlock uses same API as Jito (URL already includes ?api_key=...)
+                // send_bundle_real will add /api/v1/bundles automatically
+                let result = jito_client_for_nextblock.send_bundle_real(bundle_for_nextblock, &nextblock_endpoint_clone).await;
                 (result, task_start.elapsed())
             }
         );
@@ -1962,13 +1965,11 @@ async fn main() -> Result<()> {
     let tx_builder = Arc::new(TransactionBuilder::new(&rpc_endpoint));
     let recent_activity = Arc::new(DashMap::new());
 
-    // 🎯 Initialize NextBlock Client (parallel submission with Jito)
-    info!("🌐 Initializing NextBlock Client...");
-    let nextblock_client = Arc::new(NextBlockClient::new(
-        NEXTBLOCK_ENDPOINT,
-        NEXTBLOCK_API_KEY
-    ));
-    info!("✅ NextBlock Client ready | Endpoint: {} | Min tip: 0.001 SOL", NEXTBLOCK_ENDPOINT);
+    // 🎯 Initialize NextBlock endpoint with auth (uses same JitoClient for sending)
+    info!("🌐 Initializing NextBlock endpoint...");
+    // NextBlock uses Jito-compatible API - add API key as query parameter
+    let nextblock_endpoint_with_auth = Arc::new(format!("{}?api_key={}", NEXTBLOCK_BASE_ENDPOINT, NEXTBLOCK_API_KEY));
+    info!("✅ NextBlock endpoint ready | Base: {} | Min tip: 0.001 SOL", NEXTBLOCK_BASE_ENDPOINT);
 
     // 🌍 Get current slot from RPC to initialize Leader Oracle
     info!("🔍 Fetching current slot from RPC...");
@@ -1994,7 +1995,7 @@ async fn main() -> Result<()> {
         pool_tracker.clone(),
         stats.clone(),
         jito_client.clone(),
-        nextblock_client.clone(), // 🎯 NextBlock Client
+        nextblock_endpoint_with_auth.clone(), // 🎯 NextBlock endpoint with auth
         wallet_manager.clone(),
         tx_builder.clone(),
         recent_activity.clone(),
