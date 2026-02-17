@@ -10,7 +10,7 @@ use solana_stream_sdk::{
 };
 use std::collections::HashMap;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub commitment: Option<String>,
     pub transactions: HashMap<String, TransactionFilter>,
@@ -21,7 +21,7 @@ pub struct Config {
     pub entry: HashMap<String, EntryFilter>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct TransactionFilter {
     pub account_include: Option<Vec<String>>,
     pub account_exclude: Option<Vec<String>>,
@@ -44,7 +44,7 @@ impl From<&TransactionFilter> for GeyserSubscribeRequestFilterTransactions {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct AccountFilter {
     pub account: Option<Vec<String>>,
     pub owner: Option<Vec<String>>,
@@ -104,7 +104,7 @@ impl From<&AccountFilter> for GeyserSubscribeRequestFilterAccounts {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct AccountSubFilter {
     pub memcmp: Option<Memcmp>,
     pub datasize: Option<u64>,
@@ -112,19 +112,19 @@ pub struct AccountSubFilter {
     pub lamports: Option<Lamports>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Memcmp {
     pub offset: usize,
     pub data: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Lamports {
     pub cmp: String,
     pub value: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct SlotFilter {
     pub filter_by_commitment: Option<bool>,
     pub interslot_updates: Option<bool>,
@@ -139,7 +139,7 @@ impl From<&SlotFilter> for GeyserSubscribeRequestFilterSlots {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct BlockFilter {
     pub account_include: Option<Vec<String>>,
     pub include_transactions: Option<bool>,
@@ -158,7 +158,7 @@ impl From<&BlockFilter> for GeyserSubscribeRequestFilterBlocks {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct BlockMetaFilter {}
 
 impl From<&BlockMetaFilter> for GeyserSubscribeRequestFilterBlocksMeta {
@@ -167,7 +167,7 @@ impl From<&BlockMetaFilter> for GeyserSubscribeRequestFilterBlocksMeta {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct EntryFilter {}
 
 impl From<&EntryFilter> for GeyserSubscribeRequestFilterEntry {

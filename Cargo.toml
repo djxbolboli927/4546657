@@ -1,6 +1,6 @@
 [package]
-name = "mev_bot_unified"
-version = "3.0.0"
+name = "arb_bot"
+version = "1.0.0"
 edition = "2021"
 
 [dependencies]
@@ -44,6 +44,11 @@ futures = "0.3"
 reqwest = { version = "0.11", features = ["json"] }
 # TCP tuning for gRPC
 socket2 = "0.5"
+
+# NOTE: lighthouse-sdk conflicts with solana-stream-sdk's solana-sdk version.
+# Lighthouse assertion is implemented manually via raw instruction bytes below.
+# To re-enable once upstream resolves the conflict:
+# lighthouse-sdk = "2.0"
 
 [profile.release]
 lto = true

@@ -131,6 +131,38 @@ impl JitoClient {
         JITO_TIP_ACCOUNTS[index]
     }
 
+    /// Fetch the latest blockhash from the configured RPC endpoint.
+    pub async fn get_latest_blockhash(&self) -> Result<solana_sdk::hash::Hash> {
+        use std::str::FromStr;
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getLatestBlockhash",
+            "params": [{ "commitment": "processed" }]
+        });
+
+        let resp = self
+            .http_client
+            .post(&self.rpc_endpoint)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("getLatestBlockhash request failed: {e}"))?;
+
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| anyhow!("getLatestBlockhash parse error: {e}"))?;
+
+        let hash_str = json["result"]["value"]["blockhash"]
+            .as_str()
+            .ok_or_else(|| anyhow!("blockhash missing in response"))?;
+
+        solana_sdk::hash::Hash::from_str(hash_str)
+            .map_err(|e| anyhow!("Invalid blockhash '{hash_str}': {e}"))
+    }
+
     /// ✅ شبیه‌سازی باندل با استفاده از Jito simulateBundle API
     /// این متد از Base64 encoding استفاده می‌کند (طبق مستندات جیتو)
     /// نکته مهم: simulateBundle باید به RPC endpoint فرستاده شود (نه Block Engine!)
@@ -777,5 +809,53 @@ impl JitoClient {
             .map_err(|e| anyhow!("Parse error: {} - Raw: {}", e, response_text))?;
 
         Ok(result.result.value)
+    }
+
+    /// Fetch an Address Lookup Table account from the RPC.
+    pub async fn fetch_alt(
+        &self,
+        address: &solana_sdk::pubkey::Pubkey,
+    ) -> Result<solana_sdk::address_lookup_table::AddressLookupTableAccount> {
+        use std::str::FromStr;
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [
+                address.to_string(),
+                { "encoding": "base64", "commitment": "processed" }
+            ]
+        });
+
+        let resp = self
+            .http_client
+            .post(&self.rpc_endpoint)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("getAccountInfo failed: {e}"))?;
+
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| anyhow!("getAccountInfo parse error: {e}"))?;
+
+        let data_b64 = json["result"]["value"]["data"][0]
+            .as_str()
+            .ok_or_else(|| anyhow!("ALT account data missing for {address}"))?;
+
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(data_b64)
+            .map_err(|e| anyhow!("ALT base64 decode error: {e}"))?;
+
+        // Deserialize using solana-sdk's AddressLookupTable
+        let table = solana_sdk::address_lookup_table::state::AddressLookupTable::deserialize(&raw)
+            .map_err(|e| anyhow!("ALT deserialize error: {e}"))?;
+
+        Ok(solana_sdk::address_lookup_table::AddressLookupTableAccount {
+            key: *address,
+            addresses: table.addresses.to_vec(),
+        })
     }
 }

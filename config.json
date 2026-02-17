@@ -2,20 +2,15 @@
   "commitment": "Processed",
   "transactions": {},
   "accounts": {
-    "pumpfun_bonding_curves": {
-      "account": [],
-      "owner": ["6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"],
-      "filters": [
-        {
-          "dataSize": 264
-        },
-        {
-          "lamports": {
-            "cmp": "gt",
-            "value": 4000000000
-          }
-        }
-      ]
+    "bisonfi_wsol_usdc_pool": {
+      "account": ["51FQwjrvo8J8zXUaKyAznJ5NYpoiTCuqAqCu3HAMB9NZ"],
+      "owner": [],
+      "filters": []
+    },
+    "tessera_v_authority": {
+      "account": ["8ekCy2jHHUbW2yeNGFWYJT9Hm9FW7SvZcZK66dSZCDiF"],
+      "owner": [],
+      "filters": []
     }
   },
   "slots": {},

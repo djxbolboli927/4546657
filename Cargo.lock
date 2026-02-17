@@ -456,6 +456,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "arb_bot"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "backoff",
+ "base64 0.22.1",
+ "bincode",
+ "borsh 1.6.0",
+ "bs58",
+ "crossbeam-channel",
+ "dashmap 6.1.0",
+ "dotenvy",
+ "env_logger 0.11.8",
+ "futures",
+ "hex",
+ "lazy_static",
+ "log",
+ "rayon",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+ "serde_jsonc",
+ "sha2 0.10.9",
+ "socket2 0.5.10",
+ "solana-client",
+ "solana-entry 2.2.20",
+ "solana-sdk 2.2.2",
+ "solana-stream-sdk",
+ "solana-transaction-status 2.2.20",
+ "tokio",
+ "tonic 0.12.3",
+]
+
+[[package]]
 name = "arc-swap"
 version = "1.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3711,40 +3745,6 @@ dependencies = [
  "keccak",
  "rand_core 0.6.4",
  "zeroize",
-]
-
-[[package]]
-name = "mev_bot_unified"
-version = "3.0.0"
-dependencies = [
- "anyhow",
- "backoff",
- "base64 0.22.1",
- "bincode",
- "borsh 1.6.0",
- "bs58",
- "crossbeam-channel",
- "dashmap 6.1.0",
- "dotenvy",
- "env_logger 0.11.8",
- "futures",
- "hex",
- "lazy_static",
- "log",
- "rayon",
- "reqwest 0.11.27",
- "serde",
- "serde_json",
- "serde_jsonc",
- "sha2 0.10.9",
- "socket2 0.5.10",
- "solana-client",
- "solana-entry 2.2.20",
- "solana-sdk 2.2.2",
- "solana-stream-sdk",
- "solana-transaction-status 2.2.20",
- "tokio",
- "tonic 0.12.3",
 ]
 
 [[package]]
