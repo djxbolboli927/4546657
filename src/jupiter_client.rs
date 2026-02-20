@@ -157,6 +157,7 @@ impl JupiterClient {
     }
 
     /// Generic GET /quote.
+    /// Includes forJitoBundle=true to exclude HumidiFi (incompatible tip mechanism).
     pub async fn quote(
         &self,
         input_mint: &str,
@@ -164,7 +165,7 @@ impl JupiterClient {
         amount: u64,
     ) -> Result<QuoteResponse> {
         let url = format!(
-            "{}/quote?inputMint={}&outputMint={}&amount={}&slippageBps=0&swapMode=ExactIn",
+            "{}/quote?inputMint={}&outputMint={}&amount={}&slippageBps=0&swapMode=ExactIn&forJitoBundle=true",
             self.base_url, input_mint, output_mint, amount
         );
 

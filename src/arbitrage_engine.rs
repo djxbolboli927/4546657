@@ -168,7 +168,8 @@ impl ArbitrageState {
 ///   2. Get swap instructions from Jupiter
 ///   3. Build TX1: compute budget + setup + swap + Lighthouse assertion
 ///   4. Build TX2: Jito tip (75% of net profit)
-///   5. Submit [TX1, TX2] to Jito block engine
+///   5. Simulate bundle via Jito RPC (free pre-verification)
+///   6. Submit [TX1, TX2] to Jito block engine
 pub async fn execute_arbitrage(
     opp: ArbitrageOpportunity,
     _state: Arc<ArbitrageState>,
@@ -181,21 +182,39 @@ pub async fn execute_arbitrage(
 ) -> Result<String> {
     let start = Instant::now();
 
-    // ── Step 1: Jupiter Metis quote ──────────────────────────────────────────
-    let quote = jupiter
-        .quote_circular_wsol(opp.wsol_input)
-        .await
-        .map_err(|e| anyhow!("Jupiter quote failed: {e}"))?;
+    // ── Step 1: Jupiter Metis quote with multi-amount probing ────────────────
+    // Try multiple input amounts to find the most profitable trade size.
+    // Jupiter routing may yield different net profits at different sizes.
+    let probe_amounts = build_probe_amounts(opp.wsol_input);
+
+    let mut best_quote: Option<QuoteResponse> = None;
+    let mut best_net_profit: u64 = 0;
+
+    for amount in &probe_amounts {
+        match jupiter.quote_circular_wsol(*amount).await {
+            Ok(q) => {
+                let q_out = q.out_amount_u64();
+                let q_in = q.in_amount_u64();
+                if q_out > q_in {
+                    let gross = q_out - q_in;
+                    let tip = gross * JITO_TIP_PERCENT / 100;
+                    let net = gross.saturating_sub(tip);
+                    if net > best_net_profit {
+                        best_net_profit = net;
+                        best_quote = Some(q);
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("Probe amount {} failed: {e}", amount);
+            }
+        }
+    }
+
+    let quote = best_quote.ok_or_else(|| anyhow!("No profitable quote found across {} probe amounts", probe_amounts.len()))?;
 
     let quote_out = quote.out_amount_u64();
     let quote_in = quote.in_amount_u64();
-
-    if quote_out <= quote_in {
-        return Err(anyhow!(
-            "Jupiter quote not profitable: in={quote_in} out={quote_out}"
-        ));
-    }
-
     let gross_profit = quote_out - quote_in;
     let tip_lamports = gross_profit * JITO_TIP_PERCENT / 100;
     let net_profit = gross_profit.saturating_sub(tip_lamports);
@@ -287,9 +306,32 @@ pub async fn execute_arbitrage(
     )
     .map_err(|e| anyhow!("Failed to sign TX2: {e}"))?;
 
-    // ── Step 5: Submit bundle ─────────────────────────────────────────────────
+    // ── Step 5: Simulate bundle (free pre-verification) ───────────────────────
     let bundle = vec![tx1, tx2];
 
+    let sim_result = jito
+        .simulate_bundle(bundle.clone(), None)
+        .await
+        .map_err(|e| anyhow!("Bundle simulation failed: {e}"))?;
+
+    // Check each transaction in the simulation result
+    for (i, tx_result) in sim_result.transaction_results.iter().enumerate() {
+        if let Some(err) = &tx_result.err {
+            return Err(anyhow!(
+                "Bundle simulation TX{} failed: {:?}",
+                i + 1,
+                err
+            ));
+        }
+    }
+
+    debug!(
+        "Bundle simulation passed ({} TXs OK) in {:.1}ms",
+        sim_result.transaction_results.len(),
+        start.elapsed().as_millis()
+    );
+
+    // ── Step 6: Submit bundle ─────────────────────────────────────────────────
     let bundle_id = jito
         .send_bundle_real(bundle, jito_endpoint)
         .await
@@ -379,6 +421,35 @@ async fn fetch_alts(
 fn tip_account_for_slot(slot: u64) -> Pubkey {
     let idx = (slot as usize) % JITO_TIP_ACCOUNTS.len();
     Pubkey::from_str(JITO_TIP_ACCOUNTS[idx]).expect("invalid tip account")
+}
+
+// ─── Multi-amount probing ────────────────────────────────────────────────────
+
+/// Build a set of probe amounts around the estimated optimal input.
+/// Returns 5 amounts: 25%, 50%, 100%, 200%, and a fixed small amount (0.5 SOL).
+/// All amounts are clamped to [0.01 SOL, MAX_ARB_INPUT_LAMPORTS].
+fn build_probe_amounts(estimated_optimal: u64) -> Vec<u64> {
+    let min_amount = 10_000_000u64; // 0.01 SOL
+    let fixed_small = 500_000_000u64; // 0.5 SOL
+
+    let mut amounts = vec![
+        estimated_optimal / 4,
+        estimated_optimal / 2,
+        estimated_optimal,
+        estimated_optimal.saturating_mul(2),
+        fixed_small,
+    ];
+
+    // Deduplicate, clamp, and sort
+    amounts.sort();
+    amounts.dedup();
+    amounts.retain(|&a| a >= min_amount && a <= MAX_ARB_INPUT_LAMPORTS);
+
+    if amounts.is_empty() {
+        amounts.push(fixed_small.min(MAX_ARB_INPUT_LAMPORTS));
+    }
+
+    amounts
 }
 
 // ─── Statistics ──────────────────────────────────────────────────────────────
