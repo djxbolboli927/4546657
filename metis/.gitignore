@@ -1,0 +1,8 @@
+# Market cache - دانلود از https://cache.jup.ag/markets?v=4
+market-cache.json
+
+# لاگ‌ها
+*.log
+
+# فایل‌های موقت
+*.tmp
