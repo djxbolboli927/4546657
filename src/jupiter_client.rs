@@ -157,7 +157,16 @@ impl JupiterClient {
     }
 
     /// Generic GET /quote.
-    /// Includes forJitoBundle=true to exclude HumidiFi (incompatible tip mechanism).
+    ///
+    /// All filters are sent as query parameters per Metis API spec:
+    /// - `slippageBps=0`: Zero slippage for atomic arbitrage (revert if price changed).
+    /// - `swapMode=ExactIn`: Fix the input amount, let Metis find best output.
+    /// - `forJitoBundle=true`: Exclude DEXes incompatible with Jito bundles (HumidiFi).
+    /// - `restrictIntermediateTokens=true`: Only route through high-liquidity intermediate
+    ///    tokens (stables), avoiding obscure pairs that cause failures.
+    /// - `maxAccounts=40`: Limit transaction account count. Fewer accounts → fewer hops
+    ///    (Metis has no native `maxHops` param; this is the indirect control).
+    ///    40 accounts typically yields 2-4 hops while keeping TX size manageable.
     pub async fn quote(
         &self,
         input_mint: &str,
@@ -165,7 +174,12 @@ impl JupiterClient {
         amount: u64,
     ) -> Result<QuoteResponse> {
         let url = format!(
-            "{}/quote?inputMint={}&outputMint={}&amount={}&slippageBps=0&swapMode=ExactIn&forJitoBundle=true",
+            "{}/quote?inputMint={}&outputMint={}&amount={}\
+             &slippageBps=0\
+             &swapMode=ExactIn\
+             &forJitoBundle=true\
+             &restrictIntermediateTokens=true\
+             &maxAccounts=40",
             self.base_url, input_mint, output_mint, amount
         );
 
