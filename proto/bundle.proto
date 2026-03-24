@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package bundle;
+
+service BundleService {
+  rpc SendBundle(SendBundleRequest) returns (SendBundleResponse);
+  rpc GetBundleStatuses(GetBundleStatusesRequest) returns (GetBundleStatusesResponse);
+}
+
+message SendBundleRequest {
+  Bundle bundle = 1;
+}
+
+message SendBundleResponse {
+  string uuid = 1;
+}
+
+message GetBundleStatusesRequest {
+  repeated string bundle_ids = 1;
+}
+
+message GetBundleStatusesResponse {
+  repeated BundleStatus statuses = 1;
+}
+
+message BundleStatus {
+  string bundle_id = 1;
+  string status = 2;
+  string landed_slot = 3;
+}
+
+message Bundle {
+  repeated Packet packets = 1;
+}
+
+message Packet {
+  bytes data = 1;
+  Meta meta = 2;
+}
+
+message Meta {
+  uint64 size = 1;
+  string addr = 2;
+  uint32 port = 3;
+  uint32 flags = 4;
+  uint64 sender_stake = 5;
+}

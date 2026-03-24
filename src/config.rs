@@ -1,0 +1,55 @@
+use anyhow::Result;
+use serde::Deserialize;
+use std::path::Path;
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Config {
+    pub metis: MetisConfig,
+    pub trading: TradingConfig,
+    pub jito: JitoConfig,
+    pub rpc: RpcConfig,
+    pub performance: PerformanceConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct MetisConfig {
+    pub url: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TradingConfig {
+    pub min_amount_sol: f64,
+    pub max_amount_sol: f64,
+    pub step_sol: f64,
+    pub min_profit_lamports: u64,
+    pub tokens_file: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct JitoConfig {
+    pub grpc_url: String,
+    pub auth_keypair: String,
+    pub trading_keypair: String,
+    pub tip_min_lamports: u64,
+    pub tip_max_lamports: u64,
+    pub tip_profit_percent: f64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RpcConfig {
+    pub url: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PerformanceConfig {
+    pub threads: usize,
+    pub quote_timeout_ms: u64,
+}
+
+impl Config {
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        let config: Config = toml::from_str(&content)?;
+        Ok(config)
+    }
+}

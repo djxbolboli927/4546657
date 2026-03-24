@@ -1,0 +1,24 @@
+[metis]
+url = "http://127.0.0.1:18080"
+
+[trading]
+min_amount_sol = 0.1
+max_amount_sol = 0.2
+step_sol = 0.00005
+min_profit_lamports = 1000
+tokens_file = "tokens.txt"
+
+[jito]
+grpc_url = "https://frankfurt.mainnet.block-engine.jito.wtf"
+auth_keypair = "grpc-jito.json"
+trading_keypair = "wallet.json"
+tip_min_lamports = 10000
+tip_max_lamports = 1000000
+tip_profit_percent = 0.50
+
+[rpc]
+url = "https://api.mainnet-beta.solana.com"
+
+[performance]
+threads = 4
+quote_timeout_ms = 500
