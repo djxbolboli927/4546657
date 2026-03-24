@@ -45,79 +45,56 @@ async fn main() -> Result<()> {
     // Create RPC client
     let rpc_client = Arc::new(RpcClient::new(config.rpc.url.clone()));
 
-    // Verify WSOL ATA exists
+    // Verify WSOL ATA exists (required because wrapAndUnwrapSol=false)
     let wsol_mint = solana_sdk::pubkey::Pubkey::from_str_const(tokens::WSOL_MINT);
     let wsol_ata = spl_associated_token_account::get_associated_token_address(
         &trading_keypair.pubkey(),
         &wsol_mint,
     );
     match rpc_client.get_account(&wsol_ata) {
-        Ok(_) => info!(ata = %wsol_ata, "WSOL ATA exists"),
+        Ok(_) => info!(ata = %wsol_ata, "WSOL ATA verified"),
         Err(e) => {
             warn!(
                 ata = %wsol_ata,
                 error = %e,
-                "WSOL ATA not found — please create it before running"
+                "WSOL ATA not found — create it before running!"
             );
         }
     }
 
-    // Create Metis client
+    // Create Metis client (local self-hosted at 127.0.0.1:18080)
     let metis = metis::MetisClient::new(&config.metis.url, config.performance.quote_timeout_ms);
 
-    // Connect to Jito
+    // Connect to Jito gRPC with whitelisted auth keypair
     let mut jito_client = jito::JitoClient::connect(&config.jito.grpc_url, auth_keypair).await?;
     info!("connected to Jito gRPC");
 
     // Jito rate limiter: max N bundles per second, drop if exceeded (no queue)
     let mut jito_limiter = RateLimiter::new(config.jito.max_bundles_per_second);
 
-    // Main loop
-    info!("starting arbitrage scanner");
+    // Main loop — continuous scanning
+    info!(
+        tokens = token_mints.len(),
+        min_sol = config.trading.min_amount_sol,
+        max_sol = config.trading.max_amount_sol,
+        step = config.trading.step_sol,
+        "starting arbitrage scanner"
+    );
+
     loop {
         for token_mint in &token_mints {
-            match arbitrage::scan_token(&metis, token_mint, &config).await {
-                Ok(Some(opp)) => {
-                    // Check Jito rate limit — if exceeded, drop this opportunity immediately
-                    if !jito_limiter.try_acquire() {
-                        warn!(
-                            token = %opp.token_mint,
-                            profit = opp.profit_lamports,
-                            "jito rate limit hit, dropping opportunity (no queue)"
-                        );
-                        continue;
-                    }
-
-                    info!(
-                        token = %opp.token_mint,
-                        profit = opp.profit_lamports,
-                        "opportunity found, executing immediately..."
-                    );
-
-                    match arbitrage::execute_opportunity(
-                        &opp,
-                        &metis,
-                        &mut jito_client,
-                        &trading_keypair,
-                        &rpc_client,
-                        &config,
-                    )
-                    .await
-                    {
-                        Ok(uuid) => {
-                            info!(uuid = %uuid, "arbitrage executed");
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "arbitrage execution failed");
-                        }
-                    }
-                }
-                Ok(None) => {
-                    // No opportunity for this token
-                }
-                Err(e) => {
-                    error!(token = token_mint, error = %e, "scan error");
-                }
+            if let Err(e) = arbitrage::scan_and_execute(
+                &metis,
+                token_mint,
+                &config,
+                &mut jito_client,
+                &trading_keypair,
+                &rpc_client,
+                &mut jito_limiter,
+            )
+            .await
+            {
+                error!(token = token_mint.as_str(), error = %e, "scan error");
             }
         }
     }

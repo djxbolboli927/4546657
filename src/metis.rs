@@ -77,6 +77,8 @@ impl MetisClient {
     pub fn new(base_url: &str, timeout_ms: u64) -> Self {
         let http = Client::builder()
             .timeout(Duration::from_millis(timeout_ms))
+            .pool_max_idle_per_host(10)
+            .tcp_nodelay(true)
             .build()
             .expect("failed to build http client");
         Self {
@@ -86,6 +88,14 @@ impl MetisClient {
     }
 
     /// Get a quote from Metis.
+    ///
+    /// Parameters per Jupiter/Metis docs:
+    /// - slippageBps=0: zero slippage, tx reverts if exact amount not met
+    /// - onlyDirectRoutes=true: single-hop for speed
+    /// - maxAccounts=24: keep tx within 1232 byte limit
+    /// - forJitoBundle=true: excludes Jito-incompatible DEXes
+    /// - swapMode=ExactIn: exact input amount
+    /// - restrictIntermediateTokens=false: allow all intermediate tokens
     pub async fn get_quote(
         &self,
         input_mint: &str,
@@ -93,7 +103,13 @@ impl MetisClient {
         amount_lamports: u64,
     ) -> Result<QuoteResponse> {
         let url = format!(
-            "{}/quote?inputMint={}&outputMint={}&amount={}&slippageBps=0&onlyDirectRoutes=true&maxAccounts=24&swapMode=ExactIn&forJitoBundle=true&restrictIntermediateTokens=false",
+            "{}/quote?inputMint={}&outputMint={}&amount={}\
+             &slippageBps=0\
+             &onlyDirectRoutes=true\
+             &maxAccounts=24\
+             &swapMode=ExactIn\
+             &forJitoBundle=true\
+             &restrictIntermediateTokens=false",
             self.base_url, input_mint, output_mint, amount_lamports
         );
 
@@ -115,6 +131,13 @@ impl MetisClient {
     }
 
     /// Get swap instructions for a given quote.
+    ///
+    /// Parameters per Jupiter docs:
+    /// - wrapAndUnwrapSol=false: WSOL ATA must already exist
+    /// - useSharedAccounts=true: use shared intermediate accounts
+    /// - dynamicComputeUnitLimit=true: Metis calculates optimal CU
+    /// - skipUserAccountsRpcCalls=true: skip RPC calls for speed
+    /// - asLegacyTransaction=false: use VersionedTransaction v0 with ALT support
     pub async fn get_swap_instructions(
         &self,
         user_pubkey: &str,

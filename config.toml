@@ -1,6 +1,6 @@
 [metis]
 url = "http://127.0.0.1:18080"
-# اطلاعات زیر برای راه‌اندازی باینری متیس هست (نه برای ربات)
+# کلید باینری برای راه‌اندازی خود متیس (ربات مستقیماً از آن استفاده نمیکند)
 binary_key = "5b945476-f95d-4403-a2b5-156db4ee3212"
 
 [trading]
@@ -14,15 +14,18 @@ tokens_file = "tokens.txt"
 grpc_url = "https://frankfurt.mainnet.block-engine.jito.wtf"
 auth_keypair = "/home/ubuntu/arb/wallet/grpc-jito.json"
 trading_keypair = "/home/ubuntu/arb/wallet/wallet-new.json"
-tip_min_lamports = 10000
+# حداقل تیپ طبق داکیومنت جیتو: 1000 لمپرت
+tip_min_lamports = 1000
 tip_max_lamports = 1000000
 tip_profit_percent = 0.50
+# ریت لیمیت ارسال باندل به جیتو: حداکثر 5 در ثانیه
 max_bundles_per_second = 5
 
 [rpc]
 url = "https://rpc.fra.shyft.to?api_key=farYqEW-7r1vxqok"
 
 [yellowstone_grpc]
+# برای راه‌اندازی متیس باینری استفاده میشه
 endpoint = "https://grpc.fra.shyft.to"
 x_token = "41cd21e6-6a66-493d-bdc6-a7057409c2a1"
 

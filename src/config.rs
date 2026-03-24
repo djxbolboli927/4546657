@@ -15,6 +15,7 @@ pub struct Config {
 #[derive(Debug, Deserialize, Clone)]
 pub struct MetisConfig {
     pub url: String,
+    #[allow(dead_code)]
     pub binary_key: String,
 }
 
@@ -39,11 +40,13 @@ pub struct JitoConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct RpcConfig {
     pub url: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct YellowstoneGrpcConfig {
     pub endpoint: String,
     pub x_token: String,

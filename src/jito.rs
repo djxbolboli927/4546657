@@ -18,14 +18,23 @@ use proto::auth::{GenerateAuthChallengeRequest, GenerateAuthTokensRequest};
 use proto::bundle::bundle_service_client::BundleServiceClient;
 use proto::bundle::{Bundle, GetBundleStatusesRequest, Packet, SendBundleRequest};
 
+type AuthenticatedBundleClient =
+    BundleServiceClient<tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>>;
+
 /// Jito gRPC client that handles authentication and bundle submission.
+/// Per Jito docs: uses whitelisted keypair for gRPC auth (not trading wallet).
 pub struct JitoClient {
-    bundle_client: BundleServiceClient<tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>>,
+    bundle_client: AuthenticatedBundleClient,
     _auth_keypair: Keypair,
 }
 
 impl JitoClient {
     /// Connect to a Jito block engine gRPC endpoint and authenticate.
+    /// Authentication flow per Jito docs:
+    /// 1. Request challenge with Searcher role
+    /// 2. Sign challenge with auth keypair
+    /// 3. Receive access token
+    /// 4. Attach token to all subsequent gRPC requests
     pub async fn connect(grpc_url: &str, auth_keypair: Keypair) -> Result<Self> {
         let tls_config = ClientTlsConfig::new().with_webpki_roots();
 
@@ -35,9 +44,9 @@ impl JitoClient {
             .await
             .context("failed to connect to Jito gRPC")?;
 
-        // Authenticate
+        // Authenticate with whitelisted keypair
         let access_token = Self::authenticate(&channel, &auth_keypair).await?;
-        info!("Jito auth successful");
+        info!("Jito gRPC auth successful");
 
         // Create authenticated bundle client
         let bundle_client = BundleServiceClient::with_interceptor(
@@ -54,7 +63,7 @@ impl JitoClient {
     async fn authenticate(channel: &Channel, keypair: &Keypair) -> Result<String> {
         let mut auth_client = AuthServiceClient::new(channel.clone());
 
-        // Step 1: Request challenge
+        // Step 1: Request challenge as Searcher
         let challenge_resp = auth_client
             .generate_auth_challenge(GenerateAuthChallengeRequest {
                 role: RoleType::Searcher as i32,
@@ -87,6 +96,10 @@ impl JitoClient {
     }
 
     /// Send a single-transaction bundle to Jito.
+    /// Per Jito docs:
+    /// - Bundle can contain up to 5 txs, executed atomically (all-or-nothing)
+    /// - Tip must be in the last tx of the bundle
+    /// - We use single-tx bundles for maximum speed
     pub async fn send_bundle(&mut self, tx: &VersionedTransaction) -> Result<String> {
         let tx_bytes = bincode::serialize(tx).context("failed to serialize transaction")?;
 
@@ -114,11 +127,11 @@ impl JitoClient {
             .context("send_bundle gRPC failed")?;
 
         let uuid = resp.into_inner().uuid;
-        info!(uuid = %uuid, "bundle submitted");
         Ok(uuid)
     }
 
-    /// Check bundle status by UUID.
+    /// Check bundle status by UUID (best-effort, non-blocking).
+    #[allow(dead_code)]
     pub async fn get_bundle_status(&mut self, uuid: &str) -> Result<Option<String>> {
         let resp = self
             .bundle_client
@@ -144,7 +157,7 @@ impl JitoClient {
     }
 }
 
-/// gRPC interceptor that attaches the access token to every request.
+/// gRPC interceptor that attaches the Bearer access token to every request.
 #[derive(Clone)]
 struct AuthInterceptor {
     access_token: String,
