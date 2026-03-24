@@ -8,12 +8,14 @@ pub struct Config {
     pub trading: TradingConfig,
     pub jito: JitoConfig,
     pub rpc: RpcConfig,
+    pub yellowstone_grpc: YellowstoneGrpcConfig,
     pub performance: PerformanceConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct MetisConfig {
     pub url: String,
+    pub binary_key: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -33,11 +35,18 @@ pub struct JitoConfig {
     pub tip_min_lamports: u64,
     pub tip_max_lamports: u64,
     pub tip_profit_percent: f64,
+    pub max_bundles_per_second: u32,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RpcConfig {
     pub url: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct YellowstoneGrpcConfig {
+    pub endpoint: String,
+    pub x_token: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]

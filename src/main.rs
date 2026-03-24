@@ -2,6 +2,7 @@ mod arbitrage;
 mod config;
 mod jito;
 mod metis;
+mod rate_limiter;
 mod tokens;
 mod transaction;
 mod wallet;
@@ -11,6 +12,8 @@ use solana_client::rpc_client::RpcClient;
 use solana_sdk::signer::Signer;
 use std::sync::Arc;
 use tracing::{error, info, warn};
+
+use rate_limiter::RateLimiter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -66,16 +69,29 @@ async fn main() -> Result<()> {
     let mut jito_client = jito::JitoClient::connect(&config.jito.grpc_url, auth_keypair).await?;
     info!("connected to Jito gRPC");
 
+    // Jito rate limiter: max N bundles per second, drop if exceeded (no queue)
+    let mut jito_limiter = RateLimiter::new(config.jito.max_bundles_per_second);
+
     // Main loop
     info!("starting arbitrage scanner");
     loop {
         for token_mint in &token_mints {
             match arbitrage::scan_token(&metis, token_mint, &config).await {
                 Ok(Some(opp)) => {
+                    // Check Jito rate limit — if exceeded, drop this opportunity immediately
+                    if !jito_limiter.try_acquire() {
+                        warn!(
+                            token = %opp.token_mint,
+                            profit = opp.profit_lamports,
+                            "jito rate limit hit, dropping opportunity (no queue)"
+                        );
+                        continue;
+                    }
+
                     info!(
                         token = %opp.token_mint,
                         profit = opp.profit_lamports,
-                        "opportunity found, executing..."
+                        "opportunity found, executing immediately..."
                     );
 
                     match arbitrage::execute_opportunity(
@@ -97,7 +113,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 Ok(None) => {
-                    // No opportunity for this token at this time
+                    // No opportunity for this token
                 }
                 Err(e) => {
                     error!(token = token_mint, error = %e, "scan error");
