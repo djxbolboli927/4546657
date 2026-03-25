@@ -11,8 +11,8 @@ min_profit_lamports = 1000
 tokens_file = "tokens.txt"
 
 [jito]
-grpc_url = "https://frankfurt.mainnet.block-engine.jito.wtf"
-auth_keypair = "/home/ubuntu/arb/wallet/grpc-jito.json"
+url = "https://frankfurt.mainnet.block-engine.jito.wtf"
+uuid = "8c7cda54-ef6e-4792-8617-da0341f8d485"
 trading_keypair = "/home/ubuntu/arb/wallet/wallet-new.json"
 # حداقل تیپ طبق داکیومنت جیتو: 1000 لمپرت
 tip_min_lamports = 1000

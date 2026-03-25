@@ -1,192 +1,101 @@
 use anyhow::{Context, Result};
-use solana_sdk::{signature::Keypair, signer::Signer, transaction::VersionedTransaction};
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use solana_sdk::transaction::VersionedTransaction;
 use tracing::{info, warn};
 
-pub mod proto {
-    pub mod auth {
-        tonic::include_proto!("auth");
-    }
-    pub mod bundle {
-        tonic::include_proto!("bundle");
-    }
-    pub mod searcher {
-        tonic::include_proto!("searcher");
-    }
-    pub mod packet {
-        tonic::include_proto!("packet");
-    }
-    #[allow(dead_code)]
-    pub mod shared {
-        tonic::include_proto!("shared");
-    }
+/// Jito JSON-RPC client for bundle submission.
+/// Uses the Jito Block Engine sendBundle API with UUID-based auth.
+pub struct JitoClient {
+    http: Client,
+    bundle_url: String,
 }
 
-use proto::auth::auth_service_client::AuthServiceClient;
-use proto::auth::{GenerateAuthChallengeRequest, GenerateAuthTokensRequest, Role};
-use proto::searcher::searcher_service_client::SearcherServiceClient;
-use proto::searcher::SendBundleRequest;
+#[derive(Serialize)]
+struct SendBundleRpcRequest {
+    jsonrpc: &'static str,
+    id: u64,
+    method: &'static str,
+    params: (Vec<String>,),
+}
 
-type AuthenticatedSearcherClient =
-    SearcherServiceClient<tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>>;
+#[derive(Deserialize, Debug)]
+struct RpcResponse {
+    result: Option<String>,
+    error: Option<RpcError>,
+}
 
-/// Jito gRPC client that handles authentication and bundle submission.
-/// Uses the official Jito mev-protos: SearcherService for sending bundles.
-/// Auth uses whitelisted keypair (not trading wallet).
-pub struct JitoClient {
-    searcher_client: AuthenticatedSearcherClient,
-    _auth_keypair: Keypair,
+#[derive(Deserialize, Debug)]
+struct RpcError {
+    code: i64,
+    message: String,
 }
 
 impl JitoClient {
-    /// Connect to a Jito block engine gRPC endpoint and authenticate.
-    pub async fn connect(grpc_url: &str, auth_keypair: Keypair) -> Result<Self> {
-        let tls_config = ClientTlsConfig::new().with_webpki_roots();
-
-        let channel = Endpoint::from_shared(grpc_url.to_string())?
-            .tls_config(tls_config)?
-            .connect()
-            .await
-            .context("failed to connect to Jito gRPC")?;
-
-        // Authenticate with whitelisted keypair
-        let access_token = Self::authenticate(&channel, &auth_keypair).await?;
-        info!("Jito gRPC auth successful");
-
-        // Create authenticated searcher client
-        let searcher_client = SearcherServiceClient::with_interceptor(
-            channel,
-            AuthInterceptor::new(access_token),
+    /// Create a Jito client using JSON-RPC bundle API with UUID auth.
+    ///
+    /// URL format: https://<region>.mainnet.block-engine.jito.wtf
+    /// UUID: provided by Jito for bundle submission auth
+    pub fn new(base_url: &str, uuid: &str) -> Self {
+        let bundle_url = format!(
+            "{}/api/v1/bundles?uuid={}",
+            base_url.trim_end_matches('/'),
+            uuid
         );
+        let http = Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("failed to build http client");
 
-        Ok(Self {
-            searcher_client,
-            _auth_keypair: auth_keypair,
-        })
+        info!("Jito JSON-RPC client initialized");
+
+        Self { http, bundle_url }
     }
 
-    /// Authenticate per official Jito searcher-examples/token_authenticator.rs:
-    /// 1. Send pubkey as raw 32 bytes + Role::Searcher
-    /// 2. Format challenge as "{pubkey_base58}-{server_challenge}"
-    /// 3. Sign the formatted challenge string
-    /// 4. Send formatted challenge + signature + raw pubkey bytes
-    async fn authenticate(channel: &Channel, keypair: &Keypair) -> Result<String> {
-        let mut auth_client = AuthServiceClient::new(channel.clone());
-
-        let pubkey_bytes = keypair.pubkey().as_ref().to_vec();
-
-        // Step 1: Request challenge — pubkey as raw 32 bytes, role = SEARCHER (1)
-        let challenge_resp = auth_client
-            .generate_auth_challenge(GenerateAuthChallengeRequest {
-                role: Role::Searcher as i32,
-                pubkey: pubkey_bytes.clone(),
-            })
-            .await
-            .context("auth challenge request failed")?;
-
-        let server_challenge = challenge_resp.into_inner().challenge;
-
-        // Step 2: Format challenge as "pubkey_base58-server_challenge"
-        // This is the EXACT format from jito-labs/searcher-examples token_authenticator.rs
-        let challenge = format!("{}-{}", keypair.pubkey(), server_challenge);
-
-        // Step 3: Sign the formatted challenge string
-        let signed_challenge = keypair.sign_message(challenge.as_bytes()).as_ref().to_vec();
-
-        // Step 4: Send formatted challenge (not raw server challenge!) + signature
-        let tokens_resp = auth_client
-            .generate_auth_tokens(GenerateAuthTokensRequest {
-                challenge,
-                client_pubkey: pubkey_bytes,
-                signed_challenge,
-            })
-            .await
-            .context("auth tokens request failed")?;
-
-        let tokens = tokens_resp.into_inner();
-        let access_token = tokens
-            .access_token
-            .ok_or_else(|| anyhow::anyhow!("no access token returned"))?
-            .value;
-
-        Ok(access_token)
-    }
-
-    /// Send a single-transaction bundle via SearcherService.SendBundle.
-    /// Per Jito: bundle can contain up to 5 txs, tip must be in last tx.
-    /// We use single-tx bundles for maximum speed.
-    pub async fn send_bundle(&mut self, tx: &VersionedTransaction) -> Result<String> {
+    /// Send a single-transaction bundle via Jito JSON-RPC sendBundle.
+    ///
+    /// The transaction is serialized with bincode, then base58-encoded.
+    /// Returns the bundle ID on success.
+    pub async fn send_bundle(&self, tx: &VersionedTransaction) -> Result<String> {
         let tx_bytes = bincode::serialize(tx).context("failed to serialize transaction")?;
+        let tx_base58 = bs58::encode(&tx_bytes).into_string();
 
-        let packet = proto::packet::Packet {
-            data: tx_bytes.clone(),
-            meta: Some(proto::packet::Meta {
-                size: tx_bytes.len() as u64,
-                addr: String::new(),
-                port: 0,
-                flags: None,
-                sender_stake: 0,
-            }),
-        };
-
-        let bundle = proto::bundle::Bundle {
-            header: None,
-            packets: vec![packet],
+        let request = SendBundleRpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "sendBundle",
+            params: (vec![tx_base58],),
         };
 
         let resp = self
-            .searcher_client
-            .send_bundle(SendBundleRequest {
-                bundle: Some(bundle),
-            })
-            .await;
+            .http
+            .post(&self.bundle_url)
+            .json(&request)
+            .send()
+            .await
+            .context("Jito sendBundle request failed")?;
 
-        match resp {
-            Ok(r) => {
-                let uuid = r.into_inner().uuid;
-                Ok(uuid)
-            }
-            Err(status) => {
-                warn!(
-                    code = %status.code(),
-                    message = %status.message(),
-                    "send_bundle gRPC error"
-                );
-                anyhow::bail!(
-                    "send_bundle gRPC failed: code={}, message={}",
-                    status.code(),
-                    status.message()
-                )
-            }
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            warn!(http_status = %status, body = %body, "Jito HTTP error");
+            anyhow::bail!("Jito HTTP error: {} — {}", status, body);
         }
-    }
-}
 
-/// gRPC interceptor that attaches the Bearer access token to every request.
-#[derive(Clone)]
-struct AuthInterceptor {
-    access_token: String,
-}
+        let rpc_resp: RpcResponse = resp
+            .json()
+            .await
+            .context("failed to parse Jito response")?;
 
-impl AuthInterceptor {
-    fn new(token: String) -> Self {
-        Self {
-            access_token: token,
+        if let Some(err) = rpc_resp.error {
+            warn!(code = err.code, message = %err.message, "Jito RPC error");
+            anyhow::bail!("Jito RPC error: code={}, message={}", err.code, err.message);
         }
-    }
-}
 
-impl tonic::service::Interceptor for AuthInterceptor {
-    fn call(
-        &mut self,
-        mut request: tonic::Request<()>,
-    ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
-        let value = format!("Bearer {}", self.access_token)
-            .parse()
-            .map_err(|_| tonic::Status::internal("invalid access token"))?;
-        request
-            .metadata_mut()
-            .insert("authorization", value);
-        Ok(request)
+        let bundle_id = rpc_resp
+            .result
+            .ok_or_else(|| anyhow::anyhow!("Jito returned no result and no error"))?;
+
+        Ok(bundle_id)
     }
 }

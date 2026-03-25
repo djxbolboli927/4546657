@@ -34,7 +34,7 @@ pub async fn scan_all_tokens(
     metis: &MetisClient,
     token_mints: &[String],
     config: &Config,
-    jito: &mut JitoClient,
+    jito: &JitoClient,
     trading_keypair: &Keypair,
     rpc_client: &RpcClient,
     jito_limiter: &mut RateLimiter,
@@ -139,7 +139,7 @@ pub async fn scan_all_tokens(
 async fn execute_opportunity(
     opp: &Opportunity,
     metis: &MetisClient,
-    jito: &mut JitoClient,
+    jito: &JitoClient,
     trading_keypair: &Keypair,
     rpc_client: &RpcClient,
 ) -> Result<String> {

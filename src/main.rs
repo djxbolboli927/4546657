@@ -17,15 +17,12 @@ use rate_limiter::RateLimiter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging — filter out noisy hyper/reqwest debug logs
+    // Initialize logging — always filter noisy crate debug logs
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| {
-                    tracing_subscriber::EnvFilter::new(
-                        "info,hyper_util=warn,hyper=warn,reqwest=warn,h2=warn,tonic=warn"
-                    )
-                }),
+            tracing_subscriber::EnvFilter::new(
+                "info,hyper_util=warn,hyper=warn,reqwest=warn,h2=warn,tonic=warn"
+            ),
         )
         .init();
 
@@ -37,13 +34,11 @@ async fn main() -> Result<()> {
     let token_mints = tokens::load_tokens(&config.trading.tokens_file)?;
     info!(count = token_mints.len(), "tokens loaded");
 
-    // Load keypairs
+    // Load trading keypair
     let trading_keypair = wallet::read_keypair(&config.jito.trading_keypair)?;
-    let auth_keypair = wallet::read_keypair(&config.jito.auth_keypair)?;
     info!(
         trading_wallet = %trading_keypair.pubkey(),
-        auth_wallet = %auth_keypair.pubkey(),
-        "keypairs loaded"
+        "keypair loaded"
     );
 
     // Create RPC client
@@ -61,7 +56,7 @@ async fn main() -> Result<()> {
             warn!(
                 ata = %wsol_ata,
                 error = %e,
-                "WSOL ATA not found — create it before running!"
+                "WSOL ATA not found — run: spl-token wrap <amount>"
             );
         }
     }
@@ -69,9 +64,8 @@ async fn main() -> Result<()> {
     // Create Metis client
     let metis = metis::MetisClient::new(&config.metis.url, config.performance.quote_timeout_ms);
 
-    // Connect to Jito gRPC with whitelisted auth keypair
-    let mut jito_client = jito::JitoClient::connect(&config.jito.grpc_url, auth_keypair).await?;
-    info!("connected to Jito gRPC");
+    // Create Jito JSON-RPC client with UUID auth
+    let jito_client = jito::JitoClient::new(&config.jito.url, &config.jito.uuid);
 
     // Jito rate limiter: max N bundles per second, drop if exceeded (no queue)
     let mut jito_limiter = RateLimiter::new(config.jito.max_bundles_per_second);
@@ -90,7 +84,7 @@ async fn main() -> Result<()> {
             &metis,
             &token_mints,
             &config,
-            &mut jito_client,
+            &jito_client,
             &trading_keypair,
             &rpc_client,
             &mut jito_limiter,

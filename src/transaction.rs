@@ -95,19 +95,61 @@ pub fn build_arb_transaction(
 ) -> Result<VersionedTransaction> {
     let mut instructions: Vec<Instruction> = Vec::new();
 
-    // 1. Compute budget instructions from both legs (includes SetComputeUnitLimit)
-    // Metis sets dynamicComputeUnitLimit — we use those CU values
-    for cb_ix in &swap_leg1.compute_budget_instructions {
-        instructions.push(to_sdk_instruction(cb_ix)?);
-    }
-    // Add compute budget from leg2 if it has separate CU instructions
-    for cb_ix in &swap_leg2.compute_budget_instructions {
+    // 1. Compute budget instructions — merge from both legs, avoid duplicates.
+    // ComputeBudget program ID: ComputeBudget111111111111111111111111111111
+    // Instruction discriminators: 0x02 = SetComputeUnitLimit, 0x03 = SetComputeUnitPrice
+    // We sum CU limits from both legs and keep only one of each type.
+    let compute_budget_pid = "ComputeBudget111111111111111111111111111111";
+    let mut total_cu_limit: u32 = 0;
+    let mut has_cu_price = false;
+    let mut cu_price_ix: Option<Instruction> = None;
+
+    for cb_ix in swap_leg1
+        .compute_budget_instructions
+        .iter()
+        .chain(swap_leg2.compute_budget_instructions.iter())
+    {
         let ix = to_sdk_instruction(cb_ix)?;
-        // Avoid duplicate SetComputeUnitLimit — combine CU from both legs
-        // We take the max or add them. For safety, we replace with a combined CU limit.
-        // Actually, Metis returns CU per swap. For 2 swaps we need to sum them.
-        // We'll handle this by collecting all CB instructions and adjusting below.
-        instructions.push(ix);
+        if cb_ix.program_id == compute_budget_pid && !ix.data.is_empty() {
+            match ix.data[0] {
+                0x02 => {
+                    // SetComputeUnitLimit — sum from both legs
+                    if ix.data.len() >= 5 {
+                        let cu = u32::from_le_bytes([ix.data[1], ix.data[2], ix.data[3], ix.data[4]]);
+                        total_cu_limit = total_cu_limit.saturating_add(cu);
+                    }
+                }
+                0x03 => {
+                    // SetComputeUnitPrice — keep only one (first seen)
+                    if !has_cu_price {
+                        cu_price_ix = Some(ix);
+                        has_cu_price = true;
+                    }
+                }
+                _ => {
+                    instructions.push(ix);
+                }
+            }
+        } else {
+            instructions.push(ix);
+        }
+    }
+
+    // Add combined SetComputeUnitLimit (capped at 1.4M to be safe)
+    if total_cu_limit > 0 {
+        let capped = total_cu_limit.min(1_400_000);
+        let mut data = vec![0x02];
+        data.extend_from_slice(&capped.to_le_bytes());
+        instructions.push(Instruction {
+            program_id: Pubkey::from_str(compute_budget_pid)?,
+            accounts: vec![],
+            data,
+        });
+    }
+
+    // Add SetComputeUnitPrice if present
+    if let Some(price_ix) = cu_price_ix {
+        instructions.push(price_ix);
     }
 
     // 2. Setup instructions for leg 1

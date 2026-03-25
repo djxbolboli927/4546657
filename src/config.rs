@@ -30,8 +30,8 @@ pub struct TradingConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct JitoConfig {
-    pub grpc_url: String,
-    pub auth_keypair: String,
+    pub url: String,
+    pub uuid: String,
     pub trading_keypair: String,
     pub tip_min_lamports: u64,
     pub tip_max_lamports: u64,
