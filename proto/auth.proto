@@ -2,24 +2,18 @@ syntax = "proto3";
 
 package auth;
 
-service AuthService {
-  rpc GenerateAuthChallenge(GenerateAuthChallengeRequest) returns (GenerateAuthChallengeResponse);
-  rpc GenerateAuthTokens(GenerateAuthTokensRequest) returns (GenerateAuthTokensResponse);
-  rpc RefreshAccessToken(RefreshAccessTokenRequest) returns (RefreshAccessTokenResponse);
-}
+import "google/protobuf/timestamp.proto";
 
-message Role {
-  enum RoleType {
-    SEARCHER = 0;
-    VALIDATOR = 1;
-    SHREDSTREAM_SUBSCRIBER = 2;
-    RELAYER = 3;
-  }
+enum Role {
+  RELAYER = 0;
+  SEARCHER = 1;
+  VALIDATOR = 2;
+  SHREDSTREAM_SUBSCRIBER = 3;
 }
 
 message GenerateAuthChallengeRequest {
-  Role.RoleType role = 1;
-  string pubkey = 2;
+  Role role = 1;
+  bytes pubkey = 2;
 }
 
 message GenerateAuthChallengeResponse {
@@ -28,8 +22,13 @@ message GenerateAuthChallengeResponse {
 
 message GenerateAuthTokensRequest {
   string challenge = 1;
-  string client_pubkey = 2;
+  bytes client_pubkey = 2;
   bytes signed_challenge = 3;
+}
+
+message Token {
+  string value = 1;
+  google.protobuf.Timestamp expires_at_utc = 2;
 }
 
 message GenerateAuthTokensResponse {
@@ -45,7 +44,8 @@ message RefreshAccessTokenResponse {
   Token access_token = 1;
 }
 
-message Token {
-  string value = 1;
-  int64 expires_at_utc = 2;
+service AuthService {
+  rpc GenerateAuthChallenge(GenerateAuthChallengeRequest) returns (GenerateAuthChallengeResponse) {}
+  rpc GenerateAuthTokens(GenerateAuthTokensRequest) returns (GenerateAuthTokensResponse) {}
+  rpc RefreshAccessToken(RefreshAccessTokenRequest) returns (RefreshAccessTokenResponse) {}
 }
