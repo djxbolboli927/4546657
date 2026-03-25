@@ -89,10 +89,10 @@ impl MetisClient {
 
     /// Get a quote from Metis.
     ///
-    /// Parameters per Jupiter/Metis docs:
+    /// Parameters:
     /// - slippageBps=0: zero slippage, tx reverts if exact amount not met
-    /// - onlyDirectRoutes=true: single-hop for speed
-    /// - maxAccounts=24: keep tx within 1232 byte limit
+    /// - onlyDirectRoutes=false: allow multi-hop for better routes
+    /// - maxAccounts=50: leave room for tip account in final tx
     /// - forJitoBundle=true: excludes Jito-incompatible DEXes
     /// - swapMode=ExactIn: exact input amount
     /// - restrictIntermediateTokens=false: allow all intermediate tokens
@@ -105,8 +105,8 @@ impl MetisClient {
         let url = format!(
             "{}/quote?inputMint={}&outputMint={}&amount={}\
              &slippageBps=0\
-             &onlyDirectRoutes=true\
-             &maxAccounts=24\
+             &onlyDirectRoutes=false\
+             &maxAccounts=50\
              &swapMode=ExactIn\
              &forJitoBundle=true\
              &restrictIntermediateTokens=false",
@@ -130,14 +130,54 @@ impl MetisClient {
         Ok(quote)
     }
 
-    /// Get swap instructions for a given quote.
+    /// Merge two quotes into a single circular quote via Route Concatenation.
     ///
-    /// Parameters per Jupiter docs:
-    /// - wrapAndUnwrapSol=false: WSOL ATA must already exist
-    /// - useSharedAccounts=true: use shared intermediate accounts
-    /// - dynamicComputeUnitLimit=true: Metis calculates optimal CU
-    /// - skipUserAccountsRpcCalls=true: skip RPC calls for speed
-    /// - asLegacyTransaction=false: use VersionedTransaction v0 with ALT support
+    /// Takes quote1 (WSOL→Token) and quote2 (Token→WSOL),
+    /// concatenates their routePlans, and produces a single combined quote
+    /// that represents the full circular path WSOL→Token→WSOL.
+    ///
+    /// The combined quote is then sent to /swap-instructions to get
+    /// a SINGLE route_v2 instruction that handles the entire circular arb.
+    pub fn merge_quotes(quote1: &QuoteResponse, quote2: &QuoteResponse) -> Result<QuoteResponse> {
+        // Concatenate routePlans: q1.routePlan + q2.routePlan
+        let route_plan1 = quote1
+            .route_plan
+            .as_array()
+            .context("quote1 routePlan is not an array")?;
+        let route_plan2 = quote2
+            .route_plan
+            .as_array()
+            .context("quote2 routePlan is not an array")?;
+
+        let mut combined_route_plan = route_plan1.clone();
+        combined_route_plan.extend(route_plan2.iter().cloned());
+
+        // Build merged quote:
+        // - inputMint, inAmount from quote1 (WSOL input)
+        // - outputMint, outAmount from quote2 (WSOL output)
+        // - routePlan = concatenated
+        // - otherAmountThreshold = quote2.outAmount (slippage=0)
+        Ok(QuoteResponse {
+            input_mint: quote1.input_mint.clone(),
+            in_amount: quote1.in_amount.clone(),
+            output_mint: quote2.output_mint.clone(),
+            out_amount: quote2.out_amount.clone(),
+            other_amount_threshold: quote2.out_amount.clone(),
+            swap_mode: quote1.swap_mode.clone(),
+            price_impact_pct: "0".to_string(),
+            route_plan: serde_json::Value::Array(combined_route_plan),
+            context_slot: quote2.context_slot,
+            extra: quote1.extra.clone(),
+        })
+    }
+
+    /// Get swap instructions for a merged circular quote.
+    ///
+    /// CRITICAL for circular arbitrage:
+    /// - useSharedAccounts=false (shared accounts cause memory conflicts in circular swaps)
+    /// - dynamicComputeUnitLimit=true (Metis calculates optimal CU via simulation)
+    /// - wrapAndUnwrapSol=false (WSOL ATA must pre-exist)
+    /// - asLegacyTransaction=false (v0 for ALT support)
     pub async fn get_swap_instructions(
         &self,
         user_pubkey: &str,
@@ -149,7 +189,7 @@ impl MetisClient {
             user_public_key: user_pubkey.to_string(),
             quote_response: quote_value,
             wrap_and_unwrap_sol: false,
-            use_shared_accounts: true,
+            use_shared_accounts: false,
             dynamic_compute_unit_limit: true,
             skip_user_accounts_rpc_calls: true,
             as_legacy_transaction: false,

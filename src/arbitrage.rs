@@ -12,12 +12,12 @@ use crate::transaction;
 
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 
-/// Represents a profitable arbitrage opportunity with quotes ready for execution.
+/// Represents a profitable circular arbitrage opportunity.
 struct Opportunity {
     token_mint: String,
     tip_lamports: u64,
-    quote_leg1: QuoteResponse,
-    quote_leg2: QuoteResponse,
+    /// Merged quote (route concatenation): WSOL→Token→WSOL in one route_v2.
+    merged_quote: QuoteResponse,
 }
 
 /// Scan ALL tokens at each amount step before moving to the next step.
@@ -26,10 +26,8 @@ struct Opportunity {
 ///   for amount in min..max step step:
 ///     for token in tokens:
 ///       quote WSOL→Token, Token→WSOL
+///       merge routePlans → single circular quote
 ///       if profitable → execute immediately
-///
-/// This ensures all tokens get tested at the same amount level,
-/// rather than exhausting all amounts for one token before moving on.
 pub async fn scan_all_tokens(
     metis: &MetisClient,
     token_mints: &[String],
@@ -45,7 +43,6 @@ pub async fn scan_all_tokens(
 
     let mut amount = min_lamports;
     while amount <= max_lamports {
-        // Test ALL tokens at this amount
         for token_mint in token_mints {
             // Leg 1: WSOL → Token
             let quote1 = match metis.get_quote(WSOL_MINT, token_mint, amount).await {
@@ -66,7 +63,6 @@ pub async fn scan_all_tokens(
 
             let output_wsol: u64 = quote2.out_amount.parse().unwrap_or(0);
 
-            // Check profitability
             if output_wsol <= amount {
                 continue;
             }
@@ -85,11 +81,19 @@ pub async fn scan_all_tokens(
 
             let net_profit = raw_profit - tip;
 
-            // Check Jito rate limit — drop if exceeded (no queue)
             if !jito_limiter.try_acquire() {
                 debug!(token = token_mint.as_str(), "jito rate limit hit, dropping");
                 continue;
             }
+
+            // Merge quotes via Route Concatenation → single route_v2
+            let merged_quote = match MetisClient::merge_quotes(&quote1, &quote2) {
+                Ok(q) => q,
+                Err(e) => {
+                    warn!(error = %e, token = token_mint.as_str(), "quote merge failed");
+                    continue;
+                }
+            };
 
             info!(
                 token = token_mint.as_str(),
@@ -103,8 +107,7 @@ pub async fn scan_all_tokens(
             let opp = Opportunity {
                 token_mint: token_mint.clone(),
                 tip_lamports: tip,
-                quote_leg1: quote1,
-                quote_leg2: quote2,
+                merged_quote,
             };
 
             match execute_opportunity(&opp, metis, jito, trading_keypair, rpc_client).await {
@@ -119,9 +122,7 @@ pub async fn scan_all_tokens(
                 Err(e) => {
                     warn!(
                         error = %e,
-                        chain = ?e.chain().skip(1).map(|c| c.to_string()).collect::<Vec<_>>(),
                         token = opp.token_mint.as_str(),
-                        input_lamports = amount,
                         "execution failed"
                     );
                 }
@@ -134,8 +135,11 @@ pub async fn scan_all_tokens(
     Ok(())
 }
 
-/// Execute an arbitrage opportunity using the already-obtained quotes.
-/// NO re-quote — uses the exact quotes from scanning for maximum speed.
+/// Execute a circular arbitrage opportunity.
+///
+/// Uses the merged quote (route concatenation) to get a SINGLE route_v2
+/// instruction from Metis, then builds a 3-instruction transaction:
+/// #1 SetComputeUnitLimit, #2 route_v2, #3 Jito tip
 async fn execute_opportunity(
     opp: &Opportunity,
     metis: &MetisClient,
@@ -145,35 +149,28 @@ async fn execute_opportunity(
 ) -> Result<String> {
     let user_pubkey = trading_keypair.pubkey().to_string();
 
-    // Get swap instructions for both legs using the SAME quotes (no re-quote)
-    let swap_ixs1 = metis
-        .get_swap_instructions(&user_pubkey, &opp.quote_leg1)
-        .await?;
-    let swap_ixs2 = metis
-        .get_swap_instructions(&user_pubkey, &opp.quote_leg2)
+    // Get swap instructions for the MERGED circular quote → single route_v2
+    let swap_ixs = metis
+        .get_swap_instructions(&user_pubkey, &opp.merged_quote)
         .await?;
 
-    // Get recent blockhash
     let recent_blockhash = rpc_client.get_latest_blockhash()?;
 
-    // Build the versioned transaction (both swaps + Jito tip in one tx)
+    // Build 3-instruction tx: CU limit + route_v2 + Jito tip
     let tx = transaction::build_arb_transaction(
-        &swap_ixs1,
-        &swap_ixs2,
+        &swap_ixs,
         trading_keypair,
         opp.tip_lamports,
         recent_blockhash,
         rpc_client,
     )?;
 
-    // Check transaction size (max 1232 bytes for Solana)
+    // Verify transaction size (max 1232 bytes for Solana MTU)
     let tx_bytes = bincode::serialize(&tx)?;
     if tx_bytes.len() > 1232 {
         anyhow::bail!("tx too large: {} bytes", tx_bytes.len());
     }
 
-    // Send bundle to Jito
     let uuid = jito.send_bundle(&tx).await?;
-
     Ok(uuid)
 }

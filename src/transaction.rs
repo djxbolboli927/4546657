@@ -20,9 +20,9 @@ use crate::metis::{InstructionData, SwapInstructionsResponse};
 /// Per Jito docs: do NOT use ALTs for tip accounts.
 const JITO_TIP_ACCOUNTS: &[&str] = &[
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
-    "HFqU5x63VTqvB8eLJVLaAhAroXkpBNa8bSE63Tk7LYnV",
+    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
     "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
-    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1qqRo4ppQpa",
+    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
     "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
     "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
     "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
@@ -68,26 +68,20 @@ pub fn calculate_tip(
     dynamic_tip.max(tip_min).min(tip_max)
 }
 
-/// Build a versioned transaction containing both swap legs and a Jito tip.
+/// Build a versioned transaction with exactly 3 instructions:
 ///
-/// Instruction order (all in one tx, one bundle):
-/// 1. ComputeBudgetInstruction::SetComputeUnitLimit (from Metis dynamicComputeUnitLimit)
-/// 2. Setup instructions for leg 1
-/// 3. route_v2 swap instruction leg 1 (WSOL → Token)
-/// 4. Cleanup for leg 1 (if any)
-/// 5. Setup instructions for leg 2
-/// 6. route_v2 swap instruction leg 2 (Token → WSOL)
-/// 7. Cleanup for leg 2 (if any)
-/// 8. SystemProgram::Transfer — Jito tip (MUST be last instruction)
+/// #1 - Compute Budget: SetComputeUnitLimit (from Metis dynamicComputeUnitLimit)
+/// #2 - Jupiter Aggregator V6: route_v2 (single instruction for entire circular arb)
+/// #3 - System Program: Transfer (Jito tip, MUST be last)
 ///
-/// Notes per Jito docs:
-/// - For bundles, only Jito tip matters (no priority fee needed)
-/// - Tip account must NOT be in ALT (use direct pubkey)
-/// - Uses VersionedTransaction v0 for ALT support on swap instructions
-/// - Jupiter Aggregator v6: anchor Self CPI Log verifies slippage=0 execution
+/// The merged route_v2 handles all swap hops internally (e.g. WSOL→USDC→hyUSD→WSOL).
+/// Setup/cleanup instructions are NOT needed because:
+/// - useSharedAccounts=false in circular arb mode
+/// - WSOL ATA pre-exists (verified at startup)
+///
+/// Tip account is NEVER placed in ALT — Jito requires direct write-lock visibility.
 pub fn build_arb_transaction(
-    swap_leg1: &SwapInstructionsResponse,
-    swap_leg2: &SwapInstructionsResponse,
+    swap_ixs: &SwapInstructionsResponse,
     payer: &Keypair,
     tip_lamports: u64,
     recent_blockhash: Hash,
@@ -95,91 +89,15 @@ pub fn build_arb_transaction(
 ) -> Result<VersionedTransaction> {
     let mut instructions: Vec<Instruction> = Vec::new();
 
-    // 1. Compute budget instructions — merge from both legs, avoid duplicates.
-    // ComputeBudget program ID: ComputeBudget111111111111111111111111111111
-    // Instruction discriminators: 0x02 = SetComputeUnitLimit, 0x03 = SetComputeUnitPrice
-    // We sum CU limits from both legs and keep only one of each type.
-    let compute_budget_pid = "ComputeBudget111111111111111111111111111111";
-    let mut total_cu_limit: u32 = 0;
-    let mut has_cu_price = false;
-    let mut cu_price_ix: Option<Instruction> = None;
-
-    for cb_ix in swap_leg1
-        .compute_budget_instructions
-        .iter()
-        .chain(swap_leg2.compute_budget_instructions.iter())
-    {
-        let ix = to_sdk_instruction(cb_ix)?;
-        if cb_ix.program_id == compute_budget_pid && !ix.data.is_empty() {
-            match ix.data[0] {
-                0x02 => {
-                    // SetComputeUnitLimit — sum from both legs
-                    if ix.data.len() >= 5 {
-                        let cu = u32::from_le_bytes([ix.data[1], ix.data[2], ix.data[3], ix.data[4]]);
-                        total_cu_limit = total_cu_limit.saturating_add(cu);
-                    }
-                }
-                0x03 => {
-                    // SetComputeUnitPrice — keep only one (first seen)
-                    if !has_cu_price {
-                        cu_price_ix = Some(ix);
-                        has_cu_price = true;
-                    }
-                }
-                _ => {
-                    instructions.push(ix);
-                }
-            }
-        } else {
-            instructions.push(ix);
-        }
+    // #1 — Compute budget (SetComputeUnitLimit from Metis simulation)
+    for cb_ix in &swap_ixs.compute_budget_instructions {
+        instructions.push(to_sdk_instruction(cb_ix)?);
     }
 
-    // Add combined SetComputeUnitLimit (capped at 1.4M to be safe)
-    if total_cu_limit > 0 {
-        let capped = total_cu_limit.min(1_400_000);
-        let mut data = vec![0x02];
-        data.extend_from_slice(&capped.to_le_bytes());
-        instructions.push(Instruction {
-            program_id: Pubkey::from_str(compute_budget_pid)?,
-            accounts: vec![],
-            data,
-        });
-    }
+    // #2 — Single route_v2 for the entire circular swap
+    instructions.push(to_sdk_instruction(&swap_ixs.swap_instruction)?);
 
-    // Add SetComputeUnitPrice if present
-    if let Some(price_ix) = cu_price_ix {
-        instructions.push(price_ix);
-    }
-
-    // 2. Setup instructions for leg 1
-    for setup_ix in &swap_leg1.setup_instructions {
-        instructions.push(to_sdk_instruction(setup_ix)?);
-    }
-
-    // 3. route_v2 swap leg 1 (WSOL → Token)
-    instructions.push(to_sdk_instruction(&swap_leg1.swap_instruction)?);
-
-    // 4. Cleanup for leg 1
-    if let Some(ref cleanup) = swap_leg1.cleanup_instruction {
-        instructions.push(to_sdk_instruction(cleanup)?);
-    }
-
-    // 5. Setup instructions for leg 2
-    for setup_ix in &swap_leg2.setup_instructions {
-        instructions.push(to_sdk_instruction(setup_ix)?);
-    }
-
-    // 6. route_v2 swap leg 2 (Token → WSOL)
-    instructions.push(to_sdk_instruction(&swap_leg2.swap_instruction)?);
-
-    // 7. Cleanup for leg 2
-    if let Some(ref cleanup) = swap_leg2.cleanup_instruction {
-        instructions.push(to_sdk_instruction(cleanup)?);
-    }
-
-    // 8. Jito tip — MUST be last instruction
-    // Per Jito docs: don't put tip account in ALT, use direct pubkey
+    // #3 — Jito tip (MUST be last instruction, MUST NOT be in ALT)
     let tip_account = {
         let mut rng = rand::thread_rng();
         let addr = JITO_TIP_ACCOUNTS.choose(&mut rng).unwrap();
@@ -192,34 +110,41 @@ pub fn build_arb_transaction(
         tip_lamports,
     ));
 
-    // Collect all ALT addresses from both swap legs (NOT for tip accounts)
-    let mut alt_addresses: Vec<Pubkey> = Vec::new();
-    for addr in swap_leg1
-        .address_lookup_table_addresses
+    // Collect Jito tip account pubkeys to exclude from ALT resolution
+    let tip_pubkeys: Vec<Pubkey> = JITO_TIP_ACCOUNTS
         .iter()
-        .chain(swap_leg2.address_lookup_table_addresses.iter())
-    {
+        .filter_map(|a| Pubkey::from_str(a).ok())
+        .collect();
+
+    // Fetch ALTs from Metis response
+    let mut alt_addresses: Vec<Pubkey> = Vec::new();
+    for addr in &swap_ixs.address_lookup_table_addresses {
         let pubkey = Pubkey::from_str(addr)?;
         if !alt_addresses.contains(&pubkey) {
             alt_addresses.push(pubkey);
         }
     }
 
-    // Fetch ALT accounts from RPC
     let mut address_lookup_tables: Vec<AddressLookupTableAccount> = Vec::new();
     for alt_pubkey in &alt_addresses {
         let raw_account = rpc_client
             .get_account(alt_pubkey)
             .with_context(|| format!("failed to fetch ALT {}", alt_pubkey))?;
 
+        let mut addresses = deserialize_alt_addresses(&raw_account.data)?;
+
+        // Remove Jito tip accounts from ALT entries to prevent them
+        // being compressed into ALT references (Jito needs direct write-lock)
+        addresses.retain(|addr| !tip_pubkeys.contains(addr));
+
         let alt_account = AddressLookupTableAccount {
             key: *alt_pubkey,
-            addresses: deserialize_alt_addresses(&raw_account.data)?,
+            addresses,
         };
         address_lookup_tables.push(alt_account);
     }
 
-    // Build VersionedTransaction v0 (required for ALT support)
+    // Build VersionedTransaction v0
     let message = v0::Message::try_compile(
         &payer.pubkey(),
         &instructions,
@@ -237,7 +162,6 @@ pub fn build_arb_transaction(
 
 /// Deserialize the addresses stored in an Address Lookup Table account.
 fn deserialize_alt_addresses(data: &[u8]) -> Result<Vec<Pubkey>> {
-    // ALT layout: 56-byte header followed by 32-byte pubkey entries.
     const HEADER_SIZE: usize = 56;
     if data.len() < HEADER_SIZE {
         anyhow::bail!("ALT account data too short: {} bytes", data.len());
