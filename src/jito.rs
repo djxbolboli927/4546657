@@ -139,11 +139,26 @@ impl JitoClient {
             .send_bundle(SendBundleRequest {
                 bundle: Some(bundle),
             })
-            .await
-            .context("send_bundle gRPC failed")?;
+            .await;
 
-        let uuid = resp.into_inner().uuid;
-        Ok(uuid)
+        match resp {
+            Ok(r) => {
+                let uuid = r.into_inner().uuid;
+                Ok(uuid)
+            }
+            Err(status) => {
+                warn!(
+                    code = %status.code(),
+                    message = %status.message(),
+                    "send_bundle gRPC error"
+                );
+                anyhow::bail!(
+                    "send_bundle gRPC failed: code={}, message={}",
+                    status.code(),
+                    status.message()
+                )
+            }
+        }
     }
 }
 

@@ -13,25 +13,26 @@ use crate::transaction;
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 
 /// Represents a profitable arbitrage opportunity with quotes ready for execution.
-pub struct Opportunity {
+struct Opportunity {
     token_mint: String,
-    #[allow(dead_code)]
-    input_lamports: u64,
-    #[allow(dead_code)]
-    profit_lamports: u64,
     tip_lamports: u64,
-    pub quote_leg1: QuoteResponse,
-    pub quote_leg2: QuoteResponse,
+    quote_leg1: QuoteResponse,
+    quote_leg2: QuoteResponse,
 }
 
-/// Scan a single token across stepped amounts and execute immediately when profitable.
+/// Scan ALL tokens at each amount step before moving to the next step.
 ///
-/// Key design: NO re-quote. When a profitable pair of quotes is found,
-/// swap instructions are fetched and the bundle is sent immediately.
-/// Speed is everything — quotes go stale in milliseconds.
-pub async fn scan_and_execute(
+/// Loop order:
+///   for amount in min..max step step:
+///     for token in tokens:
+///       quote WSOL→Token, Token→WSOL
+///       if profitable → execute immediately
+///
+/// This ensures all tokens get tested at the same amount level,
+/// rather than exhausting all amounts for one token before moving on.
+pub async fn scan_all_tokens(
     metis: &MetisClient,
-    token_mint: &str,
+    token_mints: &[String],
     config: &Config,
     jito: &mut JitoClient,
     trading_keypair: &Keypair,
@@ -44,38 +45,32 @@ pub async fn scan_and_execute(
 
     let mut amount = min_lamports;
     while amount <= max_lamports {
-        // Leg 1: WSOL → Token
-        let quote1 = match metis.get_quote(WSOL_MINT, token_mint, amount).await {
-            Ok(q) => q,
-            Err(e) => {
-                debug!(token = token_mint, amount, error = %e, "leg1 quote failed");
-                amount += step_lamports;
+        // Test ALL tokens at this amount
+        for token_mint in token_mints {
+            // Leg 1: WSOL → Token
+            let quote1 = match metis.get_quote(WSOL_MINT, token_mint, amount).await {
+                Ok(q) => q,
+                Err(_) => continue,
+            };
+
+            let token_amount: u64 = match quote1.out_amount.parse() {
+                Ok(v) if v > 0 => v,
+                _ => continue,
+            };
+
+            // Leg 2: Token → WSOL
+            let quote2 = match metis.get_quote(token_mint, WSOL_MINT, token_amount).await {
+                Ok(q) => q,
+                Err(_) => continue,
+            };
+
+            let output_wsol: u64 = quote2.out_amount.parse().unwrap_or(0);
+
+            // Check profitability
+            if output_wsol <= amount {
                 continue;
             }
-        };
 
-        let token_amount: u64 = match quote1.out_amount.parse() {
-            Ok(v) if v > 0 => v,
-            _ => {
-                amount += step_lamports;
-                continue;
-            }
-        };
-
-        // Leg 2: Token → WSOL
-        let quote2 = match metis.get_quote(token_mint, WSOL_MINT, token_amount).await {
-            Ok(q) => q,
-            Err(e) => {
-                debug!(token = token_mint, amount, error = %e, "leg2 quote failed");
-                amount += step_lamports;
-                continue;
-            }
-        };
-
-        let output_wsol: u64 = quote2.out_amount.parse().unwrap_or(0);
-
-        // Check profitability: output must exceed input + min_profit
-        if output_wsol > amount {
             let raw_profit = output_wsol - amount;
             let tip = transaction::calculate_tip(
                 raw_profit,
@@ -84,47 +79,51 @@ pub async fn scan_and_execute(
                 config.jito.tip_max_lamports,
             );
 
-            // Net profit after tip must exceed minimum
-            if raw_profit > tip + config.trading.min_profit_lamports {
-                let net_profit = raw_profit - tip;
+            if raw_profit <= tip + config.trading.min_profit_lamports {
+                continue;
+            }
 
-                // Check Jito rate limit — if exceeded, DROP immediately (no queue)
-                if !jito_limiter.try_acquire() {
-                    warn!(
-                        token = token_mint,
+            let net_profit = raw_profit - tip;
+
+            // Check Jito rate limit — drop if exceeded (no queue)
+            if !jito_limiter.try_acquire() {
+                debug!(token = token_mint.as_str(), "jito rate limit hit, dropping");
+                continue;
+            }
+
+            info!(
+                token = token_mint.as_str(),
+                input_sol = amount as f64 / LAMPORTS_PER_SOL,
+                output_sol = output_wsol as f64 / LAMPORTS_PER_SOL,
+                profit_lamports = net_profit,
+                tip_lamports = tip,
+                "PROFITABLE — executing"
+            );
+
+            let opp = Opportunity {
+                token_mint: token_mint.clone(),
+                tip_lamports: tip,
+                quote_leg1: quote1,
+                quote_leg2: quote2,
+            };
+
+            match execute_opportunity(&opp, metis, jito, trading_keypair, rpc_client).await {
+                Ok(uuid) => {
+                    info!(
+                        uuid = %uuid,
+                        token = opp.token_mint.as_str(),
                         profit = net_profit,
-                        "jito rate limit hit, dropping opportunity"
+                        "bundle sent to Jito"
                     );
-                    amount += step_lamports;
-                    continue;
                 }
-
-                info!(
-                    token = token_mint,
-                    input_sol = amount as f64 / LAMPORTS_PER_SOL,
-                    output_sol = output_wsol as f64 / LAMPORTS_PER_SOL,
-                    profit_lamports = net_profit,
-                    tip_lamports = tip,
-                    "PROFITABLE — executing immediately"
-                );
-
-                let opp = Opportunity {
-                    token_mint: token_mint.to_string(),
-                    input_lamports: amount,
-                    profit_lamports: net_profit,
-                    tip_lamports: tip,
-                    quote_leg1: quote1,
-                    quote_leg2: quote2,
-                };
-
-                // Execute immediately — no re-quote, speed is critical
-                match execute_opportunity(&opp, metis, jito, trading_keypair, rpc_client).await {
-                    Ok(uuid) => {
-                        info!(uuid = %uuid, token = token_mint, profit = net_profit, "bundle sent");
-                    }
-                    Err(e) => {
-                        warn!(error = %e, token = token_mint, "execution failed");
-                    }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        chain = ?e.chain().skip(1).map(|c| c.to_string()).collect::<Vec<_>>(),
+                        token = opp.token_mint.as_str(),
+                        input_lamports = amount,
+                        "execution failed"
+                    );
                 }
             }
         }
@@ -170,19 +169,10 @@ async fn execute_opportunity(
     // Check transaction size (max 1232 bytes for Solana)
     let tx_bytes = bincode::serialize(&tx)?;
     if tx_bytes.len() > 1232 {
-        anyhow::bail!(
-            "tx too large: {} bytes (max 1232)",
-            tx_bytes.len()
-        );
+        anyhow::bail!("tx too large: {} bytes", tx_bytes.len());
     }
 
-    debug!(
-        tx_size = tx_bytes.len(),
-        tip = opp.tip_lamports,
-        "sending bundle"
-    );
-
-    // Send bundle to Jito — no waiting, fire and forget for speed
+    // Send bundle to Jito
     let uuid = jito.send_bundle(&tx).await?;
 
     Ok(uuid)

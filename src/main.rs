@@ -17,11 +17,15 @@ use rate_limiter::RateLimiter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
+    // Initialize logging — filter out noisy hyper/reqwest debug logs
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new(
+                        "info,hyper_util=warn,hyper=warn,reqwest=warn,h2=warn,tonic=warn"
+                    )
+                }),
         )
         .init();
 
@@ -62,7 +66,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Create Metis client (local self-hosted at 127.0.0.1:18080)
+    // Create Metis client
     let metis = metis::MetisClient::new(&config.metis.url, config.performance.quote_timeout_ms);
 
     // Connect to Jito gRPC with whitelisted auth keypair
@@ -72,7 +76,7 @@ async fn main() -> Result<()> {
     // Jito rate limiter: max N bundles per second, drop if exceeded (no queue)
     let mut jito_limiter = RateLimiter::new(config.jito.max_bundles_per_second);
 
-    // Main loop — continuous scanning
+    // Main loop — scan ALL tokens at each amount step
     info!(
         tokens = token_mints.len(),
         min_sol = config.trading.min_amount_sol,
@@ -82,20 +86,18 @@ async fn main() -> Result<()> {
     );
 
     loop {
-        for token_mint in &token_mints {
-            if let Err(e) = arbitrage::scan_and_execute(
-                &metis,
-                token_mint,
-                &config,
-                &mut jito_client,
-                &trading_keypair,
-                &rpc_client,
-                &mut jito_limiter,
-            )
-            .await
-            {
-                error!(token = token_mint.as_str(), error = %e, "scan error");
-            }
+        if let Err(e) = arbitrage::scan_all_tokens(
+            &metis,
+            &token_mints,
+            &config,
+            &mut jito_client,
+            &trading_keypair,
+            &rpc_client,
+            &mut jito_limiter,
+        )
+        .await
+        {
+            error!(error = %e, "scan cycle error");
         }
     }
 }
