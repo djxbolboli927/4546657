@@ -65,15 +65,15 @@ impl JitoClient {
         })
     }
 
-    /// Authenticate per official Jito proto:
+    /// Authenticate per official Jito searcher-examples/token_authenticator.rs:
     /// 1. Send pubkey as raw 32 bytes + Role::Searcher
-    /// 2. Sign: the challenge is signed with the private key
-    ///    The signed message is: pubkey_bytes + challenge_bytes
-    /// 3. Send signed_challenge as 64-byte signature
+    /// 2. Format challenge as "{pubkey_base58}-{server_challenge}"
+    /// 3. Sign the formatted challenge string
+    /// 4. Send formatted challenge + signature + raw pubkey bytes
     async fn authenticate(channel: &Channel, keypair: &Keypair) -> Result<String> {
         let mut auth_client = AuthServiceClient::new(channel.clone());
 
-        let pubkey_bytes = keypair.pubkey().to_bytes().to_vec();
+        let pubkey_bytes = keypair.pubkey().as_ref().to_vec();
 
         // Step 1: Request challenge — pubkey as raw 32 bytes, role = SEARCHER (1)
         let challenge_resp = auth_client
@@ -84,21 +84,21 @@ impl JitoClient {
             .await
             .context("auth challenge request failed")?;
 
-        let challenge = challenge_resp.into_inner().challenge;
+        let server_challenge = challenge_resp.into_inner().challenge;
 
-        // Step 2: Sign: prepend pubkey to challenge, then sign
-        // Per Jito proto docs: "sign(pubkey, challenge)"
-        let mut sign_data = Vec::with_capacity(32 + challenge.len());
-        sign_data.extend_from_slice(&pubkey_bytes);
-        sign_data.extend_from_slice(challenge.as_bytes());
-        let signature = keypair.sign_message(&sign_data);
+        // Step 2: Format challenge as "pubkey_base58-server_challenge"
+        // This is the EXACT format from jito-labs/searcher-examples token_authenticator.rs
+        let challenge = format!("{}-{}", keypair.pubkey(), server_challenge);
 
-        // Step 3: Send signed challenge — client_pubkey as raw 32 bytes
+        // Step 3: Sign the formatted challenge string
+        let signed_challenge = keypair.sign_message(challenge.as_bytes()).as_ref().to_vec();
+
+        // Step 4: Send formatted challenge (not raw server challenge!) + signature
         let tokens_resp = auth_client
             .generate_auth_tokens(GenerateAuthTokensRequest {
                 challenge,
                 client_pubkey: pubkey_bytes,
-                signed_challenge: signature.as_ref().to_vec(),
+                signed_challenge,
             })
             .await
             .context("auth tokens request failed")?;
