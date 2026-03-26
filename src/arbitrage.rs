@@ -14,7 +14,7 @@ const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 
 /// Base network fee: 5000 lamports (0.000005 SOL) per signature.
 /// This is the minimum Solana charges regardless of Jito tip.
-const BASE_NETWORK_FEE: u64 = 5_000;
+const BASE_NETWORK_FEE: u64 = 10_000;
 
 /// Represents a profitable circular arbitrage opportunity.
 struct Opportunity {
