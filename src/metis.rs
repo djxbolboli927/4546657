@@ -175,7 +175,7 @@ impl MetisClient {
     ///
     /// CRITICAL for circular arbitrage:
     /// - useSharedAccounts=false (shared accounts cause memory conflicts in circular swaps)
-    /// - dynamicComputeUnitLimit=true (Metis calculates optimal CU via simulation)
+    /// - dynamicComputeUnitLimit=false (avoid extra RPC simulation call by Metis — we set CU manually)
     /// - wrapAndUnwrapSol=false (WSOL ATA must pre-exist)
     /// - asLegacyTransaction=false (v0 for ALT support)
     pub async fn get_swap_instructions(
@@ -190,7 +190,7 @@ impl MetisClient {
             quote_response: quote_value,
             wrap_and_unwrap_sol: false,
             use_shared_accounts: false,
-            dynamic_compute_unit_limit: true,
+            dynamic_compute_unit_limit: false,
             skip_user_accounts_rpc_calls: true,
             as_legacy_transaction: false,
         };

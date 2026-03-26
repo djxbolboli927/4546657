@@ -61,6 +61,9 @@ pub struct YellowstoneGrpcConfig {
 pub struct PerformanceConfig {
     pub threads: usize,
     pub quote_timeout_ms: u64,
+    /// CU limits per hop count: index 0 = 2 hops, index 1 = 3 hops, etc.
+    /// If hops exceed the array, the last value is used.
+    pub cu_limits: Vec<u32>,
 }
 
 impl Config {

@@ -37,3 +37,6 @@ x_token = "41cd21e6-6a66-493d-bdc6-a7057409c2a1"
 [performance]
 threads = 4
 quote_timeout_ms = 500
+# CU limit بر اساس تعداد هاپ: [2 hops, 3 hops, 4 hops, ...]
+# اگه تعداد هاپ بیشتر از طول آرایه بشه، آخرین مقدار استفاده میشه
+cu_limits = [149000, 169000, 189000, 209000, 229000]
