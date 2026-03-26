@@ -128,6 +128,12 @@ pub async fn scan_all_tokens(
                 .map(|a| a.len())
                 .unwrap_or(2);
             let cu_limit = lookup_cu_limit(hop_count, &config.performance.cu_limits);
+            debug!(
+                token = token_mint.as_str(),
+                hops = hop_count,
+                cu_limit = cu_limit,
+                "CU limit selected"
+            );
 
             match execute_opportunity(
                 &opp,
