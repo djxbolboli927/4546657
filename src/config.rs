@@ -25,6 +25,8 @@ pub struct TradingConfig {
     pub max_amount_sol: f64,
     pub step_sol: f64,
     pub min_profit_lamports: u64,
+    /// Base Solana network fee in lamports (e.g. 10000 = 0.00001 SOL).
+    pub base_fee_lamports: u64,
     pub tokens_file: String,
 }
 
@@ -40,9 +42,12 @@ pub struct JitoConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
 pub struct RpcConfig {
     pub url: String,
+    /// RPC for tx simulation before sending to Jito (e.g. eRPC).
+    /// If empty, simulation is skipped.
+    #[serde(default)]
+    pub simulation_url: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]

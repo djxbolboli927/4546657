@@ -41,8 +41,18 @@ async fn main() -> Result<()> {
         "keypair loaded"
     );
 
-    // Create RPC client
+    // Create main RPC client (for blockhash, ALT fetch)
     let rpc_client = Arc::new(RpcClient::new(config.rpc.url.clone()));
+
+    // Create simulation RPC client (eRPC — for simulateTransaction before Jito)
+    let sim_rpc_client = if !config.rpc.simulation_url.is_empty() {
+        let client = Arc::new(RpcClient::new(config.rpc.simulation_url.clone()));
+        info!(url = config.rpc.simulation_url.as_str(), "simulation RPC enabled");
+        Some(client)
+    } else {
+        info!("simulation RPC disabled (no simulation_url)");
+        None
+    };
 
     // Verify WSOL ATA exists (required because wrapAndUnwrapSol=false)
     let wsol_mint = solana_sdk::pubkey::Pubkey::from_str_const(tokens::WSOL_MINT);
@@ -76,6 +86,7 @@ async fn main() -> Result<()> {
         min_sol = config.trading.min_amount_sol,
         max_sol = config.trading.max_amount_sol,
         step = config.trading.step_sol,
+        base_fee = config.trading.base_fee_lamports,
         "starting arbitrage scanner"
     );
 
@@ -87,6 +98,7 @@ async fn main() -> Result<()> {
             &jito_client,
             &trading_keypair,
             &rpc_client,
+            sim_rpc_client.as_deref(),
             &mut jito_limiter,
         )
         .await

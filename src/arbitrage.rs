@@ -1,6 +1,6 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::{signature::Keypair, signer::Signer};
+use solana_sdk::{signature::Keypair, signer::Signer, transaction::VersionedTransaction};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
@@ -12,26 +12,15 @@ use crate::transaction;
 
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 
-/// Base network fee: 5000 lamports (0.000005 SOL) per signature.
-/// This is the minimum Solana charges regardless of Jito tip.
-const BASE_NETWORK_FEE: u64 = 10_000;
-
 /// Represents a profitable circular arbitrage opportunity.
 struct Opportunity {
     token_mint: String,
     tip_lamports: u64,
-    /// Merged quote (route concatenation): WSOL→Token→WSOL in one route_v2.
+    /// Merged quote (route concatenation): WSOL→Token→WSOL in one route.
     merged_quote: QuoteResponse,
 }
 
 /// Scan ALL tokens at each amount step before moving to the next step.
-///
-/// Loop order:
-///   for amount in min..max step step:
-///     for token in tokens:
-///       quote WSOL→Token, Token→WSOL
-///       merge routePlans → single circular quote
-///       if profitable → execute immediately
 pub async fn scan_all_tokens(
     metis: &MetisClient,
     token_mints: &[String],
@@ -39,11 +28,13 @@ pub async fn scan_all_tokens(
     jito: &JitoClient,
     trading_keypair: &Keypair,
     rpc_client: &RpcClient,
+    sim_rpc_client: Option<&RpcClient>,
     jito_limiter: &mut RateLimiter,
 ) -> Result<()> {
     let min_lamports = (config.trading.min_amount_sol * LAMPORTS_PER_SOL) as u64;
     let max_lamports = (config.trading.max_amount_sol * LAMPORTS_PER_SOL) as u64;
     let step_lamports = (config.trading.step_sol * LAMPORTS_PER_SOL) as u64;
+    let base_fee = config.trading.base_fee_lamports;
 
     let mut amount = min_lamports;
     while amount <= max_lamports {
@@ -79,8 +70,8 @@ pub async fn scan_all_tokens(
                 config.jito.tip_max_lamports,
             );
 
-            // Total costs = Jito tip + base network fee (5000 lamports)
-            let total_costs = tip + BASE_NETWORK_FEE;
+            // Total costs = Jito tip + base network fee (from config)
+            let total_costs = tip + base_fee;
 
             if raw_profit <= total_costs + config.trading.min_profit_lamports {
                 continue;
@@ -93,7 +84,7 @@ pub async fn scan_all_tokens(
                 continue;
             }
 
-            // Merge quotes via Route Concatenation → single route_v2
+            // Merge quotes via Route Concatenation → single route instruction
             let merged_quote = match MetisClient::merge_quotes(&quote1, &quote2) {
                 Ok(q) => q,
                 Err(e) => {
@@ -117,7 +108,16 @@ pub async fn scan_all_tokens(
                 merged_quote,
             };
 
-            match execute_opportunity(&opp, metis, jito, trading_keypair, rpc_client).await {
+            match execute_opportunity(
+                &opp,
+                metis,
+                jito,
+                trading_keypair,
+                rpc_client,
+                sim_rpc_client,
+            )
+            .await
+            {
                 Ok(uuid) => {
                     info!(
                         uuid = %uuid,
@@ -142,28 +142,43 @@ pub async fn scan_all_tokens(
     Ok(())
 }
 
+/// Simulate a transaction via RPC before sending to Jito.
+/// Returns Ok(()) if simulation succeeds, Err if it fails.
+fn simulate_transaction(
+    sim_rpc: &RpcClient,
+    tx: &VersionedTransaction,
+) -> Result<()> {
+    let result = sim_rpc.simulate_transaction(tx)
+        .context("simulation RPC call failed")?;
+
+    if let Some(err) = result.value.err {
+        anyhow::bail!("simulation failed: {:?}", err);
+    }
+
+    Ok(())
+}
+
 /// Execute a circular arbitrage opportunity.
 ///
-/// Uses the merged quote (route concatenation) to get a SINGLE route_v2
-/// instruction from Metis, then builds a 3-instruction transaction:
-/// #1 SetComputeUnitLimit, #2 route_v2, #3 Jito tip
+/// Flow: merge quote → swap-instructions → build tx → simulate → send to Jito
 async fn execute_opportunity(
     opp: &Opportunity,
     metis: &MetisClient,
     jito: &JitoClient,
     trading_keypair: &Keypair,
     rpc_client: &RpcClient,
+    sim_rpc_client: Option<&RpcClient>,
 ) -> Result<String> {
     let user_pubkey = trading_keypair.pubkey().to_string();
 
-    // Get swap instructions for the MERGED circular quote → single route_v2
+    // Get swap instructions for the MERGED circular quote → single route instruction
     let swap_ixs = metis
         .get_swap_instructions(&user_pubkey, &opp.merged_quote)
         .await?;
 
     let recent_blockhash = rpc_client.get_latest_blockhash()?;
 
-    // Build 3-instruction tx: CU limit + route_v2 + Jito tip
+    // Build 3-instruction tx: CU limit + route + Jito tip
     let tx = transaction::build_arb_transaction(
         &swap_ixs,
         trading_keypair,
@@ -176,6 +191,12 @@ async fn execute_opportunity(
     let tx_bytes = bincode::serialize(&tx)?;
     if tx_bytes.len() > 1232 {
         anyhow::bail!("tx too large: {} bytes", tx_bytes.len());
+    }
+
+    // Simulate via eRPC before wasting a Jito rate limit slot
+    if let Some(sim_rpc) = sim_rpc_client {
+        simulate_transaction(sim_rpc, &tx)?;
+        debug!("simulation passed");
     }
 
     let uuid = jito.send_bundle(&tx).await?;
