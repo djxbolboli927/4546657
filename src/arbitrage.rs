@@ -12,6 +12,18 @@ use crate::transaction;
 
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 
+/// Look up CU limit from config based on hop count.
+/// Index 0 = 2 hops, index 1 = 3 hops, etc.
+/// If hops exceed the array length, the last value is used.
+fn lookup_cu_limit(hop_count: usize, cu_limits: &[u32]) -> u32 {
+    if cu_limits.is_empty() {
+        return 200_000; // safe default
+    }
+    let index = hop_count.saturating_sub(2);
+    let clamped = index.min(cu_limits.len() - 1);
+    cu_limits[clamped]
+}
+
 /// Represents a profitable circular arbitrage opportunity.
 struct Opportunity {
     token_mint: String,
@@ -108,6 +120,15 @@ pub async fn scan_all_tokens(
                 merged_quote,
             };
 
+            // Count hops from merged routePlan and look up CU limit
+            let hop_count = opp
+                .merged_quote
+                .route_plan
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(2);
+            let cu_limit = lookup_cu_limit(hop_count, &config.performance.cu_limits);
+
             match execute_opportunity(
                 &opp,
                 metis,
@@ -115,6 +136,7 @@ pub async fn scan_all_tokens(
                 trading_keypair,
                 rpc_client,
                 sim_rpc_client,
+                cu_limit,
             )
             .await
             {
@@ -168,6 +190,7 @@ async fn execute_opportunity(
     trading_keypair: &Keypair,
     rpc_client: &RpcClient,
     sim_rpc_client: Option<&RpcClient>,
+    cu_limit: u32,
 ) -> Result<String> {
     let user_pubkey = trading_keypair.pubkey().to_string();
 
@@ -178,11 +201,12 @@ async fn execute_opportunity(
 
     let recent_blockhash = rpc_client.get_latest_blockhash()?;
 
-    // Build 3-instruction tx: CU limit + route + Jito tip
+    // Build 3-instruction tx: CU limit (manual) + route + Jito tip
     let tx = transaction::build_arb_transaction(
         &swap_ixs,
         trading_keypair,
         opp.tip_lamports,
+        cu_limit,
         recent_blockhash,
         rpc_client,
     )?;

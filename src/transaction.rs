@@ -70,37 +70,42 @@ pub fn calculate_tip(
 
 /// Build a versioned transaction with exactly 3 instructions:
 ///
-/// #1 - Compute Budget: SetComputeUnitLimit (from Metis dynamicComputeUnitLimit)
-/// #2 - Jupiter Aggregator V6: route_v2 (single instruction for entire circular arb)
+/// #1 - Compute Budget: SetComputeUnitLimit (manual, based on hop count from config)
+/// #2 - Jupiter Aggregator V6: route/route_v2 (single instruction for entire circular arb)
 /// #3 - System Program: Transfer (Jito tip, MUST be last)
 ///
-/// The merged route_v2 handles all swap hops internally (e.g. WSOL→USDC→hyUSD→WSOL).
+/// The merged route handles all swap hops internally (e.g. WSOL→USDC→hyUSD→WSOL).
 /// Setup/cleanup instructions are NOT needed because:
 /// - useSharedAccounts=false in circular arb mode
 /// - WSOL ATA pre-exists (verified at startup)
+///
+/// CU limit is set manually (not via Metis dynamicComputeUnitLimit) to avoid
+/// an extra RPC simulation call that adds latency.
 ///
 /// Tip account is NEVER placed in ALT — Jito requires direct write-lock visibility.
 pub fn build_arb_transaction(
     swap_ixs: &SwapInstructionsResponse,
     payer: &Keypair,
     tip_lamports: u64,
+    cu_limit: u32,
     recent_blockhash: Hash,
     rpc_client: &RpcClient,
 ) -> Result<VersionedTransaction> {
     let mut instructions: Vec<Instruction> = Vec::new();
 
-    // #1 — Only SetComputeUnitLimit (discriminator 0x02).
-    // Drop SetComputeUnitPrice (0x03) — for Jito bundles, only the tip matters.
-    // Keeping SetComputeUnitPrice wastes SOL on priority fees (e.g. 100,000 lamports)
-    // that destroy tiny arb profits. Without it, only base fee (5000 lamports) is charged.
-    for cb_ix in &swap_ixs.compute_budget_instructions {
-        let ix = to_sdk_instruction(cb_ix)?;
-        if !ix.data.is_empty() && ix.data[0] == 0x03 {
-            // Skip SetComputeUnitPrice
-            continue;
-        }
-        instructions.push(ix);
-    }
+    // #1 — SetComputeUnitLimit built manually from hop count (config-driven).
+    // dynamicComputeUnitLimit=false in Metis, so we don't rely on Metis for CU.
+    // This avoids an extra RPC simulation call that Metis would make.
+    let cu_limit_ix = Instruction {
+        program_id: Pubkey::from_str("ComputeBudget111111111111111111111111111111")?,
+        accounts: vec![],
+        data: {
+            let mut data = vec![0x02]; // SetComputeUnitLimit discriminator
+            data.extend_from_slice(&cu_limit.to_le_bytes());
+            data
+        },
+    };
+    instructions.push(cu_limit_ix);
 
     // #2 — Single route_v2 for the entire circular swap
     instructions.push(to_sdk_instruction(&swap_ixs.swap_instruction)?);
