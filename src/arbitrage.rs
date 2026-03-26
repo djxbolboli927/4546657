@@ -12,6 +12,10 @@ use crate::transaction;
 
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 
+/// Base network fee: 5000 lamports (0.000005 SOL) per signature.
+/// This is the minimum Solana charges regardless of Jito tip.
+const BASE_NETWORK_FEE: u64 = 5_000;
+
 /// Represents a profitable circular arbitrage opportunity.
 struct Opportunity {
     token_mint: String,
@@ -75,11 +79,14 @@ pub async fn scan_all_tokens(
                 config.jito.tip_max_lamports,
             );
 
-            if raw_profit <= tip + config.trading.min_profit_lamports {
+            // Total costs = Jito tip + base network fee (5000 lamports)
+            let total_costs = tip + BASE_NETWORK_FEE;
+
+            if raw_profit <= total_costs + config.trading.min_profit_lamports {
                 continue;
             }
 
-            let net_profit = raw_profit - tip;
+            let net_profit = raw_profit - total_costs;
 
             if !jito_limiter.try_acquire() {
                 debug!(token = token_mint.as_str(), "jito rate limit hit, dropping");

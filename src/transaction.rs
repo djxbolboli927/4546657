@@ -89,9 +89,17 @@ pub fn build_arb_transaction(
 ) -> Result<VersionedTransaction> {
     let mut instructions: Vec<Instruction> = Vec::new();
 
-    // #1 — Compute budget (SetComputeUnitLimit from Metis simulation)
+    // #1 — Only SetComputeUnitLimit (discriminator 0x02).
+    // Drop SetComputeUnitPrice (0x03) — for Jito bundles, only the tip matters.
+    // Keeping SetComputeUnitPrice wastes SOL on priority fees (e.g. 100,000 lamports)
+    // that destroy tiny arb profits. Without it, only base fee (5000 lamports) is charged.
     for cb_ix in &swap_ixs.compute_budget_instructions {
-        instructions.push(to_sdk_instruction(cb_ix)?);
+        let ix = to_sdk_instruction(cb_ix)?;
+        if !ix.data.is_empty() && ix.data[0] == 0x03 {
+            // Skip SetComputeUnitPrice
+            continue;
+        }
+        instructions.push(ix);
     }
 
     // #2 — Single route_v2 for the entire circular swap
