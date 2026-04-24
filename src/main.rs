@@ -171,8 +171,14 @@ async fn async_main(config: config::Config) -> Result<()> {
         None
     };
 
-    // Arc<Mutex<>> so spawned sim tasks can acquire after sim passes.
-    let jito_limiter = Arc::new(Mutex::new(
+    // Two INDEPENDENT rate limiters: Jito enforces a per-path 5/sec cap on
+    // both REST (uuid-keyed) and gRPC (auth-keyed) separately, so we run a
+    // separate bucket for each and assign every profitable opp to exactly ONE
+    // path -- never both. Aggregate throughput = 2 * max_bundles_per_second.
+    let jito_rest_limiter = Arc::new(Mutex::new(
+        RateLimiter::new(config.jito.max_bundles_per_second),
+    ));
+    let jito_grpc_limiter = Arc::new(Mutex::new(
         RateLimiter::new(config.jito.max_bundles_per_second),
     ));
 
@@ -252,7 +258,8 @@ async fn async_main(config: config::Config) -> Result<()> {
             jito_grpc_client.as_ref(),
             &trading_keypair,
             &rpc_client,
-            &jito_limiter,
+            &jito_rest_limiter,
+            &jito_grpc_limiter,
             &blockhash_cache,
             &alt_cache,
             sim_cache.as_ref(),

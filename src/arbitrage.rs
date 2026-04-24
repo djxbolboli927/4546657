@@ -183,14 +183,14 @@ async fn check_opportunity(
 /// Scan ALL (amount x token) pairs concurrently.
 ///
 /// Hot path per profitable opportunity:
-///     found  ->  rate-limit gate  ->  spawn(build + optional sim + send)
+///     found  ->  pick REST or gRPC slot (exclusive)  ->  spawn(build + sim + send)
 ///
-/// The scan loop itself is strictly non-blocking: the rate-limit check is a
-/// single atomic `try_acquire` and every subsequent step (tx build, ALT RPC
-/// fallback, LiteSVM sim, REST + gRPC send) runs inside the spawned task so
-/// the NEXT profitable opportunity can be dispatched in the same microsecond.
-/// There is no queue between "profitable" and "send"; if the per-second Jito
-/// rate limit is already exhausted the opportunity is dropped immediately.
+/// The scan loop itself is strictly non-blocking. Jito enforces a 5/sec cap on
+/// each submission path independently, so we run TWO rate limiters (REST +
+/// gRPC) and assign every opportunity to exactly ONE of them -- the same tx
+/// is never sent to both. We try REST first; on REST-exhausted the opp tries
+/// gRPC; if BOTH are exhausted the opp is dropped right here with zero delay
+/// and no queueing.
 pub async fn scan_all_tokens(
     metis: &MetisClient,
     token_mints: &[String],
@@ -199,7 +199,8 @@ pub async fn scan_all_tokens(
     jito_grpc: Option<&Arc<JitoGrpcMulti>>,
     trading_keypair: &Arc<Keypair>,
     rpc_client: &Arc<RpcClient>,
-    jito_limiter: &Arc<Mutex<RateLimiter>>,
+    jito_rest_limiter: &Arc<Mutex<RateLimiter>>,
+    jito_grpc_limiter: &Arc<Mutex<RateLimiter>>,
     blockhash_cache: &BlockhashCache,
     alt_cache: &Arc<AltCache>,
     sim_cache: Option<&Arc<AccountCache>>,
@@ -241,16 +242,22 @@ pub async fn scan_all_tokens(
             None => continue,
         };
 
-        // ---- Rate-limit gate (immediate, non-blocking). -----------------
-        // User spec: "as soon as an opportunity is found, if the rate limit
-        // still has room send to Jito; otherwise drop with zero delay and no
-        // queueing." We consume the slot BEFORE spawning so nothing past this
-        // line can ever back up in a queue.
-        if !jito_limiter.lock().unwrap().try_acquire() {
+        // ---- Path selection + rate-limit gate (immediate, non-blocking). -
+        // User spec: each path has its own 5/sec limit; try REST first, then
+        // gRPC; if both exhausted, drop with zero delay and no queueing. The
+        // same tx is NEVER sent on both paths -- each opp goes out exactly
+        // once.
+        let use_grpc = if jito_rest_limiter.lock().unwrap().try_acquire() {
+            false
+        } else if jito_grpc.is_some()
+            && jito_grpc_limiter.lock().unwrap().try_acquire()
+        {
+            true
+        } else {
             metrics.jito_rate_limited.fetch_add(1, Ordering::Relaxed);
-            debug!(token = opp.token_mint.as_str(), "rate-limited, dropping opp");
+            debug!(token = opp.token_mint.as_str(), "both paths rate-limited, dropping opp");
             continue;
-        }
+        };
 
         info!(
             token = opp.token_mint.as_str(),
@@ -261,6 +268,7 @@ pub async fn scan_all_tokens(
             hops = opp.hop_count,
             cu_limit = opp.cu_limit,
             pmm = opp.is_pmm,
+            path = if use_grpc { "grpc" } else { "rest" },
             "PROFITABLE -- dispatching"
         );
 
@@ -429,48 +437,17 @@ pub async fn scan_all_tokens(
                 );
             }
 
-            // ---- Dispatch: REST + gRPC fired in parallel. ----------------
-            //      We don't await one before the other -- whichever block
-            //      engine accepts first wins the race to the leader.
-            let rest_fut = {
-                let j = jito_clone.clone();
-                let tx = tx.clone();
-                async move { j.send_bundle(&tx).await }
-            };
-            let grpc_fut = {
-                let g = jito_grpc_clone.clone();
-                let tx_bytes = tx_bytes.clone();
-                async move {
-                    match g {
-                        Some(g) => Some(g.send_bundle_bytes(&tx_bytes).await),
-                        None => None,
+            // ---- Dispatch on the single path we reserved upstream. ------
+            //      REST and gRPC are now mutually exclusive per opportunity.
+            if use_grpc {
+                let g = match jito_grpc_clone {
+                    Some(g) => g,
+                    None => {
+                        warn!(token = %token_for_log, "grpc path chosen but client is None");
+                        return;
                     }
-                }
-            };
-
-            let (rest_res, grpc_res) = tokio::join!(rest_fut, grpc_fut);
-
-            match rest_res {
-                Ok(uuid) => {
-                    metrics_clone.jito_sent.fetch_add(1, Ordering::Relaxed);
-                    info!(
-                        uuid = %uuid,
-                        token = %token_for_log,
-                        profit = profit_for_log,
-                        pmm = is_pmm,
-                        path = "rest",
-                        "bundle sent to Jito"
-                    );
-                }
-                Err(e) => warn!(
-                    error = %e,
-                    token = %token_for_log,
-                    path = "rest",
-                    "Jito REST send failed"
-                ),
-            }
-            if let Some(res) = grpc_res {
-                match res {
+                };
+                match g.send_bundle_bytes(&tx_bytes).await {
                     Ok(uuid) => {
                         metrics_clone.jito_grpc_sent.fetch_add(1, Ordering::Relaxed);
                         info!(
@@ -487,6 +464,26 @@ pub async fn scan_all_tokens(
                         token = %token_for_log,
                         path = "grpc",
                         "Jito gRPC send failed"
+                    ),
+                }
+            } else {
+                match jito_clone.send_bundle(&tx).await {
+                    Ok(uuid) => {
+                        metrics_clone.jito_sent.fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            uuid = %uuid,
+                            token = %token_for_log,
+                            profit = profit_for_log,
+                            pmm = is_pmm,
+                            path = "rest",
+                            "bundle sent to Jito"
+                        );
+                    }
+                    Err(e) => warn!(
+                        error = %e,
+                        token = %token_for_log,
+                        path = "rest",
+                        "Jito REST send failed"
                     ),
                 }
             }
