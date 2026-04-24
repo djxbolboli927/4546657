@@ -7,6 +7,8 @@ pub struct Config {
     pub metis: MetisConfig,
     pub trading: TradingConfig,
     pub jito: JitoConfig,
+    #[serde(default)]
+    pub jito_grpc: JitoGrpcConfig,
     pub rpc: RpcConfig,
     pub yellowstone_grpc: YellowstoneGrpcConfig,
     pub performance: PerformanceConfig,
@@ -47,6 +49,38 @@ pub struct JitoConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct RpcConfig {
     pub url: String,
+}
+
+/// Jito block-engine gRPC searcher channel.
+///
+/// The `auth_keypair` is ONLY used to sign the one-shot auth challenge Jito's
+/// AuthService hands out -- it is not a funding wallet and does not need SOL.
+/// The keypair's pubkey must be the one registered with Jito (e.g. via their
+/// Shield programme or the searcher onboarding API).
+///
+/// If `enabled=false` (or the section is missing), the bot falls back to the
+/// REST `sendBundle` path only.
+#[derive(Debug, Deserialize, Clone)]
+pub struct JitoGrpcConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Full URLs of Jito block-engine gRPC endpoints, e.g.
+    /// `https://frankfurt.mainnet.block-engine.jito.wtf`.
+    #[serde(default)]
+    pub endpoints: Vec<String>,
+    /// Path to the keypair whose pubkey Jito has whitelisted as a searcher.
+    #[serde(default)]
+    pub auth_keypair: String,
+}
+
+impl Default for JitoGrpcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoints: Vec::new(),
+            auth_keypair: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]

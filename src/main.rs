@@ -4,6 +4,7 @@ mod arbitrage;
 mod blockhash_cache;
 mod config;
 mod jito;
+mod jito_grpc;
 mod litesvm_sim;
 mod metis;
 mod metrics;
@@ -82,7 +83,7 @@ async fn async_main(config: config::Config) -> Result<()> {
     let token_mints = tokens::load_tokens(&config.trading.tokens_file)?;
     info!(count = token_mints.len(), "tokens loaded");
 
-    let trading_keypair = wallet::read_keypair(&config.jito.trading_keypair)?;
+    let trading_keypair = Arc::new(wallet::read_keypair(&config.jito.trading_keypair)?);
     info!(trading_wallet = %trading_keypair.pubkey(), "keypair loaded");
 
     let rpc_client = Arc::new(RpcClient::new(config.rpc.url.clone()));
@@ -111,7 +112,7 @@ async fn async_main(config: config::Config) -> Result<()> {
     info!("blockhash cache initialized (refresh every 300ms)");
 
     let tip_pubkeys = transaction::jito_tip_pubkeys();
-    let alt_cache = AltCache::new(tip_pubkeys);
+    let alt_cache = Arc::new(AltCache::new(tip_pubkeys));
     info!("ALT cache initialized");
 
     let metis = metis::MetisClient::new(&config.metis.url, config.performance.quote_timeout_ms);
@@ -122,6 +123,53 @@ async fn async_main(config: config::Config) -> Result<()> {
         urls = ?config.jito.urls,
         "Jito multi-region client ready"
     );
+
+    // Optional: Jito block-engine gRPC client. Auth failure is NOT fatal -- we
+    // just keep using the REST path. The hot submit loop never blocks on
+    // either path; REST + gRPC are fired off concurrently.
+    let jito_grpc_client = if config.jito_grpc.enabled
+        && !config.jito_grpc.endpoints.is_empty()
+    {
+        match wallet::read_keypair(&config.jito_grpc.auth_keypair) {
+            Ok(kp) => {
+                let auth_pubkey = kp.pubkey();
+                let kp = Arc::new(kp);
+                match jito_grpc::JitoGrpcMulti::connect(
+                    &config.jito_grpc.endpoints,
+                    kp.clone(),
+                )
+                .await
+                {
+                    Ok(m) => {
+                        info!(
+                            endpoints = m.endpoint_count(),
+                            auth_pubkey = %auth_pubkey,
+                            "Jito gRPC searcher channel up"
+                        );
+                        Some(Arc::new(m))
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "Jito gRPC init failed, continuing with REST-only path"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    path = %config.jito_grpc.auth_keypair,
+                    error = %e,
+                    "Jito gRPC auth keypair unreadable, staying on REST-only path"
+                );
+                None
+            }
+        }
+    } else {
+        info!("Jito gRPC disabled -- REST sendBundle only");
+        None
+    };
 
     // Arc<Mutex<>> so spawned sim tasks can acquire after sim passes.
     let jito_limiter = Arc::new(Mutex::new(
@@ -201,6 +249,7 @@ async fn async_main(config: config::Config) -> Result<()> {
             &token_mints,
             &config,
             &jito_client,
+            jito_grpc_client.as_ref(),
             &trading_keypair,
             &rpc_client,
             &jito_limiter,

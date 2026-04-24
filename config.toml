@@ -36,6 +36,24 @@ max_bundles_per_second = 5
 [rpc]
 url = "https://rpc.fra.shyft.to?api_key=farYqEW-7r1vxqok"
 
+# Jito block-engine gRPC (direct SendBundle). The keypair here ONLY signs the
+# one-time auth challenge; it is not a funding wallet. Its pubkey must match
+# what Jito has registered for this searcher (pubkey 5KEPdvckH4AumoeGbvhP5Fz2H9BcAH9qpjPdif72aufc).
+# Bundles go out to REST + gRPC concurrently so whichever lands first wins.
+[jito_grpc]
+enabled = true
+auth_keypair = "/root/m/wallet/grpc.json"
+endpoints = [
+    "https://amsterdam.mainnet.block-engine.jito.wtf",
+    "https://dublin.mainnet.block-engine.jito.wtf",
+    "https://frankfurt.mainnet.block-engine.jito.wtf",
+    "https://london.mainnet.block-engine.jito.wtf",
+    "https://ny.mainnet.block-engine.jito.wtf",
+    "https://slc.mainnet.block-engine.jito.wtf",
+    "https://singapore.mainnet.block-engine.jito.wtf",
+    "https://tokyo.mainnet.block-engine.jito.wtf",
+]
+
 [yellowstone_grpc]
 endpoint = "https://grpc.fra.shyft.to"
 x_token = "41cd21e6-6a66-493d-bdc6-a7057409c2a1"
