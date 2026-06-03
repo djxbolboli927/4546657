@@ -292,6 +292,40 @@ async fn quote_check(
 
 // ─── Worker pool ──────────────────────────────────────────────────────────────
 
+/// Janitor task: sweep stale items from the LIFO queue every second.
+///
+/// Without this, rate-limited workers keep bouncing the 8 *newest* items back
+/// to the top of the LIFO. Old items at the bottom are never popped by a
+/// worker (LIFO order), so they never hit the stale-check inside the worker
+/// loop and the queue grows unboundedly. The janitor drains them from outside.
+fn spawn_janitor(
+    lifo: Arc<Mutex<Vec<ReadyInstruction>>>,
+    metrics: Arc<Metrics>,
+    queue_max_age_ms: u64,
+) {
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let now = std::time::Instant::now();
+            let mut g = lifo.lock().unwrap();
+            let before = g.len() as i64;
+            g.retain(|item| {
+                now.duration_since(item.arrived_at).as_millis() as u64
+                    <= queue_max_age_ms
+            });
+            let dropped = before - g.len() as i64;
+            if dropped > 0 {
+                metrics.dropped_stale.fetch_add(dropped as u64, Ordering::Relaxed);
+                metrics.tx_dropped.fetch_add(dropped as u64, Ordering::Relaxed);
+                metrics.queue_depth.fetch_sub(dropped, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
 pub fn spawn_workers(
     ctx: Arc<CalcCtx>,
     metrics: Arc<Metrics>,
@@ -300,6 +334,8 @@ pub fn spawn_workers(
 ) -> Pipeline {
     let lifo: Arc<Mutex<Vec<ReadyInstruction>>> = Arc::new(Mutex::new(Vec::new()));
     let lifo_sem = Arc::new(tokio::sync::Semaphore::new(0));
+
+    spawn_janitor(lifo.clone(), metrics.clone(), queue_max_age_ms);
 
     for _ in 0..worker_count {
         let lifo_c = lifo.clone();
@@ -429,12 +465,22 @@ pub fn spawn_workers(
 
 // ─── Queue helper ─────────────────────────────────────────────────────────────
 
+/// Hard cap on live queue entries. Jito throughput × TTL sets the maximum
+/// *useful* depth (10 tx/s × 5 s = 50). We use 500 (10× buffer) so short
+/// bursts of profitable opportunities are never silently dropped, while still
+/// bounding memory and preventing the queue from growing for hours.
+const MAX_QUEUE_DEPTH: i64 = 500;
+
 fn push_to_queue(
     swap_ixs: SwapInstructionsResponse,
     hop_count: usize,
     pipeline: &Pipeline,
     metrics: &Metrics,
 ) {
+    if metrics.queue_depth.load(Ordering::Relaxed) >= MAX_QUEUE_DEPTH {
+        metrics.dropped_queue_full.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     let item = ReadyInstruction {
         swap_ixs,
         hop_count,

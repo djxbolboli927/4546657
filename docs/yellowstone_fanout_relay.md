@@ -35,7 +35,7 @@ updates are dropped — Metis must keep receiving updates with minimal delay.
 
 ## Phase A — what was built
 
-Independent crate at `tools/yellowstone_fanout/` (excluded from the main
+Independent crate at `tools_yellowstone_fanout/` (excluded from the main
 workspace, so the bot build is untouched). Binary:
 `yellowstone_fanout_phase_a`.
 
@@ -79,7 +79,7 @@ optimization), we revisit the version then.
 ## Running Phase A
 
 ```bash
-cd tools/yellowstone_fanout
+cd tools_yellowstone_fanout
 cp .env.example .env       # fill in UPSTREAM_YELLOWSTONE_X_TOKEN if needed
 set -a; . ./.env; set +a
 cargo run --release --bin yellowstone_fanout_phase_a

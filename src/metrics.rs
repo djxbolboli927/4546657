@@ -65,6 +65,11 @@ pub struct Metrics {
     pub jito_send_failed: AtomicU64,
     pub jito_sent: AtomicU64,
 
+    /// Items dropped because the LIFO queue hit MAX_QUEUE_DEPTH.
+    /// Nonzero means opportunities arrive faster than Jito can consume them —
+    /// expected at high activity; the cap prevents unbounded memory growth.
+    pub dropped_queue_full: AtomicU64,
+
     // ── Legacy aggregates (drained each window, not shown) ────────────────────
     pub dropped_busy: AtomicU64,
     pub tx_dropped: AtomicU64,
@@ -101,6 +106,7 @@ impl Metrics {
             rate_requeued: AtomicU64::new(0),
             jito_send_failed: AtomicU64::new(0),
             jito_sent: AtomicU64::new(0),
+            dropped_queue_full: AtomicU64::new(0),
             dropped_busy: AtomicU64::new(0),
             tx_dropped: AtomicU64::new(0),
             metis_fetch_ms_total: AtomicU64::new(0),
@@ -145,6 +151,7 @@ impl Metrics {
                 let q_in      = m.queue_in.swap(0, Ordering::Relaxed);
 
                 let stale     = m.dropped_stale.swap(0, Ordering::Relaxed);
+                let q_full    = m.dropped_queue_full.swap(0, Ordering::Relaxed);
                 let build     = m.tx_build_failed.swap(0, Ordering::Relaxed);
                 let too_big   = m.tx_too_large.swap(0, Ordering::Relaxed);
                 let too_locks = m.dropped_account_locks.swap(0, Ordering::Relaxed);
@@ -178,7 +185,7 @@ metis_sent={sent} routes={routes} quoted_profitable={profit}\n  \
 TEMPLATE  : route_hit={rt_hit}  hop_all_hit={ht_all}  hop_miss={ht_miss}  routes={n_routes}(patchable={n_patch})  hops={n_hops}\n  \
 IX-SOURCE : from_ram={from_ram}  from_metis={from_metis}  ram_pct={ram_pct}%\n  \
 FUNNEL    : profitable={profit}  drop_same_pool={drop_pool}  drop_multi_hop={drop_hop}  drop_merge={drop_merge}  drop_no_serve={drop_no_srv}  -> swap_ix_ok={sw_ok}\n  \
-PRE-QUEUE : swap_ix_ok={sw_ok}  swap_ix_fail={swap_fail} [timeout={sf_to} http={sf_http} net={sf_net} parse={sf_parse}] -> queue_in={q_in}  (depth_now={depth})\n  \
+PRE-QUEUE : swap_ix_ok={sw_ok}  swap_ix_fail={swap_fail} [timeout={sf_to} http={sf_http} net={sf_net} parse={sf_parse}] -> queue_in={q_in}  drop_full={q_full}  (depth_now={depth})\n  \
 IN-QUEUE  : stale={stale} (waited >{ttl_secs}s)\n  \
 TX-BUILD  : build_fail={build}  too_large={too_big}  too_many_locks={too_locks}  calc_ok={calc}\n  \
 JITO      : sent={jito}  send_fail={jfail}  waited_for_slot={requeued}\n  \

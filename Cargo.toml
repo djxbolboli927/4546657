@@ -5,15 +5,21 @@
 # because Cargo resolves 'workspace = true' from the patching workspace root,
 # not litesvm's own workspace root.
 resolver = "2"
-# The Yellowstone Fanout tool is a fully independent crate with its own
-# Cargo.lock and dependency versions. Excluding it here guarantees the bot
-# build is never affected by (and never rebuilds because of) that tool.
-exclude = ["tools/yellowstone_fanout"]
+# Only the main bot package is the default member, so `cargo run/build` at
+# the workspace root always targets the bot (not alt_loader or future tools).
+default-members = ["."]
+# The Yellowstone Fanout tool (renamed from tools/yellowstone_fanout by the
+# user; lives at tools_yellowstone_fanout/) is a fully independent crate with
+# its own Cargo.lock. Excluding it guarantees the bot build is never affected.
+exclude = ["tools_yellowstone_fanout"]
 
 [package]
 name = "solana-arb-bot"
 version = "0.1.0"
 edition = "2021"
+# Ensures `cargo run` at the workspace root always starts the main bot binary
+# even though a second binary (alt_loader) also exists in this package.
+default-run = "solana-arb-bot"
 
 [profile.release]
 # Maximum runtime performance for the hot path. Compile time goes up
