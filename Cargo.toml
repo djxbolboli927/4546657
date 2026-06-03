@@ -5,6 +5,10 @@
 # because Cargo resolves 'workspace = true' from the patching workspace root,
 # not litesvm's own workspace root.
 resolver = "2"
+# The Yellowstone Fanout tool is a fully independent crate with its own
+# Cargo.lock and dependency versions. Excluding it here guarantees the bot
+# build is never affected by (and never rebuilds because of) that tool.
+exclude = ["tools/yellowstone_fanout"]
 
 [package]
 name = "solana-arb-bot"
