@@ -18,6 +18,10 @@ pub struct Config {
     pub template_cache: TemplateCacheConfig,
     #[serde(default)]
     pub pool_state: PoolStateConfig,
+    #[serde(default)]
+    pub jupiter_price: JupiterPriceConfig,
+    #[serde(default)]
+    pub validation: ValidationConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -287,6 +291,66 @@ impl Default for PoolStateConfig {
         Self {
             enabled: false,
             mix_json: default_mix_json(),
+        }
+    }
+}
+
+// ── Jupiter Price API config ──────────────────────────────────────────────────
+
+/// Jupiter Price API V3 settings.
+/// Used by the price validator to fetch USD reference prices.
+/// Free tier: 1 RPS / 60 RPM; up to 50 mint IDs per request.
+#[derive(Debug, Deserialize, Clone)]
+pub struct JupiterPriceConfig {
+    /// Base URL, e.g. "https://api.jup.ag/price/v3"
+    #[serde(default = "default_jupiter_url")]
+    pub url: String,
+    /// x-api-key header value. Empty string = no auth (public endpoint).
+    #[serde(default)]
+    pub api_key: String,
+}
+
+fn default_jupiter_url() -> String {
+    "https://api.jup.ag/price/v3".to_string()
+}
+
+impl Default for JupiterPriceConfig {
+    fn default() -> Self {
+        Self {
+            url: default_jupiter_url(),
+            api_key: String::new(),
+        }
+    }
+}
+
+// ── Validation mode config ────────────────────────────────────────────────────
+
+/// When `enabled = true`, the bot starts ONLY the pool-state stream and the
+/// price validator — the normal Metis/Jito scan loop is not started.
+/// No transactions are sent in this mode.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ValidationConfig {
+    /// Enable validation mode. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How often to run a comparison cycle (seconds). Default: 5.
+    #[serde(default = "default_val_interval")]
+    pub interval_secs: u64,
+    /// Maximum number of pool lines to print per cycle (sorted by diff).
+    /// Use 0 for all. Default: 20.
+    #[serde(default = "default_val_max_log")]
+    pub max_pools_log: usize,
+}
+
+fn default_val_interval() -> u64 { 5 }
+fn default_val_max_log() -> usize { 20 }
+
+impl Default for ValidationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: 5,
+            max_pools_log: 20,
         }
     }
 }

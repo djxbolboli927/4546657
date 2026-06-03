@@ -17,6 +17,8 @@ mod rate_limiter;
 mod pool_state_store;
 mod pool_state_stream;
 mod template_cache;
+#[allow(dead_code)]
+mod validator;
 mod token_metrics;
 mod tokens;
 mod transaction;
@@ -96,31 +98,61 @@ async fn async_main(config: config::Config) -> Result<()> {
         template_store.spawn_flush_task(60);
     }
 
-    // ── Pool state stream (Phase 2 / data acquisition) ───────────────────────
-    // Subscribes to all pool accounts from mix.json via the same Yellowstone
-    // endpoint the bot already uses. Keeps a live PoolStateStore in memory
-    // for later use by per-DEX price calculators.
-    // Enabled only when [pool_state] enabled = true in config.toml.
-    if config.pool_state.enabled {
+    // ── Pool state stream + optional price validator ──────────────────────────
+    // When pool_state.enabled = true: subscribes to all pool accounts from
+    // mix.json via Yellowstone and keeps a live PoolStateStore in memory.
+    //
+    // When validation.enabled = true: ALSO starts the price validator which
+    // compares on-chain spot prices against Jupiter Price API V3.
+    // In validation mode the normal Metis/Jito bot loop is skipped entirely —
+    // no quotes are fetched and no transactions are sent.
+    let pool_state_result = if config.pool_state.enabled || config.validation.enabled {
         match pool_state_stream::load_mix_json(&config.pool_state.mix_json) {
-            Ok((a2p, p2a, subscribe_accounts)) => {
-                let store = pool_state_store::PoolStateStore::new(a2p, p2a);
+            Ok(parsed) => {
+                let store = pool_state_store::PoolStateStore::new(
+                    parsed.account_to_pools,
+                    parsed.pool_to_accounts,
+                );
                 eprintln!(
-                    "[pool_state] loaded mix.json: {} pools, {} subscribe accounts",
+                    "[pool_state] loaded mix.json: {} pools, {} subscribe accounts, {} vault pairs",
                     store.pool_count,
-                    subscribe_accounts.len()
+                    parsed.subscribe_list.len(),
+                    parsed.vault_pairs.len(),
                 );
                 pool_state_stream::spawn_pool_state_stream(
                     config.yellowstone_grpc.endpoint.clone(),
                     config.yellowstone_grpc.x_token.clone(),
-                    subscribe_accounts,
-                    store,
+                    parsed.subscribe_list,
+                    store.clone(),
                 );
+                Some((store, parsed.vault_pairs))
             }
             Err(e) => {
-                eprintln!("[pool_state] WARNING: could not load mix.json ({e}); pool state stream disabled");
+                eprintln!(
+                    "[pool_state] WARNING: could not load mix.json ({e}); pool state stream disabled"
+                );
+                None
             }
         }
+    } else {
+        None
+    };
+
+    // ── Validation mode: skip bot, only run price comparisons ─────────────────
+    if config.validation.enabled {
+        if let Some((store, vault_pairs)) = pool_state_result {
+            validator::spawn_validator(
+                vault_pairs,
+                store,
+                config.validation.clone(),
+                config.jupiter_price.clone(),
+            );
+        } else {
+            eprintln!("[validator] ERROR: pool state unavailable; set pool_state.mix_json in config");
+        }
+        // Park here until ctrl-c — no bot activity
+        tokio::signal::ctrl_c().await.ok();
+        return Ok(());
     }
 
     let metrics = metrics::Metrics::new();

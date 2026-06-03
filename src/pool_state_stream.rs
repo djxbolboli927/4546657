@@ -37,18 +37,32 @@ static EXTRA_PARAM_KEYS: &[&str] = &[
     "asks",
 ];
 
+/// One pool's two token-vault pubkeys, extracted from mix.json.
+/// Used by the price validator to read live reserves from PoolStateStore.
+#[derive(Debug, Clone)]
+pub struct PoolVaultPair {
+    pub pool: Pubkey,
+    pub vault_a: Pubkey,
+    pub vault_b: Pubkey,
+}
+
+/// All data produced by a single mix.json parse.
+pub struct MixJsonResult {
+    pub account_to_pools: HashMap<Pubkey, Vec<Pubkey>>,
+    pub pool_to_accounts: HashMap<Pubkey, Vec<Pubkey>>,
+    pub subscribe_list: Vec<String>,
+    /// Pools that have both tokenAccountA and tokenAccountB in params.
+    /// Used by the price validator.
+    pub vault_pairs: Vec<PoolVaultPair>,
+}
+
 /// Parse mix.json and build two indexes:
 ///   `account_to_pools`  — account pubkey → pool pubkeys that depend on it
 ///   `pool_to_accounts`  — pool pubkey → all accounts for that pool
 ///
-/// Also returns the deduplicated flat list of accounts to subscribe to.
-pub fn load_mix_json(
-    path: &str,
-) -> Result<(
-    HashMap<Pubkey, Vec<Pubkey>>,
-    HashMap<Pubkey, Vec<Pubkey>>,
-    Vec<String>,
-)> {
+/// Also returns the deduplicated flat list of accounts to subscribe to, plus
+/// the per-pool vault pairs used by the price validator.
+pub fn load_mix_json(path: &str) -> Result<MixJsonResult> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading mix.json at {path}"))?;
     let json: serde_json::Value =
@@ -61,6 +75,7 @@ pub fn load_mix_json(
     let mut pool_to_accounts: HashMap<Pubkey, Vec<Pubkey>> = HashMap::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut subscribe_list: Vec<String> = Vec::new();
+    let mut vault_pairs: Vec<PoolVaultPair> = Vec::new();
 
     for pool in pools {
         let pool_pk_str = match pool.get("pubkey").and_then(|v| v.as_str()) {
@@ -77,12 +92,21 @@ pub fn load_mix_json(
         // Always include the pool address itself.
         let mut candidates = vec![pool_pk_str.to_string()];
 
+        // Extract vault pair for the price validator.
+        let mut vault_a_str: Option<String> = None;
+        let mut vault_b_str: Option<String> = None;
+
         if let Some(params) = pool.get("params") {
             // Mandatory token accounts.
             for key in &["tokenAccountA", "tokenAccountB"] {
                 if let Some(s) = params.get(key).and_then(|v| v.as_str()) {
                     if !s.is_empty() {
                         candidates.push(s.to_string());
+                        if *key == "tokenAccountA" {
+                            vault_a_str = Some(s.to_string());
+                        } else {
+                            vault_b_str = Some(s.to_string());
+                        }
                     }
                 }
             }
@@ -93,6 +117,17 @@ pub fn load_mix_json(
                         candidates.push(s.to_string());
                     }
                 }
+            }
+        }
+
+        // Store vault pair if both vaults found.
+        if let (Some(a_str), Some(b_str)) = (&vault_a_str, &vault_b_str) {
+            if let (Ok(va), Ok(vb)) = (a_str.parse::<Pubkey>(), b_str.parse::<Pubkey>()) {
+                vault_pairs.push(PoolVaultPair {
+                    pool: pool_pk,
+                    vault_a: va,
+                    vault_b: vb,
+                });
             }
         }
 
@@ -114,7 +149,12 @@ pub fn load_mix_json(
         pool_to_accounts.entry(pool_pk).or_insert(pool_accounts);
     }
 
-    Ok((account_to_pools, pool_to_accounts, subscribe_list))
+    Ok(MixJsonResult {
+        account_to_pools,
+        pool_to_accounts,
+        subscribe_list,
+        vault_pairs,
+    })
 }
 
 // ── gRPC stream ──────────────────────────────────────────────────────────────
