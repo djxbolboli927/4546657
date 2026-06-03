@@ -15,27 +15,30 @@ use crate::pool_state_store::PoolStateStore;
 
 // ── mix.json loading ─────────────────────────────────────────────────────────
 
-/// Account fields harvested from each pool entry in mix.json.
-/// Per-DEX vaults/reserves are also collected when present so the store is
-/// as complete as possible from the start. Tick/bin arrays are absent from
-/// mix.json and are deferred to a later phase.
-static EXTRA_PARAM_KEYS: &[&str] = &[
-    "vault",
-    "vaultA",
-    "vaultB",
-    "reserve",
-    "reserveA",
-    "reserveB",
-    "oracle",
-    "observation",
-    "config",
-    "market",
-    "baseVault",
-    "quoteVault",
-    "eventQueue",
-    "bids",
-    "asks",
-];
+/// Recursively collect every valid Solana pubkey found as a JSON string value
+/// inside `value`. Numbers (e.g. routingGroup) and non-pubkey strings are
+/// ignored. This makes the parser DEX-agnostic: whatever extra accounts a
+/// given DEX puts in `params`, we capture them without a hard-coded key list.
+fn collect_pubkeys_from_value(value: &serde_json::Value, out: &mut Vec<Pubkey>) {
+    match value {
+        serde_json::Value::String(s) => {
+            if let Ok(pk) = s.parse::<Pubkey>() {
+                out.push(pk);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                collect_pubkeys_from_value(v, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_k, v) in map {
+                collect_pubkeys_from_value(v, out);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// One pool's two token-vault pubkeys, extracted from mix.json.
 /// Used by the price validator to read live reserves from PoolStateStore.
@@ -97,8 +100,11 @@ pub fn load_mix_json(path: &str) -> Result<MixJsonResult> {
 
         let mut pool_accounts: Vec<Pubkey> = Vec::new();
 
-        // Always include the pool address itself.
-        let mut candidates = vec![pool_pk_str.to_string()];
+        // Collect every account pubkey for this pool. Start with the pool
+        // address itself, then recursively harvest all valid pubkeys from
+        // `params` (DEX-agnostic — captures vaults, oracles, tick/bin arrays,
+        // configs, ALTs, mints, and anything else a DEX puts there).
+        let mut candidates: Vec<Pubkey> = vec![pool_pk];
 
         // Pool owner program id (classifies the DEX for the validator).
         let owner: Pubkey = pool
@@ -107,9 +113,9 @@ pub fn load_mix_json(path: &str) -> Result<MixJsonResult> {
             .and_then(|s| s.parse().ok())
             .unwrap_or_default();
 
-        // Extract vault pair for the price validator.
-        let mut vault_a_str: Option<String> = None;
-        let mut vault_b_str: Option<String> = None;
+        // Extract vault pair + AmmConfig for the price validator (named keys).
+        let mut vault_a: Option<Pubkey> = None;
+        let mut vault_b: Option<Pubkey> = None;
         let mut amm_config: Option<Pubkey> = None;
 
         if let Some(params) = pool.get("params") {
@@ -122,50 +128,33 @@ pub fn load_mix_json(path: &str) -> Result<MixJsonResult> {
                     }
                 }
             }
-            // Mandatory token accounts.
-            for key in &["tokenAccountA", "tokenAccountB"] {
-                if let Some(s) = params.get(key).and_then(|v| v.as_str()) {
-                    if !s.is_empty() {
-                        candidates.push(s.to_string());
-                        if *key == "tokenAccountA" {
-                            vault_a_str = Some(s.to_string());
-                        } else {
-                            vault_b_str = Some(s.to_string());
-                        }
-                    }
-                }
-            }
-            // Optional DEX-specific accounts.
-            for key in EXTRA_PARAM_KEYS {
-                if let Some(s) = params.get(*key).and_then(|v| v.as_str()) {
-                    if !s.is_empty() {
-                        candidates.push(s.to_string());
-                    }
-                }
-            }
+            // Named token accounts → vault pair for the validator.
+            vault_a = params
+                .get("tokenAccountA")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok());
+            vault_b = params
+                .get("tokenAccountB")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok());
+
+            // Recursively harvest every other pubkey in params for the stream.
+            collect_pubkeys_from_value(params, &mut candidates);
         }
 
         // Store vault pair if both vaults found.
-        if let (Some(a_str), Some(b_str)) = (&vault_a_str, &vault_b_str) {
-            if let (Ok(va), Ok(vb)) = (a_str.parse::<Pubkey>(), b_str.parse::<Pubkey>()) {
-                vault_pairs.push(PoolVaultPair {
-                    pool: pool_pk,
-                    vault_a: va,
-                    vault_b: vb,
-                    owner,
-                    amm_config,
-                });
-            }
+        if let (Some(va), Some(vb)) = (vault_a, vault_b) {
+            vault_pairs.push(PoolVaultPair {
+                pool: pool_pk,
+                vault_a: va,
+                vault_b: vb,
+                owner,
+                amm_config,
+            });
         }
 
-        for addr in candidates {
-            if addr.is_empty() {
-                continue;
-            }
-            let pk: Pubkey = match addr.parse() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
+        for pk in candidates {
+            let addr = pk.to_string();
             if seen.insert(addr.clone()) {
                 subscribe_list.push(addr);
             }
@@ -295,13 +284,9 @@ async fn run_once(
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Spawn the pool-state subscription task.
-///
-/// Connects to the same Yellowstone endpoint the bot already uses, subscribes
-/// to all accounts from mix.json, and keeps the PoolStateStore live.
-/// Reconnects automatically with exponential backoff.
-/// This task never exits — it runs for the lifetime of the process.
-pub fn spawn_pool_state_stream(
+/// Spawn one subscription stream for a single chunk of accounts.
+fn spawn_one_stream(
+    shard: usize,
     endpoint: String,
     x_token: String,
     subscribe_accounts: Vec<String>,
@@ -311,11 +296,80 @@ pub fn spawn_pool_state_stream(
         let mut backoff = Duration::from_millis(500);
         loop {
             match run_once(&endpoint, &x_token, &subscribe_accounts, &store).await {
-                Ok(()) => warn!("pool_state_stream ended cleanly, reconnecting"),
-                Err(e) => warn!(error = %e, "pool_state_stream error, reconnecting"),
+                Ok(()) => warn!(shard, "pool_state_stream ended cleanly, reconnecting"),
+                Err(e) => warn!(shard, error = %e, "pool_state_stream error, reconnecting"),
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(10));
         }
     });
+}
+
+/// Spawn a stats reporter that logs store health every 5 seconds.
+/// No per-update logging — this is the only periodic visibility into the stream.
+fn spawn_stats_reporter(store: Arc<PoolStateStore>, total_accounts: usize) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            ticker.tick().await;
+            let live_accounts = store.account_count();
+            let live_pools = store.live_pool_count();
+            eprintln!(
+                "[pool_state] stats live_accounts={live_accounts}/{total_accounts} \
+live_pools={live_pools}/{}",
+                store.pool_count
+            );
+        }
+    });
+}
+
+/// Spawn the pool-state subscription task(s) — DirectGrpcFast.
+///
+/// Subscribes directly to Yellowstone gRPC with an exact-account filter built
+/// from mix.json, and keeps the PoolStateStore live. If `accounts_per_stream`
+/// is non-zero and the list is larger, the subscription is sharded across
+/// multiple streams, all writing to the same store. A stats reporter logs
+/// live_accounts / live_pools every 5 seconds. Tasks never exit — they
+/// reconnect with exponential backoff for the lifetime of the process.
+pub fn spawn_pool_state_stream(
+    endpoint: String,
+    x_token: String,
+    subscribe_accounts: Vec<String>,
+    store: Arc<PoolStateStore>,
+) {
+    spawn_pool_state_stream_sharded(endpoint, x_token, subscribe_accounts, store, 0);
+}
+
+/// Like `spawn_pool_state_stream` but with an explicit shard size.
+/// `accounts_per_stream == 0` ⇒ a single stream (no sharding).
+pub fn spawn_pool_state_stream_sharded(
+    endpoint: String,
+    x_token: String,
+    subscribe_accounts: Vec<String>,
+    store: Arc<PoolStateStore>,
+    accounts_per_stream: usize,
+) {
+    let total = subscribe_accounts.len();
+    spawn_stats_reporter(store.clone(), total);
+
+    if accounts_per_stream == 0 || total <= accounts_per_stream {
+        eprintln!(
+            "[pool_state] direct gRPC: 1 stream, {total} accounts, commitment=processed"
+        );
+        spawn_one_stream(0, endpoint, x_token, subscribe_accounts, store);
+        return;
+    }
+
+    let chunks: Vec<Vec<String>> = subscribe_accounts
+        .chunks(accounts_per_stream)
+        .map(|c| c.to_vec())
+        .collect();
+    eprintln!(
+        "[pool_state] direct gRPC: {} streams × ≤{accounts_per_stream} accounts \
+({total} total), commitment=processed",
+        chunks.len()
+    );
+    for (shard, chunk) in chunks.into_iter().enumerate() {
+        spawn_one_stream(shard, endpoint.clone(), x_token.clone(), chunk, store.clone());
+    }
 }

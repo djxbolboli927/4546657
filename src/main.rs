@@ -99,49 +99,65 @@ async fn async_main(config: config::Config) -> Result<()> {
         template_store.spawn_flush_task(60);
     }
 
-    // ── Pool state data source — explicit, no implicit gRPC ─────────────────
-    // Priority (mutually exclusive, first match wins):
-    //   1. pool_state.socket non-empty  → relay socket (no direct gRPC)
-    //   2. pool_state.enabled = true    → direct Yellowstone gRPC (test only)
-    //   3. neither                      → pool state disabled
+    // ── Pool state data source — explicit `mode`, no implicit gRPC ──────────
+    //   mode = "direct_grpc_fast"  → bot subscribes directly to Yellowstone.
+    //   mode = "relay_socket"      → bot reads from the fanout Unix socket.
+    //   mode = "disabled"          → no pool-state stream.
     //
     // validation.enabled is a *consumer* flag — it never selects a data source.
-    // If validation is on but no data source is configured, we bail immediately
-    // with a clear message rather than silently connecting to gRPC.
-    enum PoolStateSource { RelaySocket, DirectGrpc, Disabled }
-    let pool_state_source = if !config.pool_state.socket.is_empty() {
-        PoolStateSource::RelaySocket
-    } else if config.pool_state.enabled {
-        PoolStateSource::DirectGrpc
-    } else {
-        if config.validation.enabled {
-            anyhow::bail!(
-                "validation.enabled=true but no pool state source is configured.\n\
-                 Either set [pool_state].socket = \"/tmp/yellowstone_fanout.sock\"\n\
-                 or set [pool_state].enabled = true (direct gRPC test mode)."
-            );
-        }
-        PoolStateSource::Disabled
-    };
+    // If validation is on but the source is disabled, we bail with a clear
+    // message rather than silently doing nothing.
+    let source = config.pool_state.resolved_mode();
+    if source == "invalid" {
+        anyhow::bail!(
+            "[pool_state] mode = \"{}\" is not recognised. Use one of: \
+             direct_grpc_fast, relay_socket, disabled.",
+            config.pool_state.mode
+        );
+    }
+    if source == "disabled" && config.validation.enabled {
+        anyhow::bail!(
+            "validation.enabled=true but pool_state source is disabled.\n\
+             Set [pool_state].mode = \"direct_grpc_fast\" (direct Yellowstone gRPC)\n\
+             or [pool_state].mode = \"relay_socket\" with a socket path."
+        );
+    }
 
-    let need_pool_state = !matches!(pool_state_source, PoolStateSource::Disabled);
-
-    let pool_state_result = if need_pool_state {
+    let pool_state_result = if source != "disabled" {
         match pool_state_stream::load_mix_json(&config.pool_state.mix_json) {
             Ok(parsed) => {
+                // Optional truncation for connectivity tests. 0 = no limit.
+                let mut subscribe_list = parsed.subscribe_list;
+                let full = subscribe_list.len();
+                let max = config.pool_state.max_accounts;
+                if max > 0 && full > max {
+                    eprintln!(
+                        "[pool_state] WARNING: truncating subscription {full} → {max} \
+                         accounts (max_accounts={max}); some pools will never go live. \
+                         Set max_accounts=0 for production."
+                    );
+                    subscribe_list.truncate(max);
+                }
+
                 let store = pool_state_store::PoolStateStore::new(
                     parsed.account_to_pools,
                     parsed.pool_to_accounts,
                 );
                 eprintln!(
-                    "[pool_state] mix.json: {} pools, {} accounts, {} vault pairs",
+                    "[pool_state] mode={source} mix.json: {} pools, {} unique accounts, {} vault pairs",
                     store.pool_count,
-                    parsed.subscribe_list.len(),
+                    full,
                     parsed.vault_pairs.len(),
                 );
 
-                match pool_state_source {
-                    PoolStateSource::RelaySocket => {
+                match source {
+                    "relay_socket" => {
+                        if config.pool_state.socket.is_empty() {
+                            anyhow::bail!(
+                                "[pool_state] mode=relay_socket but socket path is empty. \
+                                 Set [pool_state].socket = \"/tmp/yellowstone_fanout.sock\"."
+                            );
+                        }
                         eprintln!(
                             "[pool_state] data source: relay socket {}",
                             config.pool_state.socket
@@ -151,16 +167,20 @@ async fn async_main(config: config::Config) -> Result<()> {
                             store.clone(),
                         );
                     }
-                    PoolStateSource::DirectGrpc => {
-                        eprintln!("[pool_state] data source: direct Yellowstone gRPC");
-                        pool_state_stream::spawn_pool_state_stream(
+                    "direct_grpc_fast" => {
+                        eprintln!(
+                            "[pool_state] data source: direct Yellowstone gRPC ({})",
+                            config.yellowstone_grpc.endpoint
+                        );
+                        pool_state_stream::spawn_pool_state_stream_sharded(
                             config.yellowstone_grpc.endpoint.clone(),
                             config.yellowstone_grpc.x_token.clone(),
-                            parsed.subscribe_list,
+                            subscribe_list,
                             store.clone(),
+                            config.pool_state.accounts_per_stream,
                         );
                     }
-                    PoolStateSource::Disabled => unreachable!(),
+                    _ => unreachable!(),
                 }
 
                 Some((store, parsed.vault_pairs))

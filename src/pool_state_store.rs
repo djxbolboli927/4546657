@@ -89,4 +89,29 @@ impl PoolStateStore {
     pub fn account_count(&self) -> usize {
         self.accounts.len()
     }
+
+    /// A pool is "live" once its pool-state account and both token vaults have
+    /// been received. We approximate this as: at least 3 of the pool's mapped
+    /// accounts are present in the store (pool + vaultA + vaultB). Pools that
+    /// map fewer than 3 accounts are live once all of them are present.
+    pub fn is_pool_live(&self, pool: &Pubkey) -> bool {
+        let Some(accts) = self.pool_to_accounts.get(pool) else {
+            return false;
+        };
+        let need = accts.len().min(3);
+        let have = accts
+            .iter()
+            .filter(|pk| self.accounts.contains_key(*pk))
+            .take(need)
+            .count();
+        have >= need
+    }
+
+    /// Count of pools that currently satisfy `is_pool_live`.
+    pub fn live_pool_count(&self) -> usize {
+        self.pool_to_accounts
+            .keys()
+            .filter(|p| self.is_pool_live(p))
+            .count()
+    }
 }

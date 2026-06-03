@@ -271,18 +271,37 @@ fn default_true_tc() -> bool {
 /// In Phase A it simply receives and stores data — no calculator is wired yet.
 #[derive(Debug, Deserialize, Clone)]
 pub struct PoolStateConfig {
-    /// Enable direct Yellowstone gRPC subscription (fallback when socket is empty).
+    /// Explicit data-source selector. One of:
+    ///   "direct_grpc_fast" — bot subscribes directly to Yellowstone gRPC.
+    ///   "relay_socket"     — bot reads decoded updates from a Unix socket.
+    ///   "disabled"         — no pool-state stream.
+    /// When empty, falls back to the legacy `enabled`/`socket` booleans.
+    #[serde(default)]
+    pub mode: String,
+    /// Legacy: enable direct Yellowstone gRPC subscription (used only when
+    /// `mode` is empty). Prefer `mode = "direct_grpc_fast"`.
     #[serde(default)]
     pub enabled: bool,
     /// Path to mix.json (Metis market cache).
     #[serde(default = "default_mix_json")]
     pub mix_json: String,
     /// Unix socket written by yellowstone_fanout_phase_a.
-    /// When non-empty the bot reads from here instead of connecting to Yellowstone.
+    /// Used only when `mode = "relay_socket"` (or legacy: non-empty socket).
     /// Set to the same value as BOT_SOCKET_PATH in the fanout process.
     /// Example: /tmp/yellowstone_fanout.sock
     #[serde(default)]
     pub socket: String,
+    /// Cap on the number of subscribed accounts. 0 = no limit (production).
+    /// A non-zero value truncates the subscription list and logs a warning —
+    /// useful only for small connectivity tests.
+    #[serde(default)]
+    pub max_accounts: usize,
+    /// Accounts per gRPC subscription stream. 0 = single stream (no sharding).
+    /// Set to e.g. 1000–2000 if the provider limits accounts per request;
+    /// the list is split into chunks, each on its own stream, all writing to
+    /// the same PoolStateStore.
+    #[serde(default)]
+    pub accounts_per_stream: usize,
 }
 
 fn default_mix_json() -> String {
@@ -292,9 +311,33 @@ fn default_mix_json() -> String {
 impl Default for PoolStateConfig {
     fn default() -> Self {
         Self {
+            mode: String::new(),
             enabled: false,
             mix_json: default_mix_json(),
             socket: String::new(),
+            max_accounts: 0,
+            accounts_per_stream: 0,
+        }
+    }
+}
+
+impl PoolStateConfig {
+    /// Resolve the effective data source, honouring the explicit `mode` first
+    /// and falling back to the legacy boolean/socket fields.
+    pub fn resolved_mode(&self) -> &str {
+        match self.mode.trim() {
+            "direct_grpc_fast" | "relay_socket" | "disabled" => self.mode.trim(),
+            "" => {
+                if !self.socket.is_empty() {
+                    "relay_socket"
+                } else if self.enabled {
+                    "direct_grpc_fast"
+                } else {
+                    "disabled"
+                }
+            }
+            // Unknown value — treat as disabled but the caller logs it.
+            _ => "invalid",
         }
     }
 }
