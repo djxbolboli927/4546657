@@ -127,7 +127,7 @@ serve_from_metis = true
 #
 # روی سرور: fanout را با BOT_SOCKET_PATH=/tmp/yellowstone_fanout.sock اجرا کنید
 # بعد اینجا همین مسیر را بدهید.
-socket = ""   # مثال: /tmp/yellowstone_fanout.sock
+socket = "/tmp/yellowstone_fanout.sock"
 #
 # ── fallback: اتصال مستقیم Yellowstone gRPC ───────────────────────────
 # وقتی socket خالی باشد و enabled = true، bot خودش به Yellowstone وصل می‌شود.

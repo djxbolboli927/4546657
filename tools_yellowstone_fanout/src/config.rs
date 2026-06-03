@@ -27,10 +27,12 @@ impl Config {
         let x_token = std::env::var("UPSTREAM_YELLOWSTONE_X_TOKEN").unwrap_or_default();
         let mix_json = std::env::var("MIX_JSON")
             .unwrap_or_else(|_| "/root/c/metis/1/mix.json".to_string());
+        // Default high enough to cover every pool+vaultA+vaultB in mix.json
+        // (713 pools ≈ 2139 accounts). Override with MAX_ACCOUNTS if needed.
         let max_accounts = std::env::var("MAX_ACCOUNTS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(50);
+            .unwrap_or(5000);
 
         let output_mode = match std::env::var("BOT_OUTPUT_MODE").as_deref() {
             Ok("none") => OutputMode::None,
