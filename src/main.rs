@@ -17,7 +17,6 @@ mod rate_limiter;
 mod pool_state_store;
 mod pool_state_stream;
 mod template_cache;
-#[allow(dead_code)]
 mod validator;
 mod token_metrics;
 mod tokens;

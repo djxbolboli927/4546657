@@ -122,27 +122,27 @@ serve_from_metis = true
 
 [pool_state]
 # فاز ۲ — دریافت live state اکانت‌های استخرها از Yellowstone.
-# وقتی enabled = true باشد، ربات از همان endpoint [yellowstone_grpc]
-# به تعداد اکانت‌های mix.json subscribe می‌کند و state زنده را
-# در PoolStateStore نگه می‌دارد.
-# اگر فقط validation.enabled = true باشد، این بخش هم به‌صورت خودکار فعال می‌شود.
-enabled = false
+# وقتی validation.enabled = true باشد این هم فعال می‌شود.
+# مسیر mix.json را با فایل واقعی روی سرور جایگزین کنید.
+enabled = true
 mix_json = "/root/c/metis/1/mix.json"
 
 [jupiter_price]
-# Jupiter Price API V3 — برای اعتبارسنجی قیمت‌های محلی (validation mode).
-# Free tier: 1 req/s، حداکثر 50 mint در هر درخواست.
+# Jupiter Price API V3 — برای اعتبارسنجی قیمت‌های محلی.
+# حداکثر ۵۰ mint در هر درخواست.
 url = "https://api.jup.ag/price/v3"
 api_key = "jup_a12f7d564cf72370a4b3e5a9e0c14f6253d3c1c256314b4116dc83790ec30ee1"
 
 [validation]
-# وقتی enabled = true است:
-#   - loop اصلی ربات (Metis / Jito) کاملاً غیرفعال می‌شود
-#   - فقط Yellowstone pool state stream + مقایسه قیمت با Jupiter اجرا می‌شود
-#   - هیچ تراکنشی ارسال نمی‌شود
-# برای فعال‌سازی: enabled = true  (و pool_state.mix_json را درست کنید)
-enabled = false
+# ════════════════════════════════════════════════════════════════
+# VALIDATION MODE — enabled = true
+#   • loop اصلی ربات (Metis/Jito) کاملاً خاموش می‌شود
+#   • هیچ تراکنشی ارسال نمی‌شود
+#   • فقط Yellowstone → PoolStateStore → مقایسه قیمت با Jupiter
+# برای بازگشت به حالت عادی ربات: enabled = false
+# ════════════════════════════════════════════════════════════════
+enabled = true
 # هر چند ثانیه یک چرخه مقایسه اجرا شود
 interval_secs = 5
-# حداکثر تعداد pool که در هر چرخه در لاگ نشان داده می‌شود (بدترین‌ها اول)
+# حداکثر تعداد pool که در هر چرخه نشان داده می‌شود (بدترین‌ها اول)
 max_pools_log = 20
