@@ -1,7 +1,5 @@
 use anyhow::{Context, Result};
 
-/// Where the bot sink writes decoded updates. Phase A only needs stdout (for
-/// eyeballing) and none (pure metrics, to measure throughput without I/O).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
     Stdout,
@@ -15,16 +13,17 @@ pub struct Config {
     pub mix_json: String,
     pub max_accounts: usize,
     pub output_mode: OutputMode,
-    /// When true, emit full base64 account data (heavy). Off by default so the
-    /// hot path never base64-encodes multi-KB account blobs.
+    /// When true, emit full base64 account data (heavy). Off by default.
     pub dump_json: bool,
+    /// Unix socket path to serve decoded updates to the bot.
+    /// Set BOT_SOCKET_PATH to enable. Empty = disabled.
+    pub socket_path: String,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self> {
         let upstream_endpoint = std::env::var("UPSTREAM_YELLOWSTONE_ENDPOINT")
             .context("UPSTREAM_YELLOWSTONE_ENDPOINT not set")?;
-        // x_token is optional — PublicNode may or may not require it.
         let x_token = std::env::var("UPSTREAM_YELLOWSTONE_X_TOKEN").unwrap_or_default();
         let mix_json = std::env::var("MIX_JSON")
             .unwrap_or_else(|_| "/root/c/metis/1/mix.json".to_string());
@@ -38,9 +37,10 @@ impl Config {
             _ => OutputMode::Stdout,
         };
 
-        // --dump-json on the CLI or DUMP_JSON=1 in the env.
         let dump_json = std::env::args().any(|a| a == "--dump-json")
             || matches!(std::env::var("DUMP_JSON").as_deref(), Ok("1") | Ok("true"));
+
+        let socket_path = std::env::var("BOT_SOCKET_PATH").unwrap_or_default();
 
         Ok(Self {
             upstream_endpoint,
@@ -49,6 +49,7 @@ impl Config {
             max_accounts,
             output_mode,
             dump_json,
+            socket_path,
         })
     }
 }

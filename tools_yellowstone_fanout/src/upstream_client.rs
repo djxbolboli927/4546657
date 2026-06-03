@@ -10,22 +10,16 @@ use yellowstone_grpc_proto::prelude::{
     SubscribeRequestFilterAccounts, SubscribeRequestPing,
 };
 
-use crate::bot_sink;
+use crate::bot_sink::{self, BroadcastTx};
 use crate::config::Config;
 use crate::metrics::Metrics;
 
-/// Connect to the upstream Yellowstone endpoint, subscribe to the explicit
-/// account list, and forward every account update to the bot sink.
-///
-/// Returns Ok(()) on a clean stream end (caller reconnects) and Err on any
-/// connect/subscribe/stream error (caller reconnects with backoff).
 pub async fn run_stream(
     cfg: &Config,
     accounts: &[String],
     metrics: &Arc<Metrics>,
+    tx: &BroadcastTx,
 ) -> Result<()> {
-    // Mirror the bot's proven connection setup (account_cache.rs): TLS with
-    // native roots, 64 MiB max decode size, optional x-token.
     let mut builder = GeyserGrpcClient::build_from_shared(cfg.upstream_endpoint.clone())?;
     if !cfg.x_token.is_empty() {
         builder = builder.x_token(Some(cfg.x_token.clone()))?;
@@ -64,7 +58,7 @@ pub async fn run_stream(
         from_slot: None,
     };
 
-    let (mut tx, mut stream) = client
+    let (mut ping_tx, mut stream) = client
         .subscribe_with_request(Some(request))
         .await
         .context("gRPC subscribe failed")?;
@@ -84,6 +78,7 @@ pub async fn run_stream(
                     let owner = bs58::encode(&info.owner).into_string();
                     bot_sink::emit_account(
                         cfg,
+                        tx,
                         a.slot,
                         &pubkey,
                         &owner,
@@ -94,9 +89,8 @@ pub async fn run_stream(
                     );
                 }
             }
-            // Keepalive: echo pings so the upstream doesn't drop us.
             Some(UpdateOneof::Ping(_)) => {
-                let _ = tx
+                let _ = ping_tx
                     .send(SubscribeRequest {
                         ping: Some(SubscribeRequestPing { id: 1 }),
                         ..Default::default()

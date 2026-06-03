@@ -14,6 +14,7 @@ mod metis;
 mod metrics;
 mod program_registry;
 mod rate_limiter;
+mod pool_state_socket;
 mod pool_state_store;
 mod pool_state_stream;
 mod template_cache;
@@ -97,15 +98,18 @@ async fn async_main(config: config::Config) -> Result<()> {
         template_store.spawn_flush_task(60);
     }
 
-    // ── Pool state stream + optional price validator ──────────────────────────
-    // When pool_state.enabled = true: subscribes to all pool accounts from
-    // mix.json via Yellowstone and keeps a live PoolStateStore in memory.
+    // ── Pool state + optional price validator ────────────────────────────────
+    // Data source priority:
+    //   1. pool_state.socket  — reads from yellowstone_fanout Unix socket
+    //      (recommended: same data as Metis, no extra Yellowstone connection)
+    //   2. pool_state.enabled — direct Yellowstone gRPC subscription (fallback)
     //
-    // When validation.enabled = true: ALSO starts the price validator which
-    // compares on-chain spot prices against Jupiter Price API V3.
-    // In validation mode the normal Metis/Jito bot loop is skipped entirely —
-    // no quotes are fetched and no transactions are sent.
-    let pool_state_result = if config.pool_state.enabled || config.validation.enabled {
+    // When validation.enabled = true the normal Metis/Jito bot loop is skipped.
+    let need_pool_state = !config.pool_state.socket.is_empty()
+        || config.pool_state.enabled
+        || config.validation.enabled;
+
+    let pool_state_result = if need_pool_state {
         match pool_state_stream::load_mix_json(&config.pool_state.mix_json) {
             Ok(parsed) => {
                 let store = pool_state_store::PoolStateStore::new(
@@ -113,22 +117,38 @@ async fn async_main(config: config::Config) -> Result<()> {
                     parsed.pool_to_accounts,
                 );
                 eprintln!(
-                    "[pool_state] loaded mix.json: {} pools, {} subscribe accounts, {} vault pairs",
+                    "[pool_state] mix.json: {} pools, {} accounts, {} vault pairs",
                     store.pool_count,
                     parsed.subscribe_list.len(),
                     parsed.vault_pairs.len(),
                 );
-                pool_state_stream::spawn_pool_state_stream(
-                    config.yellowstone_grpc.endpoint.clone(),
-                    config.yellowstone_grpc.x_token.clone(),
-                    parsed.subscribe_list,
-                    store.clone(),
-                );
+
+                if !config.pool_state.socket.is_empty() {
+                    // ── Preferred: read from fanout socket (no extra gRPC) ──────
+                    eprintln!(
+                        "[pool_state] data source: fanout socket {}",
+                        config.pool_state.socket
+                    );
+                    pool_state_socket::spawn_socket_reader(
+                        config.pool_state.socket.clone(),
+                        store.clone(),
+                    );
+                } else if config.pool_state.enabled || config.validation.enabled {
+                    // ── Fallback: direct Yellowstone gRPC ───────────────────────
+                    eprintln!("[pool_state] data source: direct Yellowstone gRPC");
+                    pool_state_stream::spawn_pool_state_stream(
+                        config.yellowstone_grpc.endpoint.clone(),
+                        config.yellowstone_grpc.x_token.clone(),
+                        parsed.subscribe_list,
+                        store.clone(),
+                    );
+                }
+
                 Some((store, parsed.vault_pairs))
             }
             Err(e) => {
                 eprintln!(
-                    "[pool_state] WARNING: could not load mix.json ({e}); pool state stream disabled"
+                    "[pool_state] WARNING: could not load mix.json ({e}); pool state disabled"
                 );
                 None
             }

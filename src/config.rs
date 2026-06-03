@@ -271,15 +271,18 @@ fn default_true_tc() -> bool {
 /// In Phase A it simply receives and stores data — no calculator is wired yet.
 #[derive(Debug, Deserialize, Clone)]
 pub struct PoolStateConfig {
-    /// Enable the pool-state Yellowstone subscription. Default: false so
-    /// existing configs continue to work without change. Set to true once
-    /// mix_json is present and the operator wants the store active.
+    /// Enable direct Yellowstone gRPC subscription (fallback when socket is empty).
     #[serde(default)]
     pub enabled: bool,
-    /// Path to the Metis market-cache file (mix.json).
-    /// Default: /root/c/metis/1/mix.json
+    /// Path to mix.json (Metis market cache).
     #[serde(default = "default_mix_json")]
     pub mix_json: String,
+    /// Unix socket written by yellowstone_fanout_phase_a.
+    /// When non-empty the bot reads from here instead of connecting to Yellowstone.
+    /// Set to the same value as BOT_SOCKET_PATH in the fanout process.
+    /// Example: /tmp/yellowstone_fanout.sock
+    #[serde(default)]
+    pub socket: String,
 }
 
 fn default_mix_json() -> String {
@@ -291,6 +294,7 @@ impl Default for PoolStateConfig {
         Self {
             enabled: false,
             mix_json: default_mix_json(),
+            socket: String::new(),
         }
     }
 }
