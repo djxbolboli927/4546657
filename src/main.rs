@@ -99,16 +99,32 @@ async fn async_main(config: config::Config) -> Result<()> {
         template_store.spawn_flush_task(60);
     }
 
-    // ── Pool state + optional price validator ────────────────────────────────
-    // Data source priority:
-    //   1. pool_state.socket  — reads from yellowstone_fanout Unix socket
-    //      (recommended: same data as Metis, no extra Yellowstone connection)
-    //   2. pool_state.enabled — direct Yellowstone gRPC subscription (fallback)
+    // ── Pool state data source — explicit, no implicit gRPC ─────────────────
+    // Priority (mutually exclusive, first match wins):
+    //   1. pool_state.socket non-empty  → relay socket (no direct gRPC)
+    //   2. pool_state.enabled = true    → direct Yellowstone gRPC (test only)
+    //   3. neither                      → pool state disabled
     //
-    // When validation.enabled = true the normal Metis/Jito bot loop is skipped.
-    let need_pool_state = !config.pool_state.socket.is_empty()
-        || config.pool_state.enabled
-        || config.validation.enabled;
+    // validation.enabled is a *consumer* flag — it never selects a data source.
+    // If validation is on but no data source is configured, we bail immediately
+    // with a clear message rather than silently connecting to gRPC.
+    enum PoolStateSource { RelaySocket, DirectGrpc, Disabled }
+    let pool_state_source = if !config.pool_state.socket.is_empty() {
+        PoolStateSource::RelaySocket
+    } else if config.pool_state.enabled {
+        PoolStateSource::DirectGrpc
+    } else {
+        if config.validation.enabled {
+            anyhow::bail!(
+                "validation.enabled=true but no pool state source is configured.\n\
+                 Either set [pool_state].socket = \"/tmp/yellowstone_fanout.sock\"\n\
+                 or set [pool_state].enabled = true (direct gRPC test mode)."
+            );
+        }
+        PoolStateSource::Disabled
+    };
+
+    let need_pool_state = !matches!(pool_state_source, PoolStateSource::Disabled);
 
     let pool_state_result = if need_pool_state {
         match pool_state_stream::load_mix_json(&config.pool_state.mix_json) {
@@ -124,25 +140,27 @@ async fn async_main(config: config::Config) -> Result<()> {
                     parsed.vault_pairs.len(),
                 );
 
-                if !config.pool_state.socket.is_empty() {
-                    // ── Preferred: read from fanout socket (no extra gRPC) ──────
-                    eprintln!(
-                        "[pool_state] data source: fanout socket {}",
-                        config.pool_state.socket
-                    );
-                    pool_state_socket::spawn_socket_reader(
-                        config.pool_state.socket.clone(),
-                        store.clone(),
-                    );
-                } else if config.pool_state.enabled || config.validation.enabled {
-                    // ── Fallback: direct Yellowstone gRPC ───────────────────────
-                    eprintln!("[pool_state] data source: direct Yellowstone gRPC");
-                    pool_state_stream::spawn_pool_state_stream(
-                        config.yellowstone_grpc.endpoint.clone(),
-                        config.yellowstone_grpc.x_token.clone(),
-                        parsed.subscribe_list,
-                        store.clone(),
-                    );
+                match pool_state_source {
+                    PoolStateSource::RelaySocket => {
+                        eprintln!(
+                            "[pool_state] data source: relay socket {}",
+                            config.pool_state.socket
+                        );
+                        pool_state_socket::spawn_socket_reader(
+                            config.pool_state.socket.clone(),
+                            store.clone(),
+                        );
+                    }
+                    PoolStateSource::DirectGrpc => {
+                        eprintln!("[pool_state] data source: direct Yellowstone gRPC");
+                        pool_state_stream::spawn_pool_state_stream(
+                            config.yellowstone_grpc.endpoint.clone(),
+                            config.yellowstone_grpc.x_token.clone(),
+                            parsed.subscribe_list,
+                            store.clone(),
+                        );
+                    }
+                    PoolStateSource::Disabled => unreachable!(),
                 }
 
                 Some((store, parsed.vault_pairs))

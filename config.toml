@@ -132,7 +132,7 @@ socket = ""   # مثال: /tmp/yellowstone_fanout.sock
 # ── fallback: اتصال مستقیم Yellowstone gRPC ───────────────────────────
 # وقتی socket خالی باشد و enabled = true، bot خودش به Yellowstone وصل می‌شود.
 # این حالت دیر‌تر داده دریافت می‌کند (≈400ms) — برای تست اولیه قابل قبول است.
-enabled = true
+enabled = false
 mix_json = "/root/c/metis/1/mix.json"
 
 [jupiter_price]
