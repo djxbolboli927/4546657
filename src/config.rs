@@ -16,6 +16,8 @@ pub struct Config {
     pub jito_grpc: JitoGrpcConfig,
     #[serde(default)]
     pub template_cache: TemplateCacheConfig,
+    #[serde(default)]
+    pub pool_state: PoolStateConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -251,6 +253,42 @@ impl Default for TemplateCacheConfig {
 
 fn default_true_tc() -> bool {
     true
+}
+
+// ── Pool state stream config ──────────────────────────────────────────────────
+
+/// Configuration for the live pool-account state stream (Phase 2).
+///
+/// When `enabled = true`, the bot connects to the same Yellowstone endpoint
+/// used by the account_cache, subscribes to all pool accounts listed in
+/// `mix_json`, and keeps a live PoolStateStore in memory.
+///
+/// This store feeds the per-DEX price/slippage calculators (Phase 2 step 2).
+/// In Phase A it simply receives and stores data — no calculator is wired yet.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PoolStateConfig {
+    /// Enable the pool-state Yellowstone subscription. Default: false so
+    /// existing configs continue to work without change. Set to true once
+    /// mix_json is present and the operator wants the store active.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the Metis market-cache file (mix.json).
+    /// Default: /root/c/metis/1/mix.json
+    #[serde(default = "default_mix_json")]
+    pub mix_json: String,
+}
+
+fn default_mix_json() -> String {
+    "/root/c/metis/1/mix.json".to_string()
+}
+
+impl Default for PoolStateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mix_json: default_mix_json(),
+        }
+    }
 }
 
 impl Config {

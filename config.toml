@@ -119,3 +119,13 @@ max_bundles_per_second = 5
 save_new = true
 serve_route = true
 serve_from_metis = true
+
+[pool_state]
+# فاز ۲ — دریافت live state اکانت‌های استخرها از Yellowstone.
+# وقتی enabled = true باشد، ربات از همان endpoint [yellowstone_grpc]
+# به تعداد اکانت‌های mix.json subscribe می‌کند و state زنده را
+# در PoolStateStore نگه می‌دارد (پایه محاسبه قیمت هر DEX).
+# فعلاً فقط دریافت و ذخیره است؛ کالکولاتور در مرحله بعد وصل می‌شود.
+# برای فعال‌سازی:  enabled = true
+enabled = false
+mix_json = "/root/c/metis/1/mix.json"

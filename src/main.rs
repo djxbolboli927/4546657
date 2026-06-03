@@ -14,6 +14,8 @@ mod metis;
 mod metrics;
 mod program_registry;
 mod rate_limiter;
+mod pool_state_store;
+mod pool_state_stream;
 mod template_cache;
 mod token_metrics;
 mod tokens;
@@ -92,6 +94,33 @@ async fn async_main(config: config::Config) -> Result<()> {
             "[template] loaded {hops_loaded} hop templates and {routes_loaded} route templates from /root/c/cache/"
         );
         template_store.spawn_flush_task(60);
+    }
+
+    // ── Pool state stream (Phase 2 / data acquisition) ───────────────────────
+    // Subscribes to all pool accounts from mix.json via the same Yellowstone
+    // endpoint the bot already uses. Keeps a live PoolStateStore in memory
+    // for later use by per-DEX price calculators.
+    // Enabled only when [pool_state] enabled = true in config.toml.
+    if config.pool_state.enabled {
+        match pool_state_stream::load_mix_json(&config.pool_state.mix_json) {
+            Ok((a2p, p2a, subscribe_accounts)) => {
+                let store = pool_state_store::PoolStateStore::new(a2p, p2a);
+                eprintln!(
+                    "[pool_state] loaded mix.json: {} pools, {} subscribe accounts",
+                    store.pool_count,
+                    subscribe_accounts.len()
+                );
+                pool_state_stream::spawn_pool_state_stream(
+                    config.yellowstone_grpc.endpoint.clone(),
+                    config.yellowstone_grpc.x_token.clone(),
+                    subscribe_accounts,
+                    store,
+                );
+            }
+            Err(e) => {
+                eprintln!("[pool_state] WARNING: could not load mix.json ({e}); pool state stream disabled");
+            }
+        }
     }
 
     let metrics = metrics::Metrics::new();
