@@ -44,6 +44,14 @@ pub struct PoolVaultPair {
     pub pool: Pubkey,
     pub vault_a: Pubkey,
     pub vault_b: Pubkey,
+    /// The pool account's owner program id (from mix.json "owner"), used to
+    /// classify which DEX engine handles this pool. May be default/zero when
+    /// mix.json omits it (then the validator falls back to the live account's
+    /// owner from the store).
+    pub owner: Pubkey,
+    /// Optional CPMM AmmConfig account (from params "config"/"ammConfig"),
+    /// needed to read the per-pool trade_fee_rate.
+    pub amm_config: Option<Pubkey>,
 }
 
 /// All data produced by a single mix.json parse.
@@ -92,11 +100,28 @@ pub fn load_mix_json(path: &str) -> Result<MixJsonResult> {
         // Always include the pool address itself.
         let mut candidates = vec![pool_pk_str.to_string()];
 
+        // Pool owner program id (classifies the DEX for the validator).
+        let owner: Pubkey = pool
+            .get("owner")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default();
+
         // Extract vault pair for the price validator.
         let mut vault_a_str: Option<String> = None;
         let mut vault_b_str: Option<String> = None;
+        let mut amm_config: Option<Pubkey> = None;
 
         if let Some(params) = pool.get("params") {
+            // CPMM AmmConfig account (per-pool trade_fee_rate lives here).
+            for key in &["config", "ammConfig", "amm_config"] {
+                if let Some(s) = params.get(*key).and_then(|v| v.as_str()) {
+                    if let Ok(pk) = s.parse::<Pubkey>() {
+                        amm_config = Some(pk);
+                        break;
+                    }
+                }
+            }
             // Mandatory token accounts.
             for key in &["tokenAccountA", "tokenAccountB"] {
                 if let Some(s) = params.get(key).and_then(|v| v.as_str()) {
@@ -127,6 +152,8 @@ pub fn load_mix_json(path: &str) -> Result<MixJsonResult> {
                     pool: pool_pk,
                     vault_a: va,
                     vault_b: vb,
+                    owner,
+                    amm_config,
                 });
             }
         }

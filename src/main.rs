@@ -4,6 +4,7 @@ mod alt_cache;
 mod arbitrage;
 mod blockhash_cache;
 mod config;
+mod dex;
 mod dex_accounts;
 mod jito;
 #[allow(dead_code)]
@@ -163,6 +164,7 @@ async fn async_main(config: config::Config) -> Result<()> {
             validator::spawn_validator(
                 vault_pairs,
                 store,
+                rpc_client.clone(),
                 config.validation.clone(),
                 config.jupiter_price.clone(),
             );
