@@ -526,6 +526,7 @@ spot_atomic={sa:.8} local={lo:.8} jup_ratio={jp:.8} diff={d:.1}bps slot={sl}",
         diffs.iter().map(|(d, _)| d).sum::<f64>() / diffs.len() as f64
     };
     let max = diffs.first().map(|(d, _)| *d).unwrap_or(0.0);
+    let min = diffs.last().map(|(d, _)| *d).unwrap_or(0.0);
 
     let dmm_live = live.iter().filter(|d| d.engine == Engine::MeteoraDammV2).count();
     let wpool_live = live.iter().filter(|d| d.engine == Engine::OrcaWhirlpool).count();
@@ -536,7 +537,7 @@ spot_atomic={sa:.8} local={lo:.8} jup_ratio={jp:.8} diff={d:.1}bps slot={sl}",
     eprintln!(
         "[validator] pools_live={live} (cp={cp} damm_v2={dmm} whirlpool={wp} ray_clmm={rc} pumpswap={ps} dlmm={dl}) \
 compared={ok} skipped_unsupported={skip} no_jup={nj} no_decimals={nd} \
-avg={avg:.1}bps max={max:.1}bps",
+avg={avg:.1}bps max={max:.1}bps min={min:.1}bps",
         live = live.len(),
         cp = cp_live,
         dmm = dmm_live,
@@ -550,10 +551,17 @@ avg={avg:.1}bps max={max:.1}bps",
         nd = no_dec,
         avg = avg,
         max = max,
+        min = min,
     );
-    let n = if debug { diffs.len() } else { max_log };
-    for (_, line) in diffs.iter().take(n) {
-        eprintln!("[validator]   {line}");
+    // Individual pool lines: only in VALIDATOR_DEBUG=1 mode or when max_pools_log > 0.
+    if debug {
+        for (_, line) in diffs.iter() {
+            eprintln!("[validator]   {line}");
+        }
+    } else if max_log > 0 {
+        for (_, line) in diffs.iter().take(max_log) {
+            eprintln!("[validator]   {line}");
+        }
     }
 }
 

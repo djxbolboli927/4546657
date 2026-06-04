@@ -989,15 +989,21 @@ pub const ERROR_MARGIN_PER_HOP: u64 = 100;
 /// never blocks the async runtime: the gRPC stream ingestion and the price
 /// validator keep running on the worker threads while the search executes on a
 /// blocking-pool thread. On a 4-core box this keeps reserve data fresh.
+///
+/// If `hit_tx` is `Some`, all net-positive hits are forwarded to the cycle
+/// executor via the channel (non-blocking — hits are dropped if the channel
+/// is full rather than stalling the scanner).
 pub fn spawn_cycle_scanner(
     pairs: Vec<PoolVaultPair>,
     store: Arc<PoolStateStore>,
     interval_secs: u64,
     max_log: usize,
     tx_cost: u64,
+    hit_tx: Option<tokio::sync::mpsc::Sender<CycleHit>>,
 ) {
     let metrics = Arc::new(CycleMetrics::default());
     let pairs = Arc::new(pairs);
+    let hit_tx = Arc::new(hit_tx);
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
@@ -1109,6 +1115,14 @@ path=[{}]  via=[{}]",
                     path.join("→"),
                     if mints.is_empty() { "direct".to_string() } else { mints.join("→") },
                 );
+            }
+
+            // Forward net-positive hits to the executor (non-blocking).
+            if let Some(ref sender) = *hit_tx {
+                for hit in hits.iter().filter(|h| h.profit_net > 0) {
+                    // try_send never blocks — drops hit if executor is behind.
+                    let _ = sender.try_send(hit.clone());
+                }
             }
 
             // Summary stats.

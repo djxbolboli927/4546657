@@ -153,12 +153,20 @@ api_key = "jup_a12f7d564cf72370a4b3e5a9e0c14f6253d3c1c256314b4116dc83790ec30ee1"
 # ════════════════════════════════════════════════════════════════
 # VALIDATION MODE — enabled = true
 #   • loop اصلی ربات (Metis/Jito) کاملاً خاموش می‌شود
-#   • هیچ تراکنشی ارسال نمی‌شود
-#   • فقط Yellowstone → PoolStateStore → مقایسه قیمت با Jupiter
+#   • arb_cycle مسیرهای سودده را محلی پیدا می‌کند
+#   • اگر execute_cycles = true: هر hit سودده به Metis فرستاده شده
+#     و اگر Metis هم تأیید کرد → swap-instructions → Jito bundle
 # برای بازگشت به حالت عادی ربات: enabled = false
 # ════════════════════════════════════════════════════════════════
 enabled = true
-# هر چند ثانیه یک چرخه مقایسه اجرا شود
+# هر چند ثانیه یک چرخه scan اجرا شود
 interval_secs = 5
-# حداکثر تعداد pool که در هر چرخه نشان داده می‌شود (بدترین‌ها اول)
-max_pools_log = 20
+# حداکثر تعداد pool لاین که در هر چرخه validator نشان داده می‌شود.
+# 0 = فقط max/min diff نمایش داده می‌شود (بدون لیست جداگانه استخرها)
+max_pools_log = 0
+# وقتی true است: cycleهای net-positive به Metis برای ساخت اینستراکشن
+# فرستاده شده و سپس به Jito ارسال می‌شوند.
+execute_cycles = true
+# حداقل سود محلی (و تأیید Metis) به لمپرت قبل از رفتن به /swap-instructions.
+# 6600 = tx_fee(5000) + jito_tip(1000) + margin(600)
+min_exec_profit_lamports = 6600

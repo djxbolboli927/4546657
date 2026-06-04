@@ -5,6 +5,7 @@ mod arbitrage;
 mod arb_cycle;
 mod blockhash_cache;
 mod config;
+mod cycle_executor;
 mod dex;
 mod dex_accounts;
 mod jito;
@@ -197,10 +198,12 @@ async fn async_main(config: config::Config) -> Result<()> {
         None
     };
 
-    // ── Validation mode: price comparison + cycle scan, no Jito ─────────────
+    // ── Validation mode: price comparison + cycle scan ───────────────────────
+    // When execute_cycles=true, profitable cycles are also forwarded to Metis
+    // for /swap-instructions and then submitted to Jito.
     if config.validation.enabled {
         if let Some((store, vault_pairs)) = pool_state_result {
-            // 1. Jupiter price validator (same-pool local vs Jupiter reference).
+            // 1. Jupiter price validator (local spot price vs Jupiter reference).
             validator::spawn_validator(
                 vault_pairs.clone(),
                 store.clone(),
@@ -209,19 +212,88 @@ async fn async_main(config: config::Config) -> Result<()> {
                 config.jupiter_price.clone(),
             );
 
-            // 2. WSOL cycle evaluator — find 2-hop and 3-hop arb opportunities.
-            //    Does NOT send to Jito; only logs and counts profitable cycles.
+            // 2. Optionally init execution stack and forward hits to Jito.
+            let hit_tx = if config.validation.execute_cycles {
+                let blockhash_cache_exec = Arc::new(BlockhashCache::new(rpc_client.clone()));
+                let alt_cache_exec = AltCache::new(transaction::jito_tip_pubkeys());
+                let metis_exec = Arc::new(metis::MetisClient::new(
+                    &config.metis.url,
+                    config.performance.quote_timeout_ms,
+                ));
+                let jito_exec = Arc::new(jito::JitoClient::new(
+                    &config.jito.urls,
+                    &config.jito.uuid,
+                ));
+                let jito_lim_exec = Arc::new(Mutex::new(
+                    RateLimiter::new(config.jito.max_bundles_per_second),
+                ));
+
+                let (jito_grpc_exec, grpc_lim_exec) = if config.jito_grpc.enabled {
+                    match jito_grpc::JitoGrpcClient::new(
+                        &config.jito_grpc.endpoints,
+                        &config.jito_grpc.auth_keypair,
+                    )
+                    .await
+                    {
+                        Ok(client) => {
+                            let lim = Arc::new(Mutex::new(RateLimiter::new(
+                                config.jito_grpc.max_bundles_per_second,
+                            )));
+                            (Some(Arc::new(client)), Some(lim))
+                        }
+                        Err(e) => {
+                            eprintln!("[executor] Jito gRPC init failed: {e} — REST-only");
+                            (None, None)
+                        }
+                    }
+                } else {
+                    (None, None)
+                };
+
+                let ctx = Arc::new(cycle_executor::ExecutorCtx {
+                    metis: metis_exec,
+                    jito: jito_exec,
+                    jito_grpc: jito_grpc_exec,
+                    jito_limiter: jito_lim_exec,
+                    jito_grpc_limiter: grpc_lim_exec,
+                    trading_keypair: trading_keypair.clone(),
+                    rpc_client: rpc_client.clone(),
+                    blockhash_cache: blockhash_cache_exec,
+                    alt_cache: alt_cache_exec,
+                    cu_limits: config.performance.cu_limits.clone(),
+                    user_pubkey: trading_keypair.pubkey().to_string(),
+                    min_profit_lamports: config.validation.min_exec_profit_lamports,
+                    tip_lamports: config.jito.tip_min_lamports,
+                    base_fee_lamports: config.trading.base_fee_lamports,
+                });
+
+                let (tx, rx) = tokio::sync::mpsc::channel(200);
+                cycle_executor::spawn_cycle_executor(rx, ctx);
+                eprintln!(
+                    "[executor] started — min_profit={}L tip={}L base_fee={}L",
+                    config.validation.min_exec_profit_lamports,
+                    config.jito.tip_min_lamports,
+                    config.trading.base_fee_lamports,
+                );
+                Some(tx)
+            } else {
+                None
+            };
+
+            // 3. WSOL cycle evaluator — finds 2-hop and 3-hop arb opportunities.
+            //    Net-positive hits are forwarded to executor when execute_cycles=true.
             arb_cycle::spawn_cycle_scanner(
                 vault_pairs,
                 store,
                 config.validation.interval_secs,
                 config.validation.max_pools_log,
                 arb_cycle::DEFAULT_TX_COST,
+                hit_tx,
             );
         } else {
             eprintln!("[validator] ERROR: pool state unavailable; set pool_state.mix_json in config");
         }
-        // Park here until ctrl-c — no bot activity
+        // Park here until ctrl-c.
         tokio::signal::ctrl_c().await.ok();
         return Ok(());
     }

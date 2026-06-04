@@ -374,7 +374,12 @@ impl Default for JupiterPriceConfig {
 
 /// When `enabled = true`, the bot starts ONLY the pool-state stream and the
 /// price validator — the normal Metis/Jito scan loop is not started.
-/// No transactions are sent in this mode.
+///
+/// When `execute_cycles = true` is added, net-positive cycles found by the
+/// local scanner are forwarded to Metis for /swap-instructions and then
+/// submitted to Jito.  This reuses the same Jito credentials as production
+/// mode.  Template-cache tier-1/2 (RAM serve) is not used; every hit goes
+/// directly to Metis.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ValidationConfig {
     /// Enable validation mode. Default: false.
@@ -383,21 +388,32 @@ pub struct ValidationConfig {
     /// How often to run a comparison cycle (seconds). Default: 5.
     #[serde(default = "default_val_interval")]
     pub interval_secs: u64,
-    /// Maximum number of pool lines to print per cycle (sorted by diff).
-    /// Use 0 for all. Default: 20.
+    /// Maximum number of pool lines to print per validator cycle (sorted by diff).
+    /// Set to 0 to suppress individual pool lines and show only max/min summary.
     #[serde(default = "default_val_max_log")]
     pub max_pools_log: usize,
+    /// When true, net-positive arb_cycle hits are forwarded to Metis for
+    /// /swap-instructions and submitted to Jito. Default: false.
+    #[serde(default)]
+    pub execute_cycles: bool,
+    /// Minimum local (and Metis-confirmed) profit in lamports before a cycle
+    /// hit is sent to /swap-instructions.  Default: 6600.
+    #[serde(default = "default_min_exec_profit")]
+    pub min_exec_profit_lamports: u64,
 }
 
 fn default_val_interval() -> u64 { 5 }
-fn default_val_max_log() -> usize { 20 }
+fn default_val_max_log() -> usize { 0 }
+fn default_min_exec_profit() -> u64 { 6_600 }
 
 impl Default for ValidationConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             interval_secs: 5,
-            max_pools_log: 20,
+            max_pools_log: 0,
+            execute_cycles: false,
+            min_exec_profit_lamports: 6_600,
         }
     }
 }
