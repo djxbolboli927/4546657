@@ -8,6 +8,7 @@
 //!
 //! Source cross-validation:
 //!   • raydium-io/raydium-clmm programs/amm/src/ (PoolState layout, AmmConfig)
+//!   • raydium-io/raydium-clmm programs/amm/src/states/tick_array.rs (TickArray)
 //!   • Raydium CLMM on-chain program: tick math identical to Whirlpool / Uniswap v3
 //!
 //! Fee is in the pool's AmmConfig account (separate from the pool account):
@@ -39,6 +40,28 @@
 //!   11..43 owner (Pubkey)
 //!   43..47 protocol_fee_rate (u32)
 //!   47..51 trade_fee_rate (u32)  ← fee used for swap math
+//!
+//! TickArrayState layout (Anchor zero_copy, LE integers, repr(packed)):
+//!   0..8    discriminator
+//!   8..40   pool_id (Pubkey)
+//!   40..44  start_tick_index (i32)
+//!   44..14924  ticks: [TickState; TICK_ARRAY_SIZE=60]  (each 248 bytes, repr(packed))
+//!     Each TickState (248 bytes, repr(packed)):
+//!       0..4    tick (i32)
+//!       4..20   liquidity_net (i128)  ← used for crossing
+//!       20..36  liquidity_gross (u128)
+//!       36..52  fee_growth_outside_0_x64 (u128)
+//!       52..68  fee_growth_outside_1_x64 (u128)
+//!       68..76  tick_cumulative_outside (i64)
+//!       76..92  seconds_per_liquidity_outside_x64 (u128)
+//!       92..96  seconds_outside (u32)
+//!       96..144 rewards_growth_outside ([u128; 3])
+//!       144..248 padding ([u64; 13])
+//!   14924..14925 initialized_tick_count (u8)
+//!   14932..14940 recent_epoch (u64)  [+7 align padding after initialized_tick_count]
+//!   14940..15684 padding ([u64; 93])
+//!
+//! TickArray PDA seeds: [b"tick_array", pool_id, start_tick_index_i32_be_bytes]
 
 use solana_sdk::pubkey::Pubkey;
 
@@ -49,6 +72,12 @@ pub const PROGRAM_ID: Pubkey =
 
 /// Denominator for `trade_fee_rate` (parts per million).
 pub const FEE_RATE_DENOMINATOR: u32 = 1_000_000;
+
+/// Ticks per TickArray (from raydium-clmm constants.rs).
+pub const TICK_ARRAY_SIZE: i32 = 60;
+
+/// Max ticks the multi-tick quote will cross before giving up (prevents pathological loops).
+const MAX_TICKS_CROSSED: u32 = 20;
 
 mod pool_offsets {
     pub const AMM_CONFIG: usize = 9;
@@ -66,6 +95,21 @@ mod pool_offsets {
 mod amm_config_offsets {
     pub const TRADE_FEE_RATE: usize = 47;
     pub const MIN_LEN: usize = 51;
+}
+
+mod tick_array_offsets {
+    /// Byte offset of start_tick_index within TickArrayState.
+    pub const START_TICK_INDEX: usize = 40;
+    /// Byte offset of the first TickState within TickArrayState.
+    pub const TICKS_START: usize = 44;
+    /// Size of one TickState (repr(packed), no internal padding).
+    pub const TICK_STATE_SIZE: usize = 248;
+    /// Byte offset of `tick` within a TickState.
+    pub const TICK_OFFSET: usize = 0;
+    /// Byte offset of `liquidity_net` (i128) within a TickState.
+    pub const LIQUIDITY_NET_OFFSET: usize = 4;
+    /// Minimum TickArrayState length to be valid.
+    pub const MIN_LEN: usize = 44 + 60 * 248; // 14924 bytes
 }
 
 /// Snapshot of Raydium CLMM pool state for local quote computation.
@@ -178,6 +222,70 @@ pub fn fee_rate_from_tick_spacing(tick_spacing: u16) -> u32 {
     }
 }
 
+/// Compute the start tick index of the TickArray that contains `tick`.
+///
+/// From raydium-clmm source (math/mod.rs):
+///   start = floor(tick / (tick_spacing * TICK_ARRAY_SIZE)) × (tick_spacing * TICK_ARRAY_SIZE)
+/// Special case for negative ticks: floor towards −∞, not 0 (same as div_euclid).
+pub fn tick_array_start_index(tick: i32, tick_spacing: u16) -> i32 {
+    let ticks_per_array = tick_spacing as i32 * TICK_ARRAY_SIZE;
+    // Rust div rounds toward zero; we need floor (towards -∞).
+    tick.div_euclid(ticks_per_array) * ticks_per_array
+}
+
+/// Derive the PDA for a Raydium CLMM TickArray account.
+///
+/// Seeds: `[b"tick_array", pool_id, start_tick_index.to_be_bytes()]`
+/// (big-endian i32 — confirmed from raydium SDK source)
+pub fn derive_tick_array_pda(pool_id: &Pubkey, start_tick_index: i32) -> Pubkey {
+    let (pda, _) = Pubkey::find_program_address(
+        &[
+            b"tick_array",
+            pool_id.as_ref(),
+            &start_tick_index.to_be_bytes(),
+        ],
+        &PROGRAM_ID,
+    );
+    pda
+}
+
+/// Read the `liquidity_net` (i128, LE) for the tick at `tick_index` from a
+/// raw TickArrayState account.  Returns `None` if the array doesn't cover
+/// that tick or the data is too short.
+fn read_liquidity_net(
+    data: &[u8],
+    tick_index: i32,
+    start_tick_index: i32,
+    tick_spacing: u16,
+) -> Option<i128> {
+    use tick_array_offsets::*;
+    if data.len() < MIN_LEN {
+        return None;
+    }
+    // Verify stored start_tick_index matches.
+    let stored_start = i32::from_le_bytes(
+        data[START_TICK_INDEX..START_TICK_INDEX + 4].try_into().ok()?,
+    );
+    if stored_start != start_tick_index {
+        return None;
+    }
+    // Which slot in the array?
+    let slot = (tick_index - start_tick_index) / tick_spacing as i32;
+    if slot < 0 || slot >= TICK_ARRAY_SIZE {
+        return None;
+    }
+    let base = TICKS_START + slot as usize * TICK_STATE_SIZE;
+    if data.len() < base + TICK_STATE_SIZE {
+        return None;
+    }
+    let liq_net = i128::from_le_bytes(
+        data[base + LIQUIDITY_NET_OFFSET..base + LIQUIDITY_NET_OFFSET + 16]
+            .try_into()
+            .ok()?,
+    );
+    Some(liq_net)
+}
+
 /// Exact-in swap quote for one Raydium CLMM pool (single-tick, no tick-array).
 ///
 /// Delegates to `whirlpool::quote_exact_in` — tick math and swap math are
@@ -205,6 +313,199 @@ pub fn quote_exact_in(
         sqrt_price_upper,
         fee_rate,
     )
+}
+
+/// Exact-in swap quote for Raydium CLMM with multi-tick traversal.
+///
+/// Simulates the full Uniswap-v3-style swap loop: cross tick boundaries one at
+/// a time, adjusting liquidity via `liquidity_net`, until `amount_in` is
+/// exhausted. Each tick boundary's TickArray account is loaded lazily via the
+/// supplied `get_tick_array` closure.
+///
+/// Returns `None` if:
+/// - a required TickArray is missing from the store (conservative)
+/// - liquidity drops to zero mid-swap
+/// - arithmetic overflow
+///
+/// Falls back automatically to the single-tick quote when `amount_in` stays
+/// within the current tick (tick array not needed).
+/// `get_tick_array` receives the already-derived PDA of the requested TickArray.
+/// The caller looks it up in the store: `|pda| store.accounts.get(&pda).map(|r| r.data.clone())`.
+pub fn quote_exact_in_multi_tick<F>(
+    amount_in: u64,
+    zero_for_one: bool,
+    mut sqrt_price: u128,
+    mut liquidity: u128,
+    tick_current: i32,
+    tick_spacing: u16,
+    trade_fee_rate: u32,
+    pool_id: &Pubkey,
+    mut get_tick_array: F,
+) -> Option<u64>
+where
+    F: FnMut(Pubkey) -> Option<Vec<u8>>,
+{
+    if amount_in == 0 || liquidity == 0 {
+        return None;
+    }
+    let fee_rate_u128 = trade_fee_rate as u128;
+    let fee_denom = 1_000_000u128;
+    let fee_comp = fee_denom.checked_sub(fee_rate_u128)?;
+
+    let mut amount_left = amount_in;
+    let mut total_out: u64 = 0;
+    let mut tick = tick_current;
+
+    // Cache: (arr_start, raw_data) — avoid redundant PDA lookups.
+    let mut cached_arr_start: Option<i32> = None;
+    let mut cached_arr_data: Vec<u8> = Vec::new();
+
+    for _ in 0..MAX_TICKS_CROSSED {
+        if amount_left == 0 {
+            break;
+        }
+
+        // Tick boundary we'll hit next in the swap direction.
+        let boundary_tick = if zero_for_one {
+            // Price decreases (token0 in): crosses lower boundary of current interval.
+            let lower = tick.div_euclid(tick_spacing as i32) * tick_spacing as i32;
+            // If we're already exactly on the lower boundary, go one more step down.
+            if tick == lower { lower - tick_spacing as i32 } else { lower }
+        } else {
+            // Price increases (token1 in): crosses upper boundary of current interval.
+            let lower = tick.div_euclid(tick_spacing as i32) * tick_spacing as i32;
+            lower + tick_spacing as i32
+        };
+
+        let sqrt_boundary = whirlpool::sqrt_price_from_tick_index(boundary_tick)?;
+        // Clamp to global price limits.
+        let sqrt_target = if zero_for_one {
+            sqrt_boundary.max(whirlpool::MIN_SQRT_PRICE_X64 + 1)
+        } else {
+            sqrt_boundary.min(whirlpool::MAX_SQRT_PRICE_X64 - 1)
+        };
+
+        // How much input (after fee) is needed to reach sqrt_target?
+        let amount_after_fee_to_target = if zero_for_one {
+            // Token A in: compute A needed to move price from sqrt_price → sqrt_target.
+            // Δa = L × (1/sqrt_target − 1/sqrt_price) = L × (sqrt_price − sqrt_target) /
+            //      (sqrt_price × sqrt_target) × 2^64
+            compute_amount_a_in(sqrt_price, sqrt_target, liquidity)?
+        } else {
+            // Token B in: Δb = L × (sqrt_target − sqrt_price) / 2^64
+            compute_amount_b_in(sqrt_price, sqrt_target, liquidity)?
+        };
+
+        // Gross input (including fee) to reach target: gross = ceil(net / fee_comp * fee_denom).
+        let gross_to_target: u64 = {
+            let g = (amount_after_fee_to_target as u128)
+                .checked_mul(fee_denom)?
+                .checked_add(fee_comp - 1)? // ceil
+                / fee_comp;
+            u64::try_from(g).unwrap_or(u64::MAX)
+        };
+
+        let (step_out, consumed) = if amount_left >= gross_to_target {
+            // Cross the boundary: swap all the way to sqrt_target.
+            let out = if zero_for_one {
+                whirlpool::amount_delta_b(sqrt_price, sqrt_target, liquidity)?
+            } else {
+                whirlpool::amount_delta_a(sqrt_target, sqrt_price, liquidity)?
+            };
+            (out, gross_to_target)
+        } else {
+            // Stays within this tick range: partial swap.
+            let after_fee = (amount_left as u128 * fee_comp / fee_denom) as u64;
+            if after_fee == 0 {
+                break;
+            }
+            let next_sqrt = if zero_for_one {
+                whirlpool::next_sqrt_from_a_round_up(sqrt_price, liquidity, after_fee)?
+            } else {
+                whirlpool::next_sqrt_from_b_round_down(sqrt_price, liquidity, after_fee)?
+            };
+            let out = if zero_for_one {
+                whirlpool::amount_delta_b(sqrt_price, next_sqrt, liquidity)?
+            } else {
+                whirlpool::amount_delta_a(next_sqrt, sqrt_price, liquidity)?
+            };
+            sqrt_price = next_sqrt;
+            (out, amount_left)
+        };
+
+        total_out = total_out.checked_add(step_out)?;
+        amount_left = amount_left.saturating_sub(consumed);
+
+        if amount_left == 0 {
+            break;
+        }
+
+        // We crossed boundary_tick — load the TickArray and apply liquidity_net.
+        sqrt_price = sqrt_target;
+
+        let arr_start = tick_array_start_index(boundary_tick, tick_spacing);
+        if cached_arr_start != Some(arr_start) {
+            let pda = derive_tick_array_pda(pool_id, arr_start);
+            let data = get_tick_array(pda).unwrap_or_default();
+            if data.len() < tick_array_offsets::MIN_LEN {
+                // Missing or undersized tick array — fall back to single-tick mode.
+                // Return whatever output we've accumulated so far (conservative).
+                return if total_out > 0 { Some(total_out) } else { None };
+            }
+            cached_arr_data = data;
+            cached_arr_start = Some(arr_start);
+        }
+
+        let liq_net = read_liquidity_net(&cached_arr_data, boundary_tick, arr_start, tick_spacing)
+            .unwrap_or(0i128);
+
+        // Uniswap v3 convention: liq_net is added when crossing LEFT→RIGHT (price up).
+        // Crossing RIGHT→LEFT (zero_for_one): subtract. Crossing LEFT→RIGHT: add.
+        if zero_for_one {
+            liquidity = (liquidity as i128).checked_sub(liq_net)? as u128;
+            tick = boundary_tick - 1; // now below the crossed tick
+        } else {
+            liquidity = (liquidity as i128).checked_add(liq_net)? as u128;
+            tick = boundary_tick;
+        }
+
+        if liquidity == 0 {
+            return None; // no liquidity in this range
+        }
+    }
+
+    if total_out == 0 { None } else { Some(total_out) }
+}
+
+// ── Amount helpers for multi-tick ─────────────────────────────────────────────
+
+/// Token-A input to move sqrt_price from `p_cur` to `p_next` (p_next < p_cur).
+/// From Uniswap v3: Δa = L × (p_cur − p_next) / (p_cur × p_next / 2^64)
+///                     = L × (p_cur − p_next) × 2^64 / (p_cur × p_next)
+fn compute_amount_a_in(p_cur: u128, p_next: u128, liquidity: u128) -> Option<u64> {
+    debug_assert!(p_cur >= p_next);
+    use crate::dex::uint256::U256;
+    let delta = p_cur.checked_sub(p_next)?;
+    // numerator = liquidity × delta << 64
+    let ld = U256::mul_u128(liquidity, delta);
+    let numerator = ld.checked_shl64()?;
+    let denominator = U256::mul_u128(p_cur, p_next);
+    // ceil for exact-in (protects pool)
+    let out = numerator.div_ceil_u128(denominator)?;
+    u64::try_from(out).ok()
+}
+
+/// Token-B input to move sqrt_price from `p_cur` to `p_next` (p_next > p_cur).
+/// From Uniswap v3: Δb = ceil(L × (p_next − p_cur) / 2^64)
+fn compute_amount_b_in(p_cur: u128, p_next: u128, liquidity: u128) -> Option<u64> {
+    debug_assert!(p_next >= p_cur);
+    use crate::dex::uint256::U256;
+    let delta = p_next.checked_sub(p_cur)?;
+    let prod = U256::mul_u128(liquidity, delta);
+    // ceil(prod / 2^64) — reuse div_ceil_u128 with divisor = 2^64
+    let two_pow_64 = U256::from_u128(1u128 << 64);
+    let out = prod.div_ceil_u128(two_pow_64)?;
+    u64::try_from(out).ok()
 }
 
 #[cfg(test)]

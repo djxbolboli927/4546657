@@ -63,8 +63,8 @@ pub enum DexKind {
         fee_rate: u16,
         a_for_b: bool,
     },
-    /// Raydium CLMM: Uniswap-v3-style CLMM.  Single-tick quote from a
-    /// pool-account snapshot.  Same Q64.64 math as Whirlpool.
+    /// Raydium CLMM: Uniswap-v3-style CLMM.  Multi-tick quote when TickArray
+    /// accounts are in the store; single-tick fallback otherwise.
     /// `zero_for_one` = token0 → token1 direction.
     RaydiumClmm {
         sqrt_price: u128,
@@ -73,6 +73,10 @@ pub enum DexKind {
         sqrt_price_upper: u128,
         trade_fee_rate: u32,
         zero_for_one: bool,
+        /// Current tick index — needed for multi-tick boundary calculation.
+        tick_current: i32,
+        /// Tick spacing for this pool tier.
+        tick_spacing: u16,
     },
     /// PumpSwap: pump.fun's constant-product AMM (x*y=k, 30 bps total fee).
     /// Priced from live vault reserves like Raydium AMM v4.
@@ -271,6 +275,8 @@ fn push_raydium_clmm_edges(pair: &PoolVaultPair, store: &PoolStateStore, out: &m
         sqrt_price_upper: pool.sqrt_price_upper,
         trade_fee_rate,
         zero_for_one,
+        tick_current: pool.tick_current,
+        tick_spacing: pool.tick_spacing,
     };
 
     // Token0 → Token1 (zero_for_one = true)
@@ -492,8 +498,28 @@ pub fn quote_edge(edge: &Edge, amount_in: u64, store: &PoolStateStore) -> Option
         sqrt_price_upper,
         trade_fee_rate,
         zero_for_one,
+        tick_current,
+        tick_spacing,
     } = &edge.dex_kind
     {
+        let pool_pk = edge.pool;
+        // Attempt multi-tick traversal if tick arrays are present in the store.
+        // Falls back gracefully to single-tick when arrays are missing.
+        let multi = raydium_clmm::quote_exact_in_multi_tick(
+            amount_in,
+            *zero_for_one,
+            *sqrt_price,
+            *liquidity,
+            *tick_current,
+            *tick_spacing,
+            *trade_fee_rate,
+            &pool_pk,
+            |pda| store.accounts.get(&pda).map(|r| r.data.clone()),
+        );
+        if multi.is_some() {
+            return multi;
+        }
+        // Tick arrays missing — single-tick quote (returns None on crossing).
         return raydium_clmm::quote_exact_in(
             amount_in,
             *zero_for_one,
@@ -696,7 +722,94 @@ pub fn find_cycles_in_store(
         }
     }
 
-    // Sort by gross profit descending.
+    // Dedup: keep only the best hit per unique (pool-pair, direction) — drop
+    // redundant coarse-grid hits before the optimisation pass.
+    hits.sort_unstable_by(|a, b| b.profit_gross.cmp(&a.profit_gross));
+
+    // ── Optimisation pass ──────────────────────────────────────────────────────
+    // For the top unique cycles found by the coarse scan, run a ternary search
+    // to find the exact amount_in that maximises gross profit.  This naturally
+    // handles DLMM bin crossings (the quote function already traverses bins) and
+    // CLMM tick crossings (when tick arrays are in the store).
+    {
+        // Find an edge by (pool pubkey, mint_in) from the adjacency map.
+        let find_edge_idx = |pool: Pubkey, mint_in: Pubkey| -> Option<usize> {
+            by_mint_in.get(&mint_in).and_then(|idxs| {
+                idxs.iter().find(|&&i| edges[i].pool == pool).copied()
+            })
+        };
+
+        let mut seen_paths: std::collections::HashSet<Vec<Pubkey>> = std::collections::HashSet::new();
+        let mut opt_hits: Vec<CycleHit> = Vec::new();
+        let coarse_hits_snap: Vec<CycleHit> = hits.iter().take(50).cloned().collect();
+
+        for hit in &coarse_hits_snap {
+            if !seen_paths.insert(hit.pools.clone()) {
+                continue;
+            }
+            if opt_hits.len() >= 20 {
+                break;
+            }
+            let hops = hit.hops();
+            // Search bounds: ±10× the coarse best amount to stay near the
+            // known profitable region, capped to global limits.
+            let seed = hit.amount_in;
+            let lo = (seed / 10).clamp(SEARCH_MIN_LAMPORTS, SEARCH_MAX_LAMPORTS);
+            let hi = (seed.saturating_mul(10)).clamp(lo, SEARCH_MAX_LAMPORTS);
+
+            if hops == 2 {
+                let x = hit.intermediate_mints[0];
+                let i1 = match find_edge_idx(hit.pools[0], wsol_mint) { Some(i) => i, None => continue };
+                let i2 = match find_edge_idx(hit.pools[1], x) { Some(i) => i, None => continue };
+                if let Some((amt, gross)) = optimise_2hop(
+                    &edges[i1], &edges[i2], store, lo, hi,
+                ) {
+                    let out = amt + gross;
+                    let net = (out as i64) - (amt as i64) - (tx_cost as i64)
+                        - (error_margin_per_hop as i64 * 2);
+                    opt_hits.push(CycleHit {
+                        pools: hit.pools.clone(),
+                        dex_names: hit.dex_names.clone(),
+                        intermediate_mints: hit.intermediate_mints.clone(),
+                        amount_in: amt,
+                        amount_out: out,
+                        profit_gross: gross,
+                        profit_net: net,
+                    });
+                }
+            } else if hops == 3 {
+                let x = hit.intermediate_mints[0];
+                let y = hit.intermediate_mints[1];
+                let i1 = match find_edge_idx(hit.pools[0], wsol_mint) { Some(i) => i, None => continue };
+                let i2 = match find_edge_idx(hit.pools[1], x) { Some(i) => i, None => continue };
+                let i3 = match find_edge_idx(hit.pools[2], y) { Some(i) => i, None => continue };
+                if let Some((amt, gross)) = optimise_3hop(
+                    &edges[i1], &edges[i2], &edges[i3], store, lo, hi,
+                ) {
+                    let out = amt + gross;
+                    let net = (out as i64) - (amt as i64) - (tx_cost as i64)
+                        - (error_margin_per_hop as i64 * 3);
+                    opt_hits.push(CycleHit {
+                        pools: hit.pools.clone(),
+                        dex_names: hit.dex_names.clone(),
+                        intermediate_mints: hit.intermediate_mints.clone(),
+                        amount_in: amt,
+                        amount_out: out,
+                        profit_gross: gross,
+                        profit_net: net,
+                    });
+                }
+            }
+        }
+
+        // Replace coarse-scan entries with optimised ones where available.
+        let opt_pools: std::collections::HashSet<Vec<Pubkey>> =
+            opt_hits.iter().map(|h| h.pools.clone()).collect();
+        hits.retain(|h| !opt_pools.contains(&h.pools));
+        hits.extend(opt_hits);
+    }
+
+    // Final sort by gross profit descending.
     hits.sort_unstable_by(|a, b| b.profit_gross.cmp(&a.profit_gross));
     hits
 }
@@ -716,14 +829,113 @@ pub struct CycleMetrics {
 // ── Periodic scanner ──────────────────────────────────────────────────────────
 
 /// Amounts to test (lamports of WSOL).
-/// Covers 0.001 → 0.05 SOL with a few key points for a fast overview.
+/// Covers 0.001 → 0.5 SOL with key points for a fast overview.
+/// After the initial scan, `find_cycles_in_store` refines the top hits with
+/// ternary search — these coarse points just seed the search range.
 pub const SCAN_AMOUNTS: &[u64] = &[
-    1_000_000,   // 0.001 SOL
-    5_000_000,   // 0.005 SOL
-    10_000_000,  // 0.010 SOL
-    25_000_000,  // 0.025 SOL
-    50_000_000,  // 0.050 SOL
+    1_000_000,    // 0.001 SOL
+    5_000_000,    // 0.005 SOL
+    10_000_000,   // 0.010 SOL
+    25_000_000,   // 0.025 SOL
+    50_000_000,   // 0.050 SOL
+    100_000_000,  // 0.100 SOL
+    250_000_000,  // 0.250 SOL
+    500_000_000,  // 0.500 SOL
 ];
+
+/// Minimum input amount for ternary search (1 SOL = 1 lamport here is too small).
+const SEARCH_MIN_LAMPORTS: u64 = 100_000; // 0.0001 SOL
+/// Maximum input amount for ternary search.
+const SEARCH_MAX_LAMPORTS: u64 = 1_000_000_000; // 1.0 SOL
+
+/// Gross profit (amount_out − amount_in) for a 2-hop cycle, or 0 if no profit.
+/// Returns `None` if the quote fails.
+fn gross_2hop(
+    e1: &Edge,
+    e2: &Edge,
+    amount_in: u64,
+    store: &Arc<PoolStateStore>,
+) -> Option<u64> {
+    let mid = quote_edge(e1, amount_in, store)?;
+    let out = quote_edge(e2, mid, store)?;
+    out.checked_sub(amount_in)
+}
+
+/// Gross profit for a 3-hop cycle.
+fn gross_3hop(
+    e1: &Edge,
+    e2: &Edge,
+    e3: &Edge,
+    amount_in: u64,
+    store: &Arc<PoolStateStore>,
+) -> Option<u64> {
+    let mid1 = quote_edge(e1, amount_in, store)?;
+    let mid2 = quote_edge(e2, mid1, store)?;
+    let out = quote_edge(e3, mid2, store)?;
+    out.checked_sub(amount_in)
+}
+
+/// Ternary search for the `amount_in` that maximises gross profit on a 2-hop
+/// cycle.  The profit curve is unimodal (concave) for all CP / CLMM / DLMM
+/// pools: slippage increases with size, so there is a single peak.
+///
+/// Returns `(best_amount, best_gross)` or `None` if no gross-positive amount
+/// is found in `[lo, hi]`.
+fn optimise_2hop(
+    e1: &Edge,
+    e2: &Edge,
+    store: &Arc<PoolStateStore>,
+    mut lo: u64,
+    mut hi: u64,
+) -> Option<(u64, u64)> {
+    // 50 iterations: converges to within (hi−lo)/3^50 ≈ 0.
+    for _ in 0..50 {
+        if hi <= lo + 3 { break; }
+        let m1 = lo + (hi - lo) / 3;
+        let m2 = hi - (hi - lo) / 3;
+        let p1 = gross_2hop(e1, e2, m1, store).unwrap_or(0);
+        let p2 = gross_2hop(e1, e2, m2, store).unwrap_or(0);
+        if p1 < p2 { lo = m1; } else { hi = m2; }
+    }
+    // Sample a few points near the found optimum to handle flat plateaus.
+    let candidates = [
+        lo,
+        lo + (hi - lo) / 4,
+        (lo + hi) / 2,
+        hi - (hi - lo) / 4,
+        hi,
+    ];
+    let best = candidates
+        .iter()
+        .filter_map(|&a| gross_2hop(e1, e2, a, store).map(|g| (a, g)))
+        .max_by_key(|&(_, g)| g)?;
+    if best.1 > 0 { Some(best) } else { None }
+}
+
+/// Ternary search for optimal amount on a 3-hop cycle.
+fn optimise_3hop(
+    e1: &Edge,
+    e2: &Edge,
+    e3: &Edge,
+    store: &Arc<PoolStateStore>,
+    mut lo: u64,
+    mut hi: u64,
+) -> Option<(u64, u64)> {
+    for _ in 0..50 {
+        if hi <= lo + 3 { break; }
+        let m1 = lo + (hi - lo) / 3;
+        let m2 = hi - (hi - lo) / 3;
+        let p1 = gross_3hop(e1, e2, e3, m1, store).unwrap_or(0);
+        let p2 = gross_3hop(e1, e2, e3, m2, store).unwrap_or(0);
+        if p1 < p2 { lo = m1; } else { hi = m2; }
+    }
+    let candidates = [lo, lo + (hi - lo) / 4, (lo + hi) / 2, hi - (hi - lo) / 4, hi];
+    let best = candidates
+        .iter()
+        .filter_map(|&a| gross_3hop(e1, e2, e3, a, store).map(|g| (a, g)))
+        .max_by_key(|&(_, g)| g)?;
+    if best.1 > 0 { Some(best) } else { None }
+}
 
 /// Standard costs assumed for the Raydium AMM/CPMM staging env:
 ///   tx_fee     = 5_000 lamports

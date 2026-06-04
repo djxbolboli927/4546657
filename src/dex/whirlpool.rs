@@ -328,7 +328,7 @@ pub fn quote_exact_in(
 ///   numerator   = L × sqrt_P × 2^64      (Q192-ish, via U256)
 ///   denominator = L × 2^64 + sqrt_P × Δa (Q192-ish, via U256)
 ///   next_sqrt   = ⌈ numerator / denominator ⌉
-fn next_sqrt_from_a_round_up(sqrt_price: u128, liquidity: u128, amount: u64) -> Option<u128> {
+pub(crate) fn next_sqrt_from_a_round_up(sqrt_price: u128, liquidity: u128, amount: u64) -> Option<u128> {
     let product = U256::mul_u128(sqrt_price, amount as u128);
 
     // numerator = (L * sqrt_P) << 64
@@ -347,7 +347,7 @@ fn next_sqrt_from_a_round_up(sqrt_price: u128, liquidity: u128, amount: u64) -> 
 /// Formula (from token_math.rs):
 ///   delta   = ⌊ amount × 2^64 / L ⌋
 ///   next    = sqrt_P + delta
-fn next_sqrt_from_b_round_down(sqrt_price: u128, liquidity: u128, amount: u64) -> Option<u128> {
+pub(crate) fn next_sqrt_from_b_round_down(sqrt_price: u128, liquidity: u128, amount: u64) -> Option<u128> {
     // amount is u64 so amount << 64 fits in u128: max = (2^64-1) * 2^64 < 2^128.
     let amount_x64 = (amount as u128) << 64;
     let delta = amount_x64 / liquidity; // floor
@@ -357,7 +357,7 @@ fn next_sqrt_from_b_round_down(sqrt_price: u128, liquidity: u128, amount: u64) -
 /// Token-B output for A→B swap (price decreased from `p_old` to `p_new`).
 ///
 /// Formula: Δb = ⌊ L × (p_old − p_new) / 2^64 ⌋  (Q64.64 product >> 64)
-fn amount_delta_b(p_old: u128, p_new: u128, liquidity: u128) -> Option<u64> {
+pub(crate) fn amount_delta_b(p_old: u128, p_new: u128, liquidity: u128) -> Option<u64> {
     debug_assert!(p_old >= p_new, "amount_delta_b: price did not decrease");
     let delta = p_old - p_new;
     // Try exact u128 multiply first (fast path for most realistic pools).
@@ -382,7 +382,7 @@ fn amount_delta_b(p_old: u128, p_new: u128, liquidity: u128) -> Option<u64> {
 ///
 /// Requires U256: numerator = (L × Δsqrt) << 64 reaches ~2^289 in extreme
 /// cases but is None-guarded by `checked_shl64`.
-fn amount_delta_a(p_new: u128, p_old: u128, liquidity: u128) -> Option<u64> {
+pub(crate) fn amount_delta_a(p_new: u128, p_old: u128, liquidity: u128) -> Option<u64> {
     debug_assert!(p_new >= p_old, "amount_delta_a: price did not increase");
     let delta = p_new - p_old;
     // numerator = L * delta << 64
