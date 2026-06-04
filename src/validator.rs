@@ -24,7 +24,7 @@ use std::time::Duration;
 use tracing::warn;
 
 use crate::config::{JupiterPriceConfig, ValidationConfig};
-use crate::dex::{meteora_damm_v2, raydium_amm_v4, raydium_cpmm, whirlpool};
+use crate::dex::{meteora_damm_v2, pumpswap, raydium_amm_v4, raydium_clmm, raydium_cpmm, whirlpool};
 use crate::pool_state_store::PoolStateStore;
 use crate::pool_state_stream::PoolVaultPair;
 
@@ -39,6 +39,10 @@ enum Engine {
     MeteoraDammV2,
     /// Orca Whirlpool — priced from pool account sqrt_price (Q64.64).
     OrcaWhirlpool,
+    /// Raydium CLMM — priced from pool account sqrt_price (Q64.64).
+    RaydiumClmm,
+    /// PumpSwap — priced from vault reserves (constant-product, 30 bps fee).
+    PumpSwap,
 }
 
 impl Engine {
@@ -48,6 +52,8 @@ impl Engine {
             Engine::RaydiumCpmm => "ray_cpmm",
             Engine::MeteoraDammV2 => "mtr_damm_v2",
             Engine::OrcaWhirlpool => "orca_wpool",
+            Engine::RaydiumClmm => "ray_clmm",
+            Engine::PumpSwap => "pumpswap",
         }
     }
 }
@@ -63,6 +69,10 @@ fn classify(owner: &Pubkey) -> Option<Engine> {
         Some(Engine::MeteoraDammV2)
     } else if *owner == whirlpool::PROGRAM_ID {
         Some(Engine::OrcaWhirlpool)
+    } else if *owner == raydium_clmm::PROGRAM_ID {
+        Some(Engine::RaydiumClmm)
+    } else if *owner == pumpswap::PROGRAM_ID {
+        Some(Engine::PumpSwap)
     } else {
         None
     }
@@ -305,6 +315,61 @@ async fn run_cycle(
             continue;
         }
 
+        if engine == Engine::RaydiumClmm {
+            let Some(acc) = store.accounts.get(&pair.pool) else { continue };
+            let Some(pool) = raydium_clmm::parse_pool(&acc.data) else { continue };
+            let sp = pool.sqrt_price_x64 as f64 / Q64_F64;
+            let spot_atomic = sp * sp;
+            let slot = acc.slot;
+            let (reserve_a, reserve_b) = {
+                let ra = store.accounts.get(&pool.token_vault_0)
+                    .and_then(|r| read_spl_token_account(&r.data).map(|(_, a)| a))
+                    .unwrap_or(0);
+                let rb = store.accounts.get(&pool.token_vault_1)
+                    .and_then(|r| read_spl_token_account(&r.data).map(|(_, a)| a))
+                    .unwrap_or(0);
+                (ra, rb)
+            };
+            if mint_set.insert(pool.token_mint_0) { mint_list.push(pool.token_mint_0); }
+            if mint_set.insert(pool.token_mint_1) { mint_list.push(pool.token_mint_1); }
+            live.push(LivePool {
+                pool: pair.pool,
+                engine,
+                mint_a: pool.token_mint_0,
+                mint_b: pool.token_mint_1,
+                reserve_a,
+                reserve_b,
+                spot_atomic,
+                slot,
+            });
+            continue;
+        }
+
+        if engine == Engine::PumpSwap {
+            let Some(pool_acc) = store.accounts.get(&pair.pool) else { continue };
+            let Some(pool) = pumpswap::parse_pool(&pool_acc.data) else { continue };
+            let slot = pool_acc.slot;
+            let Some(base_data) = store.accounts.get(&pool.base_vault) else { continue };
+            let Some(quote_data) = store.accounts.get(&pool.quote_vault) else { continue };
+            let Some((_, reserve_a)) = read_spl_token_account(&base_data.data) else { continue };
+            let Some((_, reserve_b)) = read_spl_token_account(&quote_data.data) else { continue };
+            if reserve_a == 0 || reserve_b == 0 { continue; }
+            let spot_atomic = reserve_b as f64 / reserve_a as f64;
+            if mint_set.insert(pool.base_mint) { mint_list.push(pool.base_mint); }
+            if mint_set.insert(pool.quote_mint) { mint_list.push(pool.quote_mint); }
+            live.push(LivePool {
+                pool: pair.pool,
+                engine,
+                mint_a: pool.base_mint,
+                mint_b: pool.quote_mint,
+                reserve_a,
+                reserve_b,
+                spot_atomic,
+                slot,
+            });
+            continue;
+        }
+
         // ── Raydium AMM v4 / CPMM — price from vault reserves ─────────────────
         let a_data = match store.accounts.get(&pair.vault_a) {
             Some(r) => r.data.clone(),
@@ -416,15 +481,19 @@ spot_atomic={sa:.8} local={lo:.8} jup_ratio={jp:.8} diff={d:.1}bps slot={sl}",
 
     let dmm_live = live.iter().filter(|d| d.engine == Engine::MeteoraDammV2).count();
     let wpool_live = live.iter().filter(|d| d.engine == Engine::OrcaWhirlpool).count();
-    let cp_live = live.len() - dmm_live - wpool_live;
+    let rclmm_live = live.iter().filter(|d| d.engine == Engine::RaydiumClmm).count();
+    let pump_live = live.iter().filter(|d| d.engine == Engine::PumpSwap).count();
+    let cp_live = live.len() - dmm_live - wpool_live - rclmm_live - pump_live;
     eprintln!(
-        "[validator] pools_live={live} (cp={cp} damm_v2={dmm} whirlpool={wp}) \
+        "[validator] pools_live={live} (cp={cp} damm_v2={dmm} whirlpool={wp} ray_clmm={rc} pumpswap={ps}) \
 compared={ok} skipped_unsupported={skip} no_jup={nj} no_decimals={nd} \
 avg={avg:.1}bps max={max:.1}bps",
         live = live.len(),
         cp = cp_live,
         dmm = dmm_live,
         wp = wpool_live,
+        rc = rclmm_live,
+        ps = pump_live,
         ok = diffs.len(),
         skip = skipped_dex,
         nj = no_jup,
@@ -454,7 +523,7 @@ pub fn spawn_validator(
     let total_pairs = pairs.len();
     eprintln!(
         "[validator] started — {total_pairs} pool pairs \
-(Raydium AMM v4/CPMM/Meteora DAMM v2/Orca Whirlpool), \
+(Raydium AMM v4/CPMM/CLMM, Meteora DAMM v2, Orca Whirlpool, PumpSwap), \
 interval={s}s, max_log={m}, debug={debug}",
         s = val_cfg.interval_secs,
         m = val_cfg.max_pools_log,

@@ -23,7 +23,9 @@
 //! Remaining DEXes (Raydium CLMM, Meteora DLMM, …) get their own engines later.
 
 pub mod meteora_damm_v2;
+pub mod pumpswap;
 pub mod raydium_amm_v4;
+pub mod raydium_clmm;
 pub mod raydium_cpmm;
 pub mod uint256;
 pub mod whirlpool;

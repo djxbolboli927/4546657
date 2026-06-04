@@ -23,7 +23,7 @@ use std::time::Duration;
 use solana_sdk::pubkey::Pubkey;
 use tracing::warn;
 
-use crate::dex::{meteora_damm_v2, raydium_amm_v4, raydium_cpmm, whirlpool};
+use crate::dex::{meteora_damm_v2, pumpswap, raydium_amm_v4, raydium_clmm, raydium_cpmm, whirlpool};
 use crate::pool_state_store::PoolStateStore;
 use crate::pool_state_stream::PoolVaultPair;
 
@@ -61,6 +61,20 @@ pub enum DexKind {
         fee_rate: u16,
         a_for_b: bool,
     },
+    /// Raydium CLMM: Uniswap-v3-style CLMM.  Single-tick quote from a
+    /// pool-account snapshot.  Same Q64.64 math as Whirlpool.
+    /// `zero_for_one` = token0 → token1 direction.
+    RaydiumClmm {
+        sqrt_price: u128,
+        liquidity: u128,
+        sqrt_price_lower: u128,
+        sqrt_price_upper: u128,
+        trade_fee_rate: u32,
+        zero_for_one: bool,
+    },
+    /// PumpSwap: pump.fun's constant-product AMM (x*y=k, 30 bps total fee).
+    /// Priced from live vault reserves like Raydium AMM v4.
+    PumpSwap,
 }
 
 impl DexKind {
@@ -70,6 +84,8 @@ impl DexKind {
             DexKind::RaydiumCpmm { .. } => "RaydiumCpmm",
             DexKind::MeteoraDammV2 { .. } => "MeteoraDammV2",
             DexKind::OrcaWhirlpoolV1 { .. } => "OrcaWhirlpoolV1",
+            DexKind::RaydiumClmm { .. } => "RaydiumClmm",
+            DexKind::PumpSwap => "PumpSwap",
         }
     }
 }
@@ -211,6 +227,93 @@ fn push_whirlpool_edges(pair: &PoolVaultPair, store: &PoolStateStore, out: &mut 
     });
 }
 
+/// Build two directed edges for a Raydium CLMM pool from its pool account.
+/// Silently skips if the pool is missing, has zero liquidity, or tick boundaries
+/// can't be computed.  Fee is read from the AmmConfig account; falls back to
+/// tick-spacing inference when the AmmConfig isn't in the store.
+fn push_raydium_clmm_edges(pair: &PoolVaultPair, store: &PoolStateStore, out: &mut Vec<Edge>) {
+    let Some(acc) = store.accounts.get(&pair.pool) else {
+        return;
+    };
+    let Some(pool) = raydium_clmm::parse_pool(&acc.data) else {
+        return;
+    };
+
+    // Prefer pair.amm_config hint (from mix.json), then the pubkey embedded in
+    // the pool account, then fall back to tick-spacing tier inference.
+    let trade_fee_rate = if let Some(cfg_pk) = pair.amm_config {
+        store
+            .accounts
+            .get(&cfg_pk)
+            .and_then(|r| raydium_clmm::parse_trade_fee_rate(&r.data))
+    } else {
+        store
+            .accounts
+            .get(&pool.amm_config)
+            .and_then(|r| raydium_clmm::parse_trade_fee_rate(&r.data))
+    }
+    .unwrap_or_else(|| raydium_clmm::fee_rate_from_tick_spacing(pool.tick_spacing));
+
+    let make = |zero_for_one: bool| DexKind::RaydiumClmm {
+        sqrt_price: pool.sqrt_price_x64,
+        liquidity: pool.liquidity,
+        sqrt_price_lower: pool.sqrt_price_lower,
+        sqrt_price_upper: pool.sqrt_price_upper,
+        trade_fee_rate,
+        zero_for_one,
+    };
+
+    // Token0 → Token1 (zero_for_one = true)
+    out.push(Edge {
+        pool: pair.pool,
+        dex_kind: make(true),
+        mint_in: pool.token_mint_0,
+        mint_out: pool.token_mint_1,
+        vault_in: pool.token_vault_0,
+        vault_out: pool.token_vault_1,
+    });
+    // Token1 → Token0 (zero_for_one = false)
+    out.push(Edge {
+        pool: pair.pool,
+        dex_kind: make(false),
+        mint_in: pool.token_mint_1,
+        mint_out: pool.token_mint_0,
+        vault_in: pool.token_vault_1,
+        vault_out: pool.token_vault_0,
+    });
+}
+
+/// Build two directed edges for a PumpSwap pool from its pool account.
+/// Vault addresses come from the pool account itself (not pair.vault_a/b).
+/// Silently skips if the pool account is missing or too short to parse.
+fn push_pumpswap_edges(pair: &PoolVaultPair, store: &PoolStateStore, out: &mut Vec<Edge>) {
+    let Some(acc) = store.accounts.get(&pair.pool) else {
+        return;
+    };
+    let Some(pool) = pumpswap::parse_pool(&acc.data) else {
+        return;
+    };
+
+    // Base → Quote
+    out.push(Edge {
+        pool: pair.pool,
+        dex_kind: DexKind::PumpSwap,
+        mint_in: pool.base_mint,
+        mint_out: pool.quote_mint,
+        vault_in: pool.base_vault,
+        vault_out: pool.quote_vault,
+    });
+    // Quote → Base
+    out.push(Edge {
+        pool: pair.pool,
+        dex_kind: DexKind::PumpSwap,
+        mint_in: pool.quote_mint,
+        mint_out: pool.base_mint,
+        vault_in: pool.quote_vault,
+        vault_out: pool.base_vault,
+    });
+}
+
 /// Build the full edge list from live vault pairs.
 ///
 /// Each pair produces two edges (both directions). Edges whose vault data or
@@ -228,6 +331,14 @@ pub fn build_edges(pairs: &[PoolVaultPair], store: &PoolStateStore) -> Vec<Edge>
         }
         if pair.owner == whirlpool::PROGRAM_ID {
             push_whirlpool_edges(pair, store, &mut out);
+            continue;
+        }
+        if pair.owner == raydium_clmm::PROGRAM_ID {
+            push_raydium_clmm_edges(pair, store, &mut out);
+            continue;
+        }
+        if pair.owner == pumpswap::PROGRAM_ID {
+            push_pumpswap_edges(pair, store, &mut out);
             continue;
         }
 
@@ -319,6 +430,25 @@ pub fn quote_edge(edge: &Edge, amount_in: u64, store: &PoolStateStore) -> Option
             *fee_rate,
         );
     }
+    if let DexKind::RaydiumClmm {
+        sqrt_price,
+        liquidity,
+        sqrt_price_lower,
+        sqrt_price_upper,
+        trade_fee_rate,
+        zero_for_one,
+    } = &edge.dex_kind
+    {
+        return raydium_clmm::quote_exact_in(
+            amount_in,
+            *zero_for_one,
+            *sqrt_price,
+            *liquidity,
+            *sqrt_price_lower,
+            *sqrt_price_upper,
+            *trade_fee_rate,
+        );
+    }
 
     // Constant-product engines read live vault reserves.
     let in_data = store.accounts.get(&edge.vault_in)?;
@@ -345,7 +475,12 @@ pub fn quote_edge(edge: &Edge, amount_in: u64, store: &PoolStateStore) -> Option
             *trade_fee_rate,
         )
         .map(|q| q.amount_out),
-        DexKind::MeteoraDammV2 { .. } | DexKind::OrcaWhirlpoolV1 { .. } => {
+        DexKind::PumpSwap => {
+            pumpswap::quote_exact_in(amount_in, reserve_in, reserve_out)
+        }
+        DexKind::MeteoraDammV2 { .. }
+        | DexKind::OrcaWhirlpoolV1 { .. }
+        | DexKind::RaydiumClmm { .. } => {
             unreachable!("handled above")
         }
     }
