@@ -111,20 +111,24 @@ impl MetisClient {
         }
     }
 
-    /// Get a quote from Metis.
+    // ── Private HTTP helper ───────────────────────────────────────────────────
+
+    async fn fetch_quote(&self, url: String) -> Result<QuoteResponse> {
+        let resp = self.http.get(&url).send().await.context("quote request failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("quote failed: {} -- {}", status, body);
+        }
+        resp.json().await.context("failed to parse quote response")
+    }
+
+    // ── Public quote methods ──────────────────────────────────────────────────
+
+    /// Flexible quote: Metis chooses the best route freely.
     ///
-    /// Parameters:
-    /// - slippageBps=0: zero slippage at quote layer; the real on-chain floor
-    ///   is set via `other_amount_threshold` in `merge_quotes`.
-    /// - maxAccounts=50: leave room for tip account in final tx
-    /// - forJitoBundle=true: excludes Jito-incompatible DEXes
-    /// - swapMode=ExactIn: exact input amount
-    /// - restrictIntermediateTokens=false: allow all intermediate tokens
-    /// - instructionVersion=V2: tells Metis to produce a route_plan that uses
-    ///   `bps: 10000` (instead of legacy `percent: 100`). When this QuoteResponse
-    ///   is later sent to /swap-instructions, Metis builds a `route_v2` instruction
-    ///   which costs fewer compute units and is what competing arb bots use.
-    /// `only_direct`: when true, adds `&onlyDirectRoutes=true` (single-hop only).
+    /// `only_direct=false` adds `&restrictIntermediateTokens=true` (highly-liquid intermediaries).
+    /// `only_direct=true` adds `&onlyDirectRoutes=true` (single-hop, no intermediaries).
     pub async fn get_quote(
         &self,
         input_mint: &str,
@@ -132,9 +136,6 @@ impl MetisClient {
         amount_lamports: u64,
         only_direct: bool,
     ) -> Result<QuoteResponse> {
-        // Free routes: restrictIntermediateTokens=true limits intermediary tokens
-        // to highly-liquid ones (SOL, USDC, USDT, etc.) for reliable multi-hop arb.
-        // Direct routes: onlyDirectRoutes=true — no intermediate tokens anyway.
         let url = format!(
             "{}/quote?inputMint={}&outputMint={}&amount={}\
              &slippageBps=0\
@@ -143,28 +144,48 @@ impl MetisClient {
              &forJitoBundle=true\
              &instructionVersion=V2{}",
             self.base_url, input_mint, output_mint, amount_lamports,
-            if only_direct {
-                "&onlyDirectRoutes=true"
-            } else {
-                "&restrictIntermediateTokens=true"
-            }
+            if only_direct { "&onlyDirectRoutes=true" } else { "&restrictIntermediateTokens=true" }
         );
+        self.fetch_quote(url).await
+    }
 
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .context("quote request failed")?;
+    /// Strict quote: forces direct routes through the specified DEX labels only.
+    ///
+    /// Adds `&onlyDirectRoutes=true` (no multi-hop intermediaries) and
+    /// `&dexes=<labels>` so Metis only routes through the given DEX types.
+    /// Used by cycle_executor to match the DEX used in local arb_cycle calculation.
+    ///
+    /// `dexes` entries must be the Metis/Jupiter API label strings
+    /// (e.g. "Raydium", "Raydium CLMM", "Whirlpool", "Meteora DLMM").
+    pub async fn get_quote_strict(
+        &self,
+        input_mint: &str,
+        output_mint: &str,
+        amount_lamports: u64,
+        dexes: &[&str],
+    ) -> Result<QuoteResponse> {
+        let dex_param = if dexes.is_empty() {
+            String::new()
+        } else {
+            // URL-encode spaces; commas are safe in query param values for Jupiter API
+            let labels: Vec<String> = dexes.iter()
+                .map(|s| s.replace(' ', "%20"))
+                .collect();
+            format!("&dexes={}", labels.join(","))
+        };
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("quote failed: {} -- {}", status, body);
-        }
-
-        let quote: QuoteResponse = resp.json().await.context("failed to parse quote response")?;
-        Ok(quote)
+        let url = format!(
+            "{}/quote?inputMint={}&outputMint={}&amount={}\
+             &slippageBps=0\
+             &maxAccounts=50\
+             &swapMode=ExactIn\
+             &forJitoBundle=true\
+             &instructionVersion=V2\
+             &onlyDirectRoutes=true{}",
+            self.base_url, input_mint, output_mint, amount_lamports,
+            dex_param,
+        );
+        self.fetch_quote(url).await
     }
 
     /// Merge two quotes into a single circular quote via Route Concatenation.

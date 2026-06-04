@@ -1117,9 +1117,10 @@ path=[{}]  via=[{}]",
                 );
             }
 
-            // Forward net-positive hits to the executor (non-blocking).
+            // Forward net-positive 2-hop hits to the executor (non-blocking).
+            // 3-hop support requires merge_quotes_3 — skip until implemented.
             if let Some(ref sender) = *hit_tx {
-                for hit in hits.iter().filter(|h| h.profit_net > 0) {
+                for hit in hits.iter().filter(|h| h.profit_net > 0 && h.hops() == 2) {
                     // try_send never blocks — drops hit if executor is behind.
                     let _ = sender.try_send(hit.clone());
                 }

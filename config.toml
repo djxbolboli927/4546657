@@ -31,7 +31,7 @@ urls = [
 ]
 uuid = "8c7cda54-ef6e-4792-8617-da0341f8d485"
 trading_keypair = "/root/c/wallet/wallet.json"
-tip_min_lamports = 1000
+tip_min_lamports = 1600
 tip_max_lamports = 1000000
 tip_profit_percent = 0.50
 # ریت لیمیت فقط سمت ما: 5 باندل در ثانیه برای کل loop

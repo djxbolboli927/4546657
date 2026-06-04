@@ -1,16 +1,16 @@
 //! Bridges arb_cycle profitable hits to Metis /swap-instructions + Jito submission.
 //!
-//! Flow per 2-hop CycleHit:
-//!   1. Local filter: profit_net >= min_profit_lamports (done before send)
-//!   2. Metis /quote × 2 (WSOL→X, X→WSOL)
-//!   3. Check Metis out >= amount_in + min_profit_lamports
-//!   4. merge_quotes with min_acceptable_out = amount_in + tip + base_fee
-//!   5. /swap-instructions
-//!   6. build_arb_transaction → send to Jito (REST, gRPC fallback)
+//! Flow per 2-hop CycleHit (WSOL → X → WSOL):
+//!   1. Local filter: profit_gross >= min_profit_lamports  (before any Metis call)
+//!   2. Metis /quote × 2 — strict mode: onlyDirectRoutes=true + DEX filter
+//!      Metis is used ONLY for the routePlan (instruction bytes); its outAmount
+//!      is logged for comparison but does NOT gate execution.
+//!   3. merge_quotes with min_acceptable_out = amount_in + min_profit_lamports
+//!   4. /swap-instructions
+//!   5. build_arb_transaction → send to Jito (REST first, gRPC fallback)
 //!
-//! 3-hop cycles are skipped for now: merge_quotes only handles a single
-//! intermediate token. Implement 3-hop support when it appears consistently
-//! in top opportunities.
+//! 3-hop support requires merge_quotes_3; arb_cycle filters those out before
+//! forwarding so skip_hops should stay near zero.
 
 use std::sync::{
     atomic::{AtomicI64, AtomicU64, Ordering::Relaxed},
@@ -46,11 +46,10 @@ pub struct ExecutorCtx {
     pub alt_cache: AltCache,
     pub cu_limits: Vec<u32>,
     pub user_pubkey: String,
-    /// Minimum local (and Metis) profit in lamports before calling /swap-instructions.
+    /// Minimum local profit (lamports) required before Metis call and on-chain floor.
     pub min_profit_lamports: u64,
-    /// Jito tip lamports added to every transaction (system transfer to tip account).
+    /// Jito tip lamports added to every transaction.
     pub tip_lamports: u64,
-    /// Base network fee in lamports (one signature = 5000).
     pub base_fee_lamports: u64,
 }
 
@@ -58,50 +57,57 @@ pub struct ExecutorCtx {
 
 #[derive(Default)]
 pub struct ExecutorMetrics {
-    /// Hits received from arb_cycle channel.
     pub cycles_received: AtomicU64,
-    /// 3-hop (and higher) hits skipped — not implemented yet.
+    /// Hits skipped because hops != 2 (should be ~0 after arb_cycle filter).
     pub skipped_hops: AtomicU64,
-    /// Hits dropped because local profit_gross < min_profit_lamports.
+    /// Dropped before Metis: local profit_gross < min_profit_lamports.
     pub local_filter_drop: AtomicU64,
-    /// Metis /quote pair calls initiated.
     pub metis_calls: AtomicU64,
-    /// Both /quote calls succeeded (valid route obtained from Metis).
+    /// Both /quote calls succeeded (routePlan obtained).
     pub metis_route_ok: AtomicU64,
-    /// Metis /quote call failed (network, timeout, parse error).
     pub metis_error: AtomicU64,
-    /// /swap-instructions successfully obtained.
     pub instructions_built: AtomicU64,
-    /// /swap-instructions call failed.
     pub swap_ix_error: AtomicU64,
-    /// Transaction build failed (overflow, size, etc.).
     pub build_error: AtomicU64,
-    /// Bundles accepted by Jito REST.
     pub jito_rest_sent: AtomicU64,
-    /// Bundles accepted by Jito gRPC.
     pub jito_grpc_sent: AtomicU64,
-    /// Jito send returned an error.
     pub jito_error: AtomicU64,
-    /// Both rate limiters were full — bundle dropped.
     pub jito_rate_limited: AtomicU64,
-    /// Sum of local profit_gross for all jito-sent transactions (lamports).
+    /// Sum of local profit_gross for all Jito-sent transactions (lamports).
     pub total_local_profit: AtomicI64,
+}
+
+// ── DEX label mapping ─────────────────────────────────────────────────────────
+
+/// Map our internal DexKind name to the Metis/Jupiter API label used in the
+/// `dexes` query parameter and in routePlan `swapInfo.label`.
+fn dex_to_metis_label(name: &str) -> &'static str {
+    match name {
+        "RaydiumAmmV4"    => "Raydium",
+        "RaydiumCpmm"     => "Raydium CPMM",
+        "RaydiumClmm"     => "Raydium CLMM",
+        "OrcaWhirlpoolV1" => "Whirlpool",
+        "MeteoraDammV2"   => "Meteora DAMM v2",
+        "MeteoraDlmm"     => "Meteora DLMM",
+        "PumpSwap"        => "Pump.fun AMM",
+        other             => {
+            // Unknown — pass as-is so Metis can tell us it's unrecognised
+            // rather than silently routing through a different DEX.
+            // 'static safety: leak once per unknown DEX name (practically never).
+            Box::leak(other.to_string().into_boxed_str())
+        }
+    }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Spawn the cycle executor.  Returns the metrics handle for inspection.
-///
-/// The executor drains `rx`, spawning one async task per hit to keep the
-/// channel from backing up even when Metis is slow.  The channel should be
-/// sized to at most a few scan cycles' worth of hits (e.g. 200).
 pub fn spawn_cycle_executor(
     mut rx: mpsc::Receiver<CycleHit>,
     ctx: Arc<ExecutorCtx>,
 ) -> Arc<ExecutorMetrics> {
     let metrics = Arc::new(ExecutorMetrics::default());
 
-    // Periodic reporter — prints every 30 s without interrupting hot path.
+    // Periodic reporter — every 30 s.
     {
         let m = metrics.clone();
         tokio::spawn(async move {
@@ -109,7 +115,7 @@ pub fn spawn_cycle_executor(
             let mut last_rest  = 0u64;
             let mut last_grpc  = 0u64;
             let mut ticker = tokio::time::interval(Duration::from_secs(30));
-            ticker.tick().await; // skip the immediate first tick
+            ticker.tick().await;
             loop {
                 ticker.tick().await;
                 let received  = m.cycles_received.load(Relaxed);
@@ -163,16 +169,13 @@ avg_local_profit={avg_prof}L total_local={tot_prof}L"
 async fn process_hit(hit: CycleHit, ctx: Arc<ExecutorCtx>, m: Arc<ExecutorMetrics>) {
     m.cycles_received.fetch_add(1, Relaxed);
 
-    // Only 2-hop: WSOL → X → WSOL, handled via merge_quotes.
+    // Only 2-hop supported (arb_cycle already filters, but guard here too).
     if hit.hops() != 2 {
         m.skipped_hops.fetch_add(1, Relaxed);
         return;
     }
 
     // ── Local profit filter (before any Metis call) ───────────────────────────
-    // profit_gross = amount_out − amount_in from our own on-chain math.
-    // We trust this more than Metis's estimate; Metis is only used for the
-    // instruction bytes, not for the profitability decision.
     if hit.profit_gross < ctx.min_profit_lamports {
         m.local_filter_drop.fetch_add(1, Relaxed);
         return;
@@ -181,17 +184,21 @@ async fn process_hit(hit: CycleHit, ctx: Arc<ExecutorCtx>, m: Arc<ExecutorMetric
     let x_mint    = hit.intermediate_mints[0].to_string();
     let amount_in = hit.amount_in;
 
-    // ── Stage 1: Two /quote calls — only for the routePlan, NOT profit check ──
-    // We need q1 + q2 so merge_quotes can concatenate their routePlans into a
-    // single circular instruction.  Metis's outAmount is ignored intentionally:
-    // its math differs from our per-DEX formulas and would incorrectly filter
-    // many valid opportunities.
+    // ── Stage 1: Strict /quote × 2 ───────────────────────────────────────────
+    // Use DEX-filtered direct routes so Metis stays close to the same pool our
+    // local calculation used.  Metis outAmount is logged but NOT used to gate
+    // execution — local math is the profitability authority.
+    let dex1 = dex_to_metis_label(hit.dex_names[0]);
+    let dex2 = dex_to_metis_label(hit.dex_names[1]);
+
     m.metis_calls.fetch_add(1, Relaxed);
 
-    let q1 = match ctx.metis.get_quote(WSOL_MINT, &x_mint, amount_in, false).await {
+    let q1 = match ctx.metis.get_quote_strict(WSOL_MINT, &x_mint, amount_in, &[dex1]).await {
         Ok(q) => q,
         Err(e) => {
-            tracing::debug!(err = %e, amount_in, "executor: WSOL→X quote failed");
+            eprintln!(
+                "[executor][q1_err] dex={dex1} WSOL→{x_mint} amount={amount_in} err={e}"
+            );
             m.metis_error.fetch_add(1, Relaxed);
             return;
         }
@@ -199,32 +206,41 @@ async fn process_hit(hit: CycleHit, ctx: Arc<ExecutorCtx>, m: Arc<ExecutorMetric
 
     let mid: u64 = q1.out_amount.parse().unwrap_or(0);
     if mid == 0 {
+        eprintln!("[executor][q1_zero] dex={dex1} WSOL→{x_mint} amount={amount_in} q1.out=0");
         m.metis_error.fetch_add(1, Relaxed);
         return;
     }
 
-    let q2 = match ctx.metis.get_quote(&x_mint, WSOL_MINT, mid, false).await {
+    let q2 = match ctx.metis.get_quote_strict(&x_mint, WSOL_MINT, mid, &[dex2]).await {
         Ok(q) => q,
         Err(e) => {
-            tracing::debug!(err = %e, mid, "executor: X→WSOL quote failed");
+            eprintln!(
+                "[executor][q2_err] dex={dex2} {x_mint}→WSOL mid={mid} err={e}"
+            );
             m.metis_error.fetch_add(1, Relaxed);
             return;
         }
     };
 
-    // Both routes obtained — no Metis profitability gate here.
+    let metis_out: u64 = q2.out_amount.parse().unwrap_or(0);
+    let min_acceptable_out = amount_in.saturating_add(ctx.min_profit_lamports);
+
+    // Log Metis round-trip result vs our local estimate vs required floor.
+    eprintln!(
+        "[executor][quote] dex={dex1}→{dex2} x={x_mint} in={amount_in} \
+local_gross={}L metis_out={metis_out}L min_floor={min_acceptable_out}L pools={}→{}",
+        hit.profit_gross,
+        hit.pools[0],
+        hit.pools[1],
+    );
+
     m.metis_route_ok.fetch_add(1, Relaxed);
 
     // ── Stage 2: Merge + /swap-instructions ──────────────────────────────────
-    // min_acceptable_out = on-chain revert floor.
-    // The transaction reverts if actual out < amount_in + min_profit_lamports.
-    // This is the configurable threshold from config.toml, not a fixed constant.
-    let min_acceptable_out = amount_in.saturating_add(ctx.min_profit_lamports);
-
     let merged = match MetisClient::merge_quotes(&q1, &q2, min_acceptable_out) {
         Ok(q) => q,
         Err(e) => {
-            tracing::debug!(err = %e, "executor: merge_quotes failed");
+            eprintln!("[executor][merge_err] in={amount_in} err={e}");
             m.metis_error.fetch_add(1, Relaxed);
             return;
         }
@@ -233,7 +249,10 @@ async fn process_hit(hit: CycleHit, ctx: Arc<ExecutorCtx>, m: Arc<ExecutorMetric
     let swap_ixs = match ctx.metis.get_swap_instructions(&ctx.user_pubkey, &merged).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::debug!(?e, "executor: /swap-instructions failed");
+            eprintln!(
+                "[executor][ix_err] dex={dex1}→{dex2} x={x_mint} in={amount_in} \
+metis_out={metis_out} min_floor={min_acceptable_out} err={e:?}"
+            );
             m.swap_ix_error.fetch_add(1, Relaxed);
             return;
         }
@@ -243,8 +262,8 @@ async fn process_hit(hit: CycleHit, ctx: Arc<ExecutorCtx>, m: Arc<ExecutorMetric
     m.total_local_profit.fetch_add(hit.profit_gross as i64, Relaxed);
 
     // ── Stage 3: Build transaction ────────────────────────────────────────────
-    let cu_idx    = hit.hops().saturating_sub(2);
-    let cu_limit  = ctx.cu_limits.get(cu_idx).copied()
+    let cu_idx   = hit.hops().saturating_sub(2);
+    let cu_limit = ctx.cu_limits.get(cu_idx).copied()
         .unwrap_or_else(|| ctx.cu_limits.last().copied().unwrap_or(220_000));
     let blockhash = ctx.blockhash_cache.get();
 
@@ -259,44 +278,52 @@ async fn process_hit(hit: CycleHit, ctx: Arc<ExecutorCtx>, m: Arc<ExecutorMetric
     ) {
         Ok(tx) => tx,
         Err(e) => {
-            tracing::debug!(err = %e, "executor: build_arb_transaction failed");
+            eprintln!(
+                "[executor][build_err] dex={dex1}→{dex2} in={amount_in} cu={cu_limit} err={e}"
+            );
             m.build_error.fetch_add(1, Relaxed);
             return;
         }
     };
 
-    // ── Stage 4: Submit to Jito ───────────────────────────────────────────────
-    // Try REST first (5/s), then gRPC fallback (5/s). Total capacity = 10/s.
-    // Acquire the rate limiter lock BEFORE any await point.
+    // ── Stage 4: Submit to Jito (REST → gRPC fallback) ────────────────────────
     let use_rest = ctx.jito_limiter.lock()
         .map(|mut l| l.try_acquire())
         .unwrap_or(false);
 
     if use_rest {
         match ctx.jito.send_bundle(&tx).await {
-            Ok(id) => {
-                tracing::debug!(bundle_id = id, "executor: Jito REST sent");
+            Ok(bundle_id) => {
+                eprintln!(
+                    "[executor][rest_sent] bundle={bundle_id} dex={dex1}→{dex2} \
+in={amount_in} local_gross={}L tip={}L",
+                    hit.profit_gross, ctx.tip_lamports,
+                );
                 m.jito_rest_sent.fetch_add(1, Relaxed);
             }
             Err(e) => {
-                tracing::debug!(err = %e, "executor: Jito REST error");
+                eprintln!("[executor][rest_err] in={amount_in} err={e}");
                 m.jito_error.fetch_add(1, Relaxed);
             }
         }
         return;
     }
 
-    // REST rate limit full — try gRPC.
+    // REST rate-limit full — try gRPC.
     if let (Some(grpc), Some(gl)) = (&ctx.jito_grpc, &ctx.jito_grpc_limiter) {
         let use_grpc = gl.lock().map(|mut l| l.try_acquire()).unwrap_or(false);
         if use_grpc {
             match grpc.send_bundle(&tx).await {
-                Ok(id) => {
-                    tracing::debug!(bundle_id = id, "executor: Jito gRPC sent");
+                Ok(bundle_id) => {
+                    eprintln!(
+                        "[executor][grpc_sent] bundle={bundle_id} dex={dex1}→{dex2} \
+in={amount_in} local_gross={}L tip={}L",
+                        hit.profit_gross, ctx.tip_lamports,
+                    );
                     m.jito_grpc_sent.fetch_add(1, Relaxed);
                 }
                 Err(e) => {
-                    tracing::debug!(err = %e, "executor: Jito gRPC error");
+                    eprintln!("[executor][grpc_err] in={amount_in} err={e}");
                     m.jito_error.fetch_add(1, Relaxed);
                 }
             }
