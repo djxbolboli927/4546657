@@ -23,7 +23,7 @@ use std::time::Duration;
 use solana_sdk::pubkey::Pubkey;
 use tracing::warn;
 
-use crate::dex::{raydium_amm_v4, raydium_cpmm};
+use crate::dex::{meteora_damm_v2, raydium_amm_v4, raydium_cpmm};
 use crate::pool_state_store::PoolStateStore;
 use crate::pool_state_stream::PoolVaultPair;
 
@@ -32,7 +32,22 @@ use crate::pool_state_stream::PoolVaultPair;
 #[derive(Debug, Clone)]
 pub enum DexKind {
     RaydiumAmmV4,
-    RaydiumCpmm { trade_fee_rate: u64 },
+    RaydiumCpmm {
+        trade_fee_rate: u64,
+    },
+    /// Meteora DAMM v2 (cp-amm): Uniswap-v3-style, priced from a pool-account
+    /// snapshot (sqrt_price + liquidity), NOT from vault reserves. The snapshot
+    /// is taken at `build_edges` time so each per-amount `quote_edge` call is a
+    /// pure function. `a_for_b` is the swap direction for *this* edge.
+    MeteoraDammV2 {
+        sqrt_price: u128,
+        liquidity: u128,
+        sqrt_min_price: u128,
+        sqrt_max_price: u128,
+        fee_numerator: u64,
+        collect_fee_mode: u8,
+        a_for_b: bool,
+    },
 }
 
 impl DexKind {
@@ -40,6 +55,7 @@ impl DexKind {
         match self {
             DexKind::RaydiumAmmV4 => "RaydiumAmmV4",
             DexKind::RaydiumCpmm { .. } => "RaydiumCpmm",
+            DexKind::MeteoraDammV2 { .. } => "MeteoraDammV2",
         }
     }
 }
@@ -97,6 +113,52 @@ fn resolve_dex_kind(pair: &PoolVaultPair, store: &PoolStateStore) -> Option<DexK
     None // CLMM, DLMM, Whirlpool etc — skip
 }
 
+/// Build the two directed edges for a Meteora DAMM v2 pool from its pool
+/// account. Skips silently if the pool account isn't live yet, can't be parsed,
+/// or is an unsupported (compounding / empty) pool — in which case it simply
+/// won't contribute edges this scan.
+fn push_meteora_edges(pair: &PoolVaultPair, store: &PoolStateStore, out: &mut Vec<Edge>) {
+    let Some(acc) = store.accounts.get(&pair.pool) else {
+        return; // pool account not streamed yet
+    };
+    let Some(pool) = meteora_damm_v2::parse_pool(&acc.data) else {
+        return;
+    };
+    if !pool.is_supported() {
+        return; // compounding curve or empty liquidity — never priced here
+    }
+    let fee_numerator = pool.total_fee_numerator();
+
+    let make = |a_for_b: bool| DexKind::MeteoraDammV2 {
+        sqrt_price: pool.sqrt_price,
+        liquidity: pool.liquidity,
+        sqrt_min_price: pool.sqrt_min_price,
+        sqrt_max_price: pool.sqrt_max_price,
+        fee_numerator,
+        collect_fee_mode: pool.collect_fee_mode,
+        a_for_b,
+    };
+
+    // Edge A → B (a_for_b = true).
+    out.push(Edge {
+        pool: pair.pool,
+        dex_kind: make(true),
+        mint_in: pool.token_a_mint,
+        mint_out: pool.token_b_mint,
+        vault_in: pool.token_a_vault,
+        vault_out: pool.token_b_vault,
+    });
+    // Edge B → A (a_for_b = false).
+    out.push(Edge {
+        pool: pair.pool,
+        dex_kind: make(false),
+        mint_in: pool.token_b_mint,
+        mint_out: pool.token_a_mint,
+        vault_in: pool.token_b_vault,
+        vault_out: pool.token_a_vault,
+    });
+}
+
 /// Build the full edge list from live vault pairs.
 ///
 /// Each pair produces two edges (both directions). Edges whose vault data or
@@ -106,6 +168,14 @@ pub fn build_edges(pairs: &[PoolVaultPair], store: &PoolStateStore) -> Vec<Edge>
     let mut out = Vec::with_capacity(pairs.len() * 2);
 
     for pair in pairs {
+        // Meteora DAMM v2 prices from the pool account, not vault reserves, so
+        // it needs its own edge-building path (mints + state snapshot come from
+        // the pool account; the vaults are kept only for bookkeeping).
+        if pair.owner == meteora_damm_v2::PROGRAM_ID {
+            push_meteora_edges(pair, store, &mut out);
+            continue;
+        }
+
         let Some(dex_kind) = resolve_dex_kind(pair, store) else {
             continue;
         };
@@ -152,6 +222,31 @@ pub fn build_edges(pairs: &[PoolVaultPair], store: &PoolStateStore) -> Vec<Edge>
 /// Compute exact-in amount_out for one edge from live store data.
 /// Returns None if any required account is missing or reserves are zero.
 pub fn quote_edge(edge: &Edge, amount_in: u64, store: &PoolStateStore) -> Option<u64> {
+    // Meteora DAMM v2 prices from the pool-account snapshot captured at
+    // build time — no vault reads, like a Uniswap-v3 active tick.
+    if let DexKind::MeteoraDammV2 {
+        sqrt_price,
+        liquidity,
+        sqrt_min_price,
+        sqrt_max_price,
+        fee_numerator,
+        collect_fee_mode,
+        a_for_b,
+    } = &edge.dex_kind
+    {
+        return meteora_damm_v2::quote_exact_in(
+            amount_in,
+            *a_for_b,
+            *sqrt_price,
+            *liquidity,
+            *sqrt_min_price,
+            *sqrt_max_price,
+            *fee_numerator,
+            *collect_fee_mode,
+        );
+    }
+
+    // Constant-product engines read live vault reserves.
     let in_data = store.accounts.get(&edge.vault_in)?;
     let out_data = store.accounts.get(&edge.vault_out)?;
     let (_, reserve_in) = read_spl_token_account(&in_data.data)?;
@@ -176,6 +271,7 @@ pub fn quote_edge(edge: &Edge, amount_in: u64, store: &PoolStateStore) -> Option
             *trade_fee_rate,
         )
         .map(|q| q.amount_out),
+        DexKind::MeteoraDammV2 { .. } => unreachable!("handled above"),
     }
 }
 

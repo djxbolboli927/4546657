@@ -10,15 +10,20 @@
 //! no raw math). Each engine documents its source program and is unit-tested
 //! against known-good values.
 //!
-//! Phase 1 ships the two pure constant-product engines:
+//! Phase 1 shipped the two pure constant-product engines:
 //!   • Raydium AMM v4  (`raydium_amm_v4`)
 //!   • Raydium CPMM    (`raydium_cpmm`)
-//! Concentrated-liquidity / bin / orderbook DEXes (CLMM, DLMM, Whirlpool,
-//! Meteora DAMM v2, …) are deliberately NOT modelled with x*y=k and are added
-//! later with their own engines.
+//! Phase 2 adds the first concentrated-liquidity engine:
+//!   • Meteora DAMM v2 (`meteora_damm_v2`) — Uniswap-v3-style sqrt_price + L,
+//!     priced from the pool account (not vault reserves), with its own 256-bit
+//!     math helper (`uint256`).
+//! Remaining CLMM / bin / orderbook DEXes (Raydium CLMM, Meteora DLMM,
+//! Whirlpool, …) get their own engines later.
 
+pub mod meteora_damm_v2;
 pub mod raydium_amm_v4;
 pub mod raydium_cpmm;
+pub mod uint256;
 
 use solana_sdk::pubkey::Pubkey;
 

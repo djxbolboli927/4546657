@@ -1,19 +1,18 @@
 /// Price validator — a WEAK sanity check, not a correctness oracle.
 ///
-/// It compares the on-chain constant-product spot price of a pool (from live
-/// vault balances in PoolStateStore) against Jupiter's USD price *ratio* for
-/// the same two mints. Jupiter Price API gives a general USD mid-price, NOT a
-/// quote for this specific pool, so a non-zero diff is expected and only large
-/// diffs are interesting. The field is named `jup_price_ratio` to make that
-/// explicit.
+/// Compares local on-chain prices against Jupiter's USD price ratio for the
+/// same two mints. Covers three pool types:
 ///
-/// Scope (deliberately narrow per design): ONLY pools owned by Raydium AMM v4
-/// or Raydium CPMM are checked — both are pure x*y=k. CLMM / DLMM / Whirlpool /
-/// DAMM v2 / orderbook pools are SKIPPED here because reserve_b/reserve_a is
-/// not their price (that was the source of the earlier ~900000 bps garbage).
+///   • Raydium AMM v4 / CPMM — pure x*y=k; price from vault reserves.
+///   • Meteora DAMM v2 — Uniswap-v3-style; price from pool account sqrt_price.
+///
+/// CLMM / DLMM / Whirlpool / orderbook and other concentrated-liquidity pools
+/// are still skipped — their prices can't be read without tick-array state.
 ///
 /// Token decimals come from the real on-chain mint accounts (RPC, cached), NOT
-/// from Jupiter.
+/// from Jupiter. Jupiter Price API gives a general USD mid-price, not a quote
+/// for any specific pool, so non-zero diffs are expected and only large diffs
+/// are interesting. The field is named `jup_price_ratio` to make that explicit.
 ///
 /// Set VALIDATOR_DEBUG=1 for per-pool detail.
 use serde::Deserialize;
@@ -25,7 +24,7 @@ use std::time::Duration;
 use tracing::warn;
 
 use crate::config::{JupiterPriceConfig, ValidationConfig};
-use crate::dex::{raydium_amm_v4, raydium_cpmm};
+use crate::dex::{meteora_damm_v2, raydium_amm_v4, raydium_cpmm};
 use crate::pool_state_store::PoolStateStore;
 use crate::pool_state_stream::PoolVaultPair;
 
@@ -35,6 +34,9 @@ use crate::pool_state_stream::PoolVaultPair;
 enum Engine {
     RaydiumAmmV4,
     RaydiumCpmm,
+    /// Meteora DAMM v2 — priced from the pool account's `sqrt_price`, not from
+    /// vault reserves. Included so its prices can be checked against Jupiter.
+    MeteoraDammV2,
 }
 
 impl Engine {
@@ -42,21 +44,28 @@ impl Engine {
         match self {
             Engine::RaydiumAmmV4 => "ray_amm_v4",
             Engine::RaydiumCpmm => "ray_cpmm",
+            Engine::MeteoraDammV2 => "mtr_damm_v2",
         }
     }
 }
 
 /// Classify a pool by its owner program id. Returns None for DEXes this
-/// validator deliberately skips (everything that isn't pure constant product).
+/// validator deliberately skips (CLMM / DLMM / Whirlpool / orderbook).
 fn classify(owner: &Pubkey) -> Option<Engine> {
     if *owner == raydium_amm_v4::PROGRAM_ID {
         Some(Engine::RaydiumAmmV4)
     } else if *owner == raydium_cpmm::PROGRAM_ID {
         Some(Engine::RaydiumCpmm)
+    } else if *owner == meteora_damm_v2::PROGRAM_ID {
+        Some(Engine::MeteoraDammV2)
     } else {
         None
     }
 }
+
+/// Q64.64 scale as f64 (2^64). DAMM v2 spot price of token A in token B
+/// (atomic units) is `(sqrt_price / 2^64)^2`.
+const Q64_F64: f64 = 18_446_744_073_709_551_616.0;
 
 // ── SPL account decoders ───────────────────────────────────────────────────────
 
@@ -182,6 +191,9 @@ struct LivePool {
     mint_b: Pubkey,
     reserve_a: u64,
     reserve_b: u64,
+    /// Spot price of token A in token B, atomic units (B per A). For CP pools
+    /// this is `reserve_b / reserve_a`; for DAMM v2 it is `(sqrt_price/2^64)^2`.
+    spot_atomic: f64,
     slot: u64,
 }
 
@@ -196,7 +208,7 @@ async fn run_cycle(
     max_log: usize,
     debug: bool,
 ) {
-    // ── 1. Read live vaults for Raydium AMM v4 / CPMM pools only ─────────────
+    // ── 1. Collect live pools — CP pools from vaults, DAMM v2 from pool account ─
     let mut live: Vec<LivePool> = Vec::new();
     let mut mint_set: std::collections::HashSet<Pubkey> = std::collections::HashSet::new();
     let mut mint_list: Vec<Pubkey> = Vec::new();
@@ -220,6 +232,43 @@ async fn run_cycle(
             }
         };
 
+        // ── Meteora DAMM v2 — price comes from pool account sqrt_price ─────────
+        if engine == Engine::MeteoraDammV2 {
+            let Some(acc) = store.accounts.get(&pair.pool) else { continue };
+            let Some(pool) = meteora_damm_v2::parse_pool(&acc.data) else { continue };
+            if !pool.is_supported() { continue; }
+            // spot price of token A in token B, in atomic units:
+            //   price = (sqrt_price / 2^64)^2
+            let sp = pool.sqrt_price as f64 / Q64_F64;
+            let spot_atomic = sp * sp;
+            let slot = acc.slot;
+            // Also read vaults for the reserve display in the log — optional,
+            // silently skipped when not yet live.
+            let (reserve_a, reserve_b) = {
+                let ra = store.accounts.get(&pair.vault_a)
+                    .and_then(|r| read_spl_token_account(&r.data).map(|(_, a)| a))
+                    .unwrap_or(0);
+                let rb = store.accounts.get(&pair.vault_b)
+                    .and_then(|r| read_spl_token_account(&r.data).map(|(_, a)| a))
+                    .unwrap_or(0);
+                (ra, rb)
+            };
+            if mint_set.insert(pool.token_a_mint) { mint_list.push(pool.token_a_mint); }
+            if mint_set.insert(pool.token_b_mint) { mint_list.push(pool.token_b_mint); }
+            live.push(LivePool {
+                pool: pair.pool,
+                engine,
+                mint_a: pool.token_a_mint,
+                mint_b: pool.token_b_mint,
+                reserve_a,
+                reserve_b,
+                spot_atomic,
+                slot,
+            });
+            continue;
+        }
+
+        // ── Raydium AMM v4 / CPMM — price from vault reserves ─────────────────
         let a_data = match store.accounts.get(&pair.vault_a) {
             Some(r) => r.data.clone(),
             None => continue,
@@ -237,6 +286,7 @@ async fn run_cycle(
         if reserve_a == 0 || reserve_b == 0 {
             continue;
         }
+        let spot_atomic = reserve_b as f64 / reserve_a as f64;
 
         if mint_set.insert(mint_a) { mint_list.push(mint_a); }
         if mint_set.insert(mint_b) { mint_list.push(mint_b); }
@@ -248,13 +298,14 @@ async fn run_cycle(
             mint_b,
             reserve_a,
             reserve_b,
+            spot_atomic,
             slot,
         });
     }
 
     if live.is_empty() {
         eprintln!(
-            "[validator] waiting for state — subscribed_pools={} live=0 skipped_non_cp={}",
+            "[validator] waiting for state — subscribed_pools={} live=0 skipped_unsupported={}",
             pairs.len(),
             skipped_dex
         );
@@ -287,10 +338,12 @@ async fn run_cycle(
             continue;
         };
 
-        // On-chain constant-product spot price of A in B (real units):
-        //   spot = (reserve_b / reserve_a) × 10^(dec_a − dec_b)
+        // Spot price of A in B, adjusted for decimal difference → real units.
+        // CP pools: spot_atomic = reserve_b / reserve_a.
+        // DAMM v2:  spot_atomic = (sqrt_price / 2^64)^2.
+        // Both give B-per-A in atomic units; multiply by 10^(dec_a-dec_b) → real.
         let dec_adj = 10f64.powi(dec_a as i32 - dec_b as i32);
-        let local = (d.reserve_b as f64 / d.reserve_a as f64) * dec_adj;
+        let local = d.spot_atomic * dec_adj;
         // Jupiter USD price ratio (NOT a pool quote — weak reference only).
         let jup_price_ratio = usd_a / usd_b;
 
@@ -300,13 +353,14 @@ async fn run_cycle(
             diff_bps,
             format!(
                 "[{eng}] pool={p} ra={ra} rb={rb} dec_a={da} dec_b={db} \
-local={lo:.8} jup_price_ratio={jp:.8} diff={d:.1}bps slot={sl}",
+spot_atomic={sa:.8} local={lo:.8} jup_ratio={jp:.8} diff={d:.1}bps slot={sl}",
                 eng = d.engine.label(),
                 p = d.pool,
                 ra = d.reserve_a,
                 rb = d.reserve_b,
                 da = dec_a,
                 db = dec_b,
+                sa = d.spot_atomic,
                 lo = local,
                 jp = jup_price_ratio,
                 d = diff_bps,
@@ -323,10 +377,14 @@ local={lo:.8} jup_price_ratio={jp:.8} diff={d:.1}bps slot={sl}",
     };
     let max = diffs.first().map(|(d, _)| *d).unwrap_or(0.0);
 
+    let meteora_live = live.iter().filter(|d| d.engine == Engine::MeteoraDammV2).count();
+    let cp_live = live.len() - meteora_live;
     eprintln!(
-        "[validator] cp_pools_live={live} compared={ok} skipped_non_cp={skip} \
-no_jup={nj} no_decimals={nd} avg={avg:.1}bps max={max:.1}bps",
+        "[validator] pools_live={live} (cp={cp} damm_v2={dmm}) compared={ok} \
+skipped_unsupported={skip} no_jup={nj} no_decimals={nd} avg={avg:.1}bps max={max:.1}bps",
         live = live.len(),
+        cp = cp_live,
+        dmm = meteora_live,
         ok = diffs.len(),
         skip = skipped_dex,
         nj = no_jup,
@@ -353,9 +411,9 @@ pub fn spawn_validator(
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
 
-    let cp_pairs = pairs.len();
+    let total_pairs = pairs.len();
     eprintln!(
-        "[validator] started — {cp_pairs} vault pairs (Raydium AMM v4/CPMM only), \
+        "[validator] started — {total_pairs} pool pairs (Raydium AMM v4/CPMM/Meteora DAMM v2), \
 interval={s}s, max_log={m}, debug={debug}",
         s = val_cfg.interval_secs,
         m = val_cfg.max_pools_log,
