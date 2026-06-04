@@ -218,6 +218,85 @@ impl U256 {
         };
         q.as_u128()
     }
+
+    /// `self >> 64`, discarding the low 64 bits.
+    /// Used in Whirlpool negative-tick math and as a building block for shr96.
+    #[inline]
+    pub fn shr64(self) -> U256 {
+        U256 {
+            limbs: [self.limbs[1], self.limbs[2], self.limbs[3], 0],
+        }
+    }
+
+    /// `self >> 96`, discarding the low 96 bits.
+    /// Used in Whirlpool positive-tick math: each step multiplies by a Q96
+    /// constant and shifts right 96 to stay in Q96 scale.
+    #[inline]
+    pub fn shr96(self) -> U256 {
+        // Bit 96 of self is bit 32 of limbs[1]; new limbs[0] picks up bits
+        // 96..159 (= limbs[1] high half + limbs[2] low half), etc.
+        U256 {
+            limbs: [
+                (self.limbs[1] >> 32) | (self.limbs[2] << 32),
+                (self.limbs[2] >> 32) | (self.limbs[3] << 32),
+                self.limbs[3] >> 32,
+                0,
+            ],
+        }
+    }
+
+    /// `floor(self / 2^32)` as `u128`, or `None` if the result doesn't fit.
+    /// Used at the end of the Whirlpool positive-tick algorithm to convert from
+    /// Q96 back to Q64.64.
+    pub fn shr32_as_u128(self) -> Option<u128> {
+        // After >> 32 the result occupies bits [32..160) of self.
+        // Ensure the bits above bit 159 are all zero.
+        if self.limbs[3] != 0 || (self.limbs[2] >> 32) != 0 {
+            return None;
+        }
+        let lo = (self.limbs[0] >> 32) | (self.limbs[1] << 32);
+        let hi = (self.limbs[1] >> 32) | (self.limbs[2] << 32);
+        Some((hi as u128) << 64 | lo as u128)
+    }
+
+    /// `self << 64`, returning `None` if any bits above bit 191 would be lost
+    /// (i.e. `self.limbs[3] != 0`). Used in Whirlpool swap math.
+    pub fn checked_shl64(self) -> Option<U256> {
+        if self.limbs[3] != 0 {
+            return None;
+        }
+        Some(U256 {
+            limbs: [0, self.limbs[0], self.limbs[1], self.limbs[2]],
+        })
+    }
+
+    /// `self * b` (U256 × u128 → U256), returning `None` on 256-bit overflow.
+    /// The four limbs of `self` are each multiplied by both 64-bit halves of
+    /// `b`; partial products are accumulated with carry propagation.
+    pub fn mul_u256_u128(self, b: u128) -> Option<U256> {
+        let b0 = b as u64 as u128;
+        let b1 = (b >> 64) as u64 as u128;
+
+        // Five u128 accumulators (positions 0..4 in u64 units). Position 4 is
+        // the overflow detector — must be 0 for a valid 256-bit result.
+        let mut acc = [0u128; 5];
+        for i in 0..4 {
+            acc[i] += self.limbs[i] as u128 * b0;
+            acc[i + 1] += self.limbs[i] as u128 * b1;
+        }
+
+        let mut out = [0u64; 4];
+        let mut carry = 0u128;
+        for i in 0..4 {
+            let sum = acc[i] + carry;
+            out[i] = sum as u64;
+            carry = sum >> 64;
+        }
+        if acc[4] + carry != 0 {
+            return None; // product overflows 256 bits
+        }
+        Some(U256 { limbs: out })
+    }
 }
 
 #[cfg(test)]

@@ -23,7 +23,7 @@ use std::time::Duration;
 use solana_sdk::pubkey::Pubkey;
 use tracing::warn;
 
-use crate::dex::{meteora_damm_v2, raydium_amm_v4, raydium_cpmm};
+use crate::dex::{meteora_damm_v2, raydium_amm_v4, raydium_cpmm, whirlpool};
 use crate::pool_state_store::PoolStateStore;
 use crate::pool_state_stream::PoolVaultPair;
 
@@ -48,6 +48,19 @@ pub enum DexKind {
         collect_fee_mode: u8,
         a_for_b: bool,
     },
+    /// Orca Whirlpool: Uniswap-v3-style CLMM.  Single-tick quote from a
+    /// pool-account snapshot.  Returns None when the swap would cross the
+    /// current-tick's boundary (tick-array state not available).
+    OrcaWhirlpoolV1 {
+        sqrt_price: u128,
+        liquidity: u128,
+        /// sqrt_price of the lower tick boundary (Q64.64).
+        sqrt_price_lower: u128,
+        /// sqrt_price of the upper tick boundary (Q64.64).
+        sqrt_price_upper: u128,
+        fee_rate: u16,
+        a_for_b: bool,
+    },
 }
 
 impl DexKind {
@@ -56,6 +69,7 @@ impl DexKind {
             DexKind::RaydiumAmmV4 => "RaydiumAmmV4",
             DexKind::RaydiumCpmm { .. } => "RaydiumCpmm",
             DexKind::MeteoraDammV2 { .. } => "MeteoraDammV2",
+            DexKind::OrcaWhirlpoolV1 { .. } => "OrcaWhirlpoolV1",
         }
     }
 }
@@ -159,6 +173,44 @@ fn push_meteora_edges(pair: &PoolVaultPair, store: &PoolStateStore, out: &mut Ve
     });
 }
 
+/// Build two directed edges for an Orca Whirlpool pool from its pool account.
+/// Silently skips if the pool account isn't live, can't be parsed, or has zero
+/// liquidity — in all cases it simply won't contribute edges this scan.
+fn push_whirlpool_edges(pair: &PoolVaultPair, store: &PoolStateStore, out: &mut Vec<Edge>) {
+    let Some(acc) = store.accounts.get(&pair.pool) else {
+        return;
+    };
+    let Some(pool) = whirlpool::parse_pool(&acc.data) else {
+        return;
+    };
+
+    let make = |a_for_b: bool| DexKind::OrcaWhirlpoolV1 {
+        sqrt_price: pool.sqrt_price,
+        liquidity: pool.liquidity,
+        sqrt_price_lower: pool.sqrt_price_lower,
+        sqrt_price_upper: pool.sqrt_price_upper,
+        fee_rate: pool.fee_rate,
+        a_for_b,
+    };
+
+    out.push(Edge {
+        pool: pair.pool,
+        dex_kind: make(true),
+        mint_in: pool.token_mint_a,
+        mint_out: pool.token_mint_b,
+        vault_in: pool.token_vault_a,
+        vault_out: pool.token_vault_b,
+    });
+    out.push(Edge {
+        pool: pair.pool,
+        dex_kind: make(false),
+        mint_in: pool.token_mint_b,
+        mint_out: pool.token_mint_a,
+        vault_in: pool.token_vault_b,
+        vault_out: pool.token_vault_a,
+    });
+}
+
 /// Build the full edge list from live vault pairs.
 ///
 /// Each pair produces two edges (both directions). Edges whose vault data or
@@ -168,11 +220,14 @@ pub fn build_edges(pairs: &[PoolVaultPair], store: &PoolStateStore) -> Vec<Edge>
     let mut out = Vec::with_capacity(pairs.len() * 2);
 
     for pair in pairs {
-        // Meteora DAMM v2 prices from the pool account, not vault reserves, so
-        // it needs its own edge-building path (mints + state snapshot come from
-        // the pool account; the vaults are kept only for bookkeeping).
+        // CLMM pools (Meteora DAMM v2, Orca Whirlpool) price from the pool
+        // account, not vault reserves — they need their own edge-building paths.
         if pair.owner == meteora_damm_v2::PROGRAM_ID {
             push_meteora_edges(pair, store, &mut out);
+            continue;
+        }
+        if pair.owner == whirlpool::PROGRAM_ID {
+            push_whirlpool_edges(pair, store, &mut out);
             continue;
         }
 
@@ -222,8 +277,8 @@ pub fn build_edges(pairs: &[PoolVaultPair], store: &PoolStateStore) -> Vec<Edge>
 /// Compute exact-in amount_out for one edge from live store data.
 /// Returns None if any required account is missing or reserves are zero.
 pub fn quote_edge(edge: &Edge, amount_in: u64, store: &PoolStateStore) -> Option<u64> {
-    // Meteora DAMM v2 prices from the pool-account snapshot captured at
-    // build time — no vault reads, like a Uniswap-v3 active tick.
+    // CLMM engines price from a pool-account snapshot captured at build time —
+    // no vault reads required.
     if let DexKind::MeteoraDammV2 {
         sqrt_price,
         liquidity,
@@ -243,6 +298,25 @@ pub fn quote_edge(edge: &Edge, amount_in: u64, store: &PoolStateStore) -> Option
             *sqrt_max_price,
             *fee_numerator,
             *collect_fee_mode,
+        );
+    }
+    if let DexKind::OrcaWhirlpoolV1 {
+        sqrt_price,
+        liquidity,
+        sqrt_price_lower,
+        sqrt_price_upper,
+        fee_rate,
+        a_for_b,
+    } = &edge.dex_kind
+    {
+        return whirlpool::quote_exact_in(
+            amount_in,
+            *a_for_b,
+            *sqrt_price,
+            *liquidity,
+            *sqrt_price_lower,
+            *sqrt_price_upper,
+            *fee_rate,
         );
     }
 
@@ -271,7 +345,9 @@ pub fn quote_edge(edge: &Edge, amount_in: u64, store: &PoolStateStore) -> Option
             *trade_fee_rate,
         )
         .map(|q| q.amount_out),
-        DexKind::MeteoraDammV2 { .. } => unreachable!("handled above"),
+        DexKind::MeteoraDammV2 { .. } | DexKind::OrcaWhirlpoolV1 { .. } => {
+            unreachable!("handled above")
+        }
     }
 }
 
