@@ -358,6 +358,11 @@ pub const ERROR_MARGIN_PER_HOP: u64 = 100;
 
 /// Spawn the cycle scanner task. Runs every `interval_secs` seconds, logging
 /// the best opportunities found without sending any transactions.
+///
+/// The CPU-bound edge build + cycle search runs inside `spawn_blocking`, so it
+/// never blocks the async runtime: the gRPC stream ingestion and the price
+/// validator keep running on the worker threads while the search executes on a
+/// blocking-pool thread. On a 4-core box this keeps reserve data fresh.
 pub fn spawn_cycle_scanner(
     pairs: Vec<PoolVaultPair>,
     store: Arc<PoolStateStore>,
@@ -366,7 +371,7 @@ pub fn spawn_cycle_scanner(
     tx_cost: u64,
 ) {
     let metrics = Arc::new(CycleMetrics::default());
-    let m2 = metrics.clone();
+    let pairs = Arc::new(pairs);
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
@@ -375,50 +380,73 @@ pub fn spawn_cycle_scanner(
         loop {
             ticker.tick().await;
 
-            let edges = build_edges(&pairs, &store);
-            let wsol = solana_sdk::pubkey::Pubkey::from_str_const(crate::tokens::WSOL_MINT);
+            // Heavy, CPU-bound work off the async runtime.
+            let pairs_c = pairs.clone();
+            let store_c = store.clone();
+            let tx_cost_c = tx_cost;
+            let result = tokio::task::spawn_blocking(move || {
+                let edges = build_edges(&pairs_c, &store_c);
+                let wsol =
+                    solana_sdk::pubkey::Pubkey::from_str_const(crate::tokens::WSOL_MINT);
+                let live_pools = store_c.live_pool_count();
+                let edge_count = edges.len();
+                if edge_count == 0 {
+                    return (live_pools, 0usize, Vec::new());
+                }
+                let hits = find_cycles_in_store(
+                    &edges,
+                    wsol,
+                    SCAN_AMOUNTS,
+                    tx_cost_c,
+                    ERROR_MARGIN_PER_HOP,
+                    &store_c,
+                );
+                (live_pools, edge_count, hits)
+            })
+            .await;
 
-            let live_pools = store.live_pool_count();
-            let edge_count = edges.len();
+            let (live_pools, edge_count, hits) = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(error = %e, "[cycle] search task panicked");
+                    continue;
+                }
+            };
 
             if edge_count == 0 {
                 eprintln!("[cycle] no live edges yet (live_pools={live_pools})");
                 continue;
             }
 
-            let hits = find_cycles_in_store(
-                &edges,
-                wsol,
-                SCAN_AMOUNTS,
-                tx_cost,
-                ERROR_MARGIN_PER_HOP,
-                &store,
-            );
+            let scans = metrics.scans_total.fetch_add(1, Ordering::Relaxed) + 1;
+            metrics
+                .cycles_evaluated
+                .fetch_add(hits.len() as u64, Ordering::Relaxed);
 
-            let scans = m2.scans_total.fetch_add(1, Ordering::Relaxed) + 1;
-            let evaluated = hits.len() as u64;
-            m2.cycles_evaluated.fetch_add(evaluated, Ordering::Relaxed);
+            let gross_pos = hits.iter().filter(|h| h.profit_gross > 0).count();
+            let net_pos = hits.iter().filter(|h| h.profit_net > 0).count();
 
-            let gross_pos: Vec<&CycleHit> = hits.iter().filter(|h| h.profit_gross > 0).collect();
-            let net_pos: Vec<&CycleHit> = hits.iter().filter(|h| h.profit_net > 0).collect();
-
-            m2.gross_positive.fetch_add(gross_pos.len() as u64, Ordering::Relaxed);
-            m2.net_positive.fetch_add(net_pos.len() as u64, Ordering::Relaxed);
+            metrics
+                .gross_positive
+                .fetch_add(gross_pos as u64, Ordering::Relaxed);
+            metrics
+                .net_positive
+                .fetch_add(net_pos as u64, Ordering::Relaxed);
 
             if let Some(best) = hits.first() {
-                m2.best_gross_lamports
+                metrics
+                    .best_gross_lamports
                     .fetch_max(best.profit_gross, Ordering::Relaxed);
                 if best.profit_net > 0 {
-                    m2.best_net_lamports
+                    metrics
+                        .best_net_lamports
                         .fetch_max(best.profit_net as u64, Ordering::Relaxed);
                 }
             }
 
             eprintln!(
                 "[cycle] scan={scans} live_pools={live_pools} edges={edge_count} \
-hits(gross+)={} hits(net+)={} best_gross={} best_net={}",
-                gross_pos.len(),
-                net_pos.len(),
+hits(gross+)={gross_pos} hits(net+)={net_pos} best_gross={} best_net={}",
                 hits.first().map(|h| h.profit_gross).unwrap_or(0),
                 hits.first().map(|h| h.profit_net).unwrap_or(0),
             );
@@ -449,17 +477,140 @@ path=[{}]  via=[{}]",
             }
 
             // Summary stats.
-            let total_gross = m2.gross_positive.load(Ordering::Relaxed);
-            let total_net = m2.net_positive.load(Ordering::Relaxed);
-            let best_gross_ever = m2.best_gross_lamports.load(Ordering::Relaxed);
-            let best_net_ever = m2.best_net_lamports.load(Ordering::Relaxed);
+            let total_gross = metrics.gross_positive.load(Ordering::Relaxed);
+            let total_net = metrics.net_positive.load(Ordering::Relaxed);
+            let best_gross_ever = metrics.best_gross_lamports.load(Ordering::Relaxed);
+            let best_net_ever = metrics.best_net_lamports.load(Ordering::Relaxed);
             eprintln!(
                 "[cycle] cumulative: scans={scans} gross+={total_gross} net+={total_net} \
 best_gross_ever={best_gross_ever}L best_net_ever={best_net_ever}L"
             );
         }
     });
+}
 
-    // Suppress unused warning on `metrics` — it's intentionally kept alive.
-    let _ = metrics;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pool_state_store::PoolStateStore;
+
+    /// Build a 165-byte SPL token account: mint @ [0..32], amount @ [64..72].
+    fn spl_account(mint: &Pubkey, amount: u64) -> Vec<u8> {
+        let mut data = vec![0u8; 165];
+        data[0..32].copy_from_slice(mint.as_ref());
+        data[64..72].copy_from_slice(&amount.to_le_bytes());
+        data
+    }
+
+    fn insert_vault(store: &PoolStateStore, vault: Pubkey, mint: &Pubkey, amount: u64) {
+        store.apply_update(
+            vault,
+            raydium_amm_v4::PROGRAM_ID, // owner irrelevant for vaults
+            0,
+            spl_account(mint, amount),
+            1,
+            1,
+        );
+    }
+
+    /// Two WSOL/X Raydium AMM v4 pools at different prices must yield a
+    /// gross-positive 2-hop WSOL→X→WSOL cycle. Proves the search works, so an
+    /// empty result in production is a genuine market condition, not a bug.
+    #[test]
+    fn finds_two_hop_arbitrage() {
+        let wsol = Pubkey::from_str_const(crate::tokens::WSOL_MINT);
+        let x = Pubkey::new_unique();
+
+        let pool1 = Pubkey::new_unique();
+        let p1_wsol_vault = Pubkey::new_unique();
+        let p1_x_vault = Pubkey::new_unique();
+
+        let pool2 = Pubkey::new_unique();
+        let p2_wsol_vault = Pubkey::new_unique();
+        let p2_x_vault = Pubkey::new_unique();
+
+        // Build the store indexes.
+        let mut a2p: HashMap<Pubkey, Vec<Pubkey>> = HashMap::new();
+        let mut p2a: HashMap<Pubkey, Vec<Pubkey>> = HashMap::new();
+        for (pool, wv, xv) in [
+            (pool1, p1_wsol_vault, p1_x_vault),
+            (pool2, p2_wsol_vault, p2_x_vault),
+        ] {
+            p2a.insert(pool, vec![pool, wv, xv]);
+            for acc in [pool, wv, xv] {
+                a2p.entry(acc).or_default().push(pool);
+            }
+        }
+        let store = PoolStateStore::new(a2p, p2a);
+
+        // Pool1: 1000 WSOL : 1000 X  (price 1:1)
+        insert_vault(&store, p1_wsol_vault, &wsol, 1_000_000_000_000);
+        insert_vault(&store, p1_x_vault, &x, 1_000_000_000_000);
+        // Pool2: 1000 WSOL : 900 X  (X scarcer → worth more WSOL)
+        insert_vault(&store, p2_wsol_vault, &wsol, 1_000_000_000_000);
+        insert_vault(&store, p2_x_vault, &x, 900_000_000_000);
+
+        let pairs = vec![
+            PoolVaultPair {
+                pool: pool1,
+                vault_a: p1_wsol_vault,
+                vault_b: p1_x_vault,
+                owner: raydium_amm_v4::PROGRAM_ID,
+                amm_config: None,
+            },
+            PoolVaultPair {
+                pool: pool2,
+                vault_a: p2_wsol_vault,
+                vault_b: p2_x_vault,
+                owner: raydium_amm_v4::PROGRAM_ID,
+                amm_config: None,
+            },
+        ];
+
+        let edges = build_edges(&pairs, &store);
+        assert_eq!(edges.len(), 4, "two pools → four directed edges");
+
+        let hits = find_cycles_in_store(&edges, wsol, &[1_000_000], 6_000, 100, &store);
+        assert!(!hits.is_empty(), "an ~11% price gap must produce a cycle");
+        let best = &hits[0];
+        assert_eq!(best.hops(), 2);
+        assert!(best.profit_gross > 0);
+        assert!(best.is_net_positive(), "11% gap easily covers costs");
+    }
+
+    /// Two pools at the SAME price must NOT produce a profitable cycle
+    /// (fees make the round-trip a loss). Confirms we don't emit false hits.
+    #[test]
+    fn equal_price_pools_no_arbitrage() {
+        let wsol = Pubkey::from_str_const(crate::tokens::WSOL_MINT);
+        let x = Pubkey::new_unique();
+        let pool1 = Pubkey::new_unique();
+        let p1w = Pubkey::new_unique();
+        let p1x = Pubkey::new_unique();
+        let pool2 = Pubkey::new_unique();
+        let p2w = Pubkey::new_unique();
+        let p2x = Pubkey::new_unique();
+
+        let mut a2p: HashMap<Pubkey, Vec<Pubkey>> = HashMap::new();
+        let mut p2a: HashMap<Pubkey, Vec<Pubkey>> = HashMap::new();
+        for (pool, wv, xv) in [(pool1, p1w, p1x), (pool2, p2w, p2x)] {
+            p2a.insert(pool, vec![pool, wv, xv]);
+            for acc in [pool, wv, xv] {
+                a2p.entry(acc).or_default().push(pool);
+            }
+        }
+        let store = PoolStateStore::new(a2p, p2a);
+        for (wv, xv) in [(p1w, p1x), (p2w, p2x)] {
+            insert_vault(&store, wv, &wsol, 1_000_000_000_000);
+            insert_vault(&store, xv, &x, 1_000_000_000_000);
+        }
+
+        let pairs = vec![
+            PoolVaultPair { pool: pool1, vault_a: p1w, vault_b: p1x, owner: raydium_amm_v4::PROGRAM_ID, amm_config: None },
+            PoolVaultPair { pool: pool2, vault_a: p2w, vault_b: p2x, owner: raydium_amm_v4::PROGRAM_ID, amm_config: None },
+        ];
+        let edges = build_edges(&pairs, &store);
+        let hits = find_cycles_in_store(&edges, wsol, &[1_000_000], 6_000, 100, &store);
+        assert!(hits.is_empty(), "equal prices → fees make every cycle a loss");
+    }
 }
