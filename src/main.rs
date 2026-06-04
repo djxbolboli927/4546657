@@ -2,6 +2,7 @@
 mod account_cache;
 mod alt_cache;
 mod arbitrage;
+mod arb_cycle;
 mod blockhash_cache;
 mod config;
 mod dex;
@@ -196,15 +197,26 @@ async fn async_main(config: config::Config) -> Result<()> {
         None
     };
 
-    // ── Validation mode: skip bot, only run price comparisons ─────────────────
+    // ── Validation mode: price comparison + cycle scan, no Jito ─────────────
     if config.validation.enabled {
         if let Some((store, vault_pairs)) = pool_state_result {
+            // 1. Jupiter price validator (same-pool local vs Jupiter reference).
             validator::spawn_validator(
-                vault_pairs,
-                store,
+                vault_pairs.clone(),
+                store.clone(),
                 rpc_client.clone(),
                 config.validation.clone(),
                 config.jupiter_price.clone(),
+            );
+
+            // 2. WSOL cycle evaluator — find 2-hop and 3-hop arb opportunities.
+            //    Does NOT send to Jito; only logs and counts profitable cycles.
+            arb_cycle::spawn_cycle_scanner(
+                vault_pairs,
+                store,
+                config.validation.interval_secs,
+                config.validation.max_pools_log,
+                arb_cycle::DEFAULT_TX_COST,
             );
         } else {
             eprintln!("[validator] ERROR: pool state unavailable; set pool_state.mix_json in config");
