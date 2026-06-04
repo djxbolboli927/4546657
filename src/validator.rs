@@ -24,7 +24,9 @@ use std::time::Duration;
 use tracing::warn;
 
 use crate::config::{JupiterPriceConfig, ValidationConfig};
-use crate::dex::{meteora_damm_v2, pumpswap, raydium_amm_v4, raydium_clmm, raydium_cpmm, whirlpool};
+use crate::dex::{
+    meteora_damm_v2, meteora_dlmm, pumpswap, raydium_amm_v4, raydium_clmm, raydium_cpmm, whirlpool,
+};
 use crate::pool_state_store::PoolStateStore;
 use crate::pool_state_stream::PoolVaultPair;
 
@@ -43,6 +45,9 @@ enum Engine {
     RaydiumClmm,
     /// PumpSwap — priced from vault reserves (constant-product, 30 bps fee).
     PumpSwap,
+    /// Meteora DLMM — bin-based; spot price comes from the active bin
+    /// (`(1 + bin_step/10000)^active_id`).
+    MeteoraDlmm,
 }
 
 impl Engine {
@@ -54,6 +59,7 @@ impl Engine {
             Engine::OrcaWhirlpool => "orca_wpool",
             Engine::RaydiumClmm => "ray_clmm",
             Engine::PumpSwap => "pumpswap",
+            Engine::MeteoraDlmm => "mtr_dlmm",
         }
     }
 }
@@ -73,6 +79,8 @@ fn classify(owner: &Pubkey) -> Option<Engine> {
         Some(Engine::RaydiumClmm)
     } else if *owner == pumpswap::PROGRAM_ID {
         Some(Engine::PumpSwap)
+    } else if *owner == meteora_dlmm::PROGRAM_ID {
+        Some(Engine::MeteoraDlmm)
     } else {
         None
     }
@@ -370,6 +378,39 @@ async fn run_cycle(
             continue;
         }
 
+        if engine == Engine::MeteoraDlmm {
+            let Some(acc) = store.accounts.get(&pair.pool) else { continue };
+            let Some(pool) = meteora_dlmm::parse_pool(&acc.data) else { continue };
+            if !pool.is_supported() { continue; }
+            // Active-bin spot price of token X in token Y (atomic), Q64.64 → f64.
+            let Some(price_q64) = meteora_dlmm::get_price_from_id(pool.active_id, pool.bin_step)
+            else { continue };
+            let spot_atomic = price_q64 as f64 / Q64_F64;
+            let slot = acc.slot;
+            let (reserve_a, reserve_b) = {
+                let ra = store.accounts.get(&pool.reserve_x)
+                    .and_then(|r| read_spl_token_account(&r.data).map(|(_, a)| a))
+                    .unwrap_or(0);
+                let rb = store.accounts.get(&pool.reserve_y)
+                    .and_then(|r| read_spl_token_account(&r.data).map(|(_, a)| a))
+                    .unwrap_or(0);
+                (ra, rb)
+            };
+            if mint_set.insert(pool.token_x_mint) { mint_list.push(pool.token_x_mint); }
+            if mint_set.insert(pool.token_y_mint) { mint_list.push(pool.token_y_mint); }
+            live.push(LivePool {
+                pool: pair.pool,
+                engine,
+                mint_a: pool.token_x_mint,
+                mint_b: pool.token_y_mint,
+                reserve_a,
+                reserve_b,
+                spot_atomic,
+                slot,
+            });
+            continue;
+        }
+
         // ── Raydium AMM v4 / CPMM — price from vault reserves ─────────────────
         let a_data = match store.accounts.get(&pair.vault_a) {
             Some(r) => r.data.clone(),
@@ -483,9 +524,10 @@ spot_atomic={sa:.8} local={lo:.8} jup_ratio={jp:.8} diff={d:.1}bps slot={sl}",
     let wpool_live = live.iter().filter(|d| d.engine == Engine::OrcaWhirlpool).count();
     let rclmm_live = live.iter().filter(|d| d.engine == Engine::RaydiumClmm).count();
     let pump_live = live.iter().filter(|d| d.engine == Engine::PumpSwap).count();
-    let cp_live = live.len() - dmm_live - wpool_live - rclmm_live - pump_live;
+    let dlmm_live = live.iter().filter(|d| d.engine == Engine::MeteoraDlmm).count();
+    let cp_live = live.len() - dmm_live - wpool_live - rclmm_live - pump_live - dlmm_live;
     eprintln!(
-        "[validator] pools_live={live} (cp={cp} damm_v2={dmm} whirlpool={wp} ray_clmm={rc} pumpswap={ps}) \
+        "[validator] pools_live={live} (cp={cp} damm_v2={dmm} whirlpool={wp} ray_clmm={rc} pumpswap={ps} dlmm={dl}) \
 compared={ok} skipped_unsupported={skip} no_jup={nj} no_decimals={nd} \
 avg={avg:.1}bps max={max:.1}bps",
         live = live.len(),
@@ -494,6 +536,7 @@ avg={avg:.1}bps max={max:.1}bps",
         wp = wpool_live,
         rc = rclmm_live,
         ps = pump_live,
+        dl = dlmm_live,
         ok = diffs.len(),
         skip = skipped_dex,
         nj = no_jup,
@@ -523,7 +566,7 @@ pub fn spawn_validator(
     let total_pairs = pairs.len();
     eprintln!(
         "[validator] started — {total_pairs} pool pairs \
-(Raydium AMM v4/CPMM/CLMM, Meteora DAMM v2, Orca Whirlpool, PumpSwap), \
+(Raydium AMM v4/CPMM/CLMM, Meteora DAMM v2/DLMM, Orca Whirlpool, PumpSwap), \
 interval={s}s, max_log={m}, debug={debug}",
         s = val_cfg.interval_secs,
         m = val_cfg.max_pools_log,

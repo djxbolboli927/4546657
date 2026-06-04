@@ -23,7 +23,9 @@ use std::time::Duration;
 use solana_sdk::pubkey::Pubkey;
 use tracing::warn;
 
-use crate::dex::{meteora_damm_v2, pumpswap, raydium_amm_v4, raydium_clmm, raydium_cpmm, whirlpool};
+use crate::dex::{
+    meteora_damm_v2, meteora_dlmm, pumpswap, raydium_amm_v4, raydium_clmm, raydium_cpmm, whirlpool,
+};
 use crate::pool_state_store::PoolStateStore;
 use crate::pool_state_stream::PoolVaultPair;
 
@@ -75,6 +77,13 @@ pub enum DexKind {
     /// PumpSwap: pump.fun's constant-product AMM (x*y=k, 30 bps total fee).
     /// Priced from live vault reserves like Raydium AMM v4.
     PumpSwap,
+    /// Meteora DLMM: bin-based Liquidity Book. Priced from BinArray accounts
+    /// (constant-sum per bin), looked up by deriving their PDAs from the live
+    /// store at quote time. `swap_for_y` = token X in / token Y out.
+    MeteoraDlmm {
+        pool: Box<meteora_dlmm::LbPair>,
+        swap_for_y: bool,
+    },
 }
 
 impl DexKind {
@@ -86,6 +95,7 @@ impl DexKind {
             DexKind::OrcaWhirlpoolV1 { .. } => "OrcaWhirlpoolV1",
             DexKind::RaydiumClmm { .. } => "RaydiumClmm",
             DexKind::PumpSwap => "PumpSwap",
+            DexKind::MeteoraDlmm { .. } => "MeteoraDlmm",
         }
     }
 }
@@ -314,6 +324,47 @@ fn push_pumpswap_edges(pair: &PoolVaultPair, store: &PoolStateStore, out: &mut V
     });
 }
 
+/// Build two directed edges for a Meteora DLMM pool from its LbPair account.
+/// The per-bin reserves live in separate BinArray accounts read at quote time;
+/// here we only snapshot the pool parameters. Silently skips if the pool
+/// account is missing, too short, or the pool is disabled.
+fn push_dlmm_edges(pair: &PoolVaultPair, store: &PoolStateStore, out: &mut Vec<Edge>) {
+    let Some(acc) = store.accounts.get(&pair.pool) else {
+        return;
+    };
+    let Some(pool) = meteora_dlmm::parse_pool(&acc.data) else {
+        return;
+    };
+    if !pool.is_supported() {
+        return;
+    }
+
+    // X → Y (swap_for_y = true): active_id decreases.
+    out.push(Edge {
+        pool: pair.pool,
+        dex_kind: DexKind::MeteoraDlmm {
+            pool: Box::new(pool.clone()),
+            swap_for_y: true,
+        },
+        mint_in: pool.token_x_mint,
+        mint_out: pool.token_y_mint,
+        vault_in: pool.reserve_x,
+        vault_out: pool.reserve_y,
+    });
+    // Y → X (swap_for_y = false): active_id increases.
+    out.push(Edge {
+        pool: pair.pool,
+        dex_kind: DexKind::MeteoraDlmm {
+            pool: Box::new(pool.clone()),
+            swap_for_y: false,
+        },
+        mint_in: pool.token_y_mint,
+        mint_out: pool.token_x_mint,
+        vault_in: pool.reserve_y,
+        vault_out: pool.reserve_x,
+    });
+}
+
 /// Build the full edge list from live vault pairs.
 ///
 /// Each pair produces two edges (both directions). Edges whose vault data or
@@ -339,6 +390,10 @@ pub fn build_edges(pairs: &[PoolVaultPair], store: &PoolStateStore) -> Vec<Edge>
         }
         if pair.owner == pumpswap::PROGRAM_ID {
             push_pumpswap_edges(pair, store, &mut out);
+            continue;
+        }
+        if pair.owner == meteora_dlmm::PROGRAM_ID {
+            push_dlmm_edges(pair, store, &mut out);
             continue;
         }
 
@@ -450,6 +505,20 @@ pub fn quote_edge(edge: &Edge, amount_in: u64, store: &PoolStateStore) -> Option
         );
     }
 
+    if let DexKind::MeteoraDlmm { pool, swap_for_y } = &edge.dex_kind {
+        // Bin reserves live in BinArray accounts; derive each array's PDA and
+        // read it from the live store. Missing arrays ⇒ conservative None.
+        let lb_pair = edge.pool;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        return meteora_dlmm::quote_exact_in(pool, amount_in, *swap_for_y, now, |arr_index| {
+            let pda = meteora_dlmm::derive_bin_array_pda(&lb_pair, arr_index);
+            store.accounts.get(&pda).map(|r| r.data.clone())
+        });
+    }
+
     // Constant-product engines read live vault reserves.
     let in_data = store.accounts.get(&edge.vault_in)?;
     let out_data = store.accounts.get(&edge.vault_out)?;
@@ -480,7 +549,8 @@ pub fn quote_edge(edge: &Edge, amount_in: u64, store: &PoolStateStore) -> Option
         }
         DexKind::MeteoraDammV2 { .. }
         | DexKind::OrcaWhirlpoolV1 { .. }
-        | DexKind::RaydiumClmm { .. } => {
+        | DexKind::RaydiumClmm { .. }
+        | DexKind::MeteoraDlmm { .. } => {
             unreachable!("handled above")
         }
     }
