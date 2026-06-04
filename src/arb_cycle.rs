@@ -598,6 +598,10 @@ pub struct CycleHit {
     pub profit_gross: u64,
     /// Gross profit minus tx_cost and n_hops × error_margin (may be < 0).
     pub profit_net: i64,
+    /// True if this hit was refined by ternary search (not just a coarse-scan point).
+    pub optimized: bool,
+    /// The coarse-scan `amount_in` that seeded the ternary search, if any.
+    pub coarse_seed_amount: Option<u64>,
 }
 
 impl CycleHit {
@@ -665,6 +669,8 @@ pub fn find_cycles_in_store(
                     amount_out: out,
                     profit_gross: gross,
                     profit_net: net,
+                    optimized: false,
+                    coarse_seed_amount: None,
                 });
             }
         }
@@ -716,14 +722,16 @@ pub fn find_cycles_in_store(
                         amount_out: out,
                         profit_gross: gross,
                         profit_net: net,
+                        optimized: false,
+                        coarse_seed_amount: None,
                     });
                 }
             }
         }
     }
 
-    // Dedup: keep only the best hit per unique (pool-pair, direction) — drop
-    // redundant coarse-grid hits before the optimisation pass.
+    // Dedup: keep only the best hit per unique (pools, intermediate_mints) key —
+    // drop redundant coarse-grid hits before the optimisation pass.
     hits.sort_unstable_by(|a, b| b.profit_gross.cmp(&a.profit_gross));
 
     // ── Optimisation pass ──────────────────────────────────────────────────────
@@ -731,20 +739,29 @@ pub fn find_cycles_in_store(
     // to find the exact amount_in that maximises gross profit.  This naturally
     // handles DLMM bin crossings (the quote function already traverses bins) and
     // CLMM tick crossings (when tick arrays are in the store).
+    //
+    // Key includes intermediate_mints to avoid deduping two routes that share
+    // pool addresses but trade different token pairs in different directions.
     {
-        // Find an edge by (pool pubkey, mint_in) from the adjacency map.
+        type CycleKey = (Vec<Pubkey>, Vec<Pubkey>); // (pools, intermediate_mints)
+
         let find_edge_idx = |pool: Pubkey, mint_in: Pubkey| -> Option<usize> {
             by_mint_in.get(&mint_in).and_then(|idxs| {
                 idxs.iter().find(|&&i| edges[i].pool == pool).copied()
             })
         };
 
-        let mut seen_paths: std::collections::HashSet<Vec<Pubkey>> = std::collections::HashSet::new();
+        let cycle_key = |h: &CycleHit| -> CycleKey {
+            (h.pools.clone(), h.intermediate_mints.clone())
+        };
+
+        let mut seen_paths: std::collections::HashSet<CycleKey> = std::collections::HashSet::new();
         let mut opt_hits: Vec<CycleHit> = Vec::new();
         let coarse_hits_snap: Vec<CycleHit> = hits.iter().take(50).cloned().collect();
 
         for hit in &coarse_hits_snap {
-            if !seen_paths.insert(hit.pools.clone()) {
+            let key = cycle_key(hit);
+            if !seen_paths.insert(key) {
                 continue;
             }
             if opt_hits.len() >= 20 {
@@ -757,6 +774,8 @@ pub fn find_cycles_in_store(
             let lo = (seed / 10).clamp(SEARCH_MIN_LAMPORTS, SEARCH_MAX_LAMPORTS);
             let hi = (seed.saturating_mul(10)).clamp(lo, SEARCH_MAX_LAMPORTS);
 
+            let coarse_seed = hit.amount_in;
+
             if hops == 2 {
                 let x = hit.intermediate_mints[0];
                 let i1 = match find_edge_idx(hit.pools[0], wsol_mint) { Some(i) => i, None => continue };
@@ -764,17 +783,25 @@ pub fn find_cycles_in_store(
                 if let Some((amt, gross)) = optimise_2hop(
                     &edges[i1], &edges[i2], store, lo, hi,
                 ) {
-                    let out = amt + gross;
-                    let net = (out as i64) - (amt as i64) - (tx_cost as i64)
+                    // Keep whichever is better — ternary or the coarse seed point.
+                    let (final_amt, final_gross) = if gross > hit.profit_gross {
+                        (amt, gross)
+                    } else {
+                        (hit.amount_in, hit.profit_gross)
+                    };
+                    let out = final_amt + final_gross;
+                    let net = (out as i64) - (final_amt as i64) - (tx_cost as i64)
                         - (error_margin_per_hop as i64 * 2);
                     opt_hits.push(CycleHit {
                         pools: hit.pools.clone(),
                         dex_names: hit.dex_names.clone(),
                         intermediate_mints: hit.intermediate_mints.clone(),
-                        amount_in: amt,
+                        amount_in: final_amt,
                         amount_out: out,
-                        profit_gross: gross,
+                        profit_gross: final_gross,
                         profit_net: net,
+                        optimized: true,
+                        coarse_seed_amount: Some(coarse_seed),
                     });
                 }
             } else if hops == 3 {
@@ -786,31 +813,41 @@ pub fn find_cycles_in_store(
                 if let Some((amt, gross)) = optimise_3hop(
                     &edges[i1], &edges[i2], &edges[i3], store, lo, hi,
                 ) {
-                    let out = amt + gross;
-                    let net = (out as i64) - (amt as i64) - (tx_cost as i64)
+                    let (final_amt, final_gross) = if gross > hit.profit_gross {
+                        (amt, gross)
+                    } else {
+                        (hit.amount_in, hit.profit_gross)
+                    };
+                    let out = final_amt + final_gross;
+                    let net = (out as i64) - (final_amt as i64) - (tx_cost as i64)
                         - (error_margin_per_hop as i64 * 3);
                     opt_hits.push(CycleHit {
                         pools: hit.pools.clone(),
                         dex_names: hit.dex_names.clone(),
                         intermediate_mints: hit.intermediate_mints.clone(),
-                        amount_in: amt,
+                        amount_in: final_amt,
                         amount_out: out,
-                        profit_gross: gross,
+                        profit_gross: final_gross,
                         profit_net: net,
+                        optimized: true,
+                        coarse_seed_amount: Some(coarse_seed),
                     });
                 }
             }
         }
 
-        // Replace coarse-scan entries with optimised ones where available.
-        let opt_pools: std::collections::HashSet<Vec<Pubkey>> =
-            opt_hits.iter().map(|h| h.pools.clone()).collect();
-        hits.retain(|h| !opt_pools.contains(&h.pools));
+        // Replace coarse-scan entries with optimised ones (which already keep the
+        // best of coarse vs ternary). Key on (pools, intermediate_mints) to avoid
+        // false deduplication of same-pool paths with different token directions.
+        let opt_keys: std::collections::HashSet<CycleKey> =
+            opt_hits.iter().map(cycle_key).collect();
+        hits.retain(|h| !opt_keys.contains(&cycle_key(h)));
         hits.extend(opt_hits);
     }
 
-    // Final sort by gross profit descending.
-    hits.sort_unstable_by(|a, b| b.profit_gross.cmp(&a.profit_gross));
+    // Sort by net profit descending — execution candidates should be ranked by
+    // what actually lands in the wallet after fees, not raw gross.
+    hits.sort_unstable_by(|a, b| b.profit_net.cmp(&a.profit_net));
     hits
 }
 
@@ -1053,8 +1090,17 @@ hits(gross+)={gross_pos} hits(net+)={net_pos} best_gross={} best_net={}",
                     .iter()
                     .map(|m| m.to_string()[..8].to_string())
                     .collect();
+                let opt_tag = if hit.optimized {
+                    if let Some(seed) = hit.coarse_seed_amount {
+                        format!(" opt=1 seed={:.4}SOL", seed as f64 / 1e9)
+                    } else {
+                        " opt=1".to_string()
+                    }
+                } else {
+                    String::new()
+                };
                 eprintln!(
-                    "[cycle]   #{rank} {}-hop  in={:.4}SOL gross={:+}L net={:+}L  \
+                    "[cycle]   #{rank} {}-hop{opt_tag}  in={:.4}SOL gross={:+}L net={:+}L  \
 path=[{}]  via=[{}]",
                     hit.hops(),
                     hit.amount_in as f64 / 1e9,

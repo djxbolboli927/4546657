@@ -1,13 +1,20 @@
 /// Price validator — a WEAK sanity check, not a correctness oracle.
 ///
-/// Compares local on-chain prices against Jupiter's USD price ratio for the
-/// same two mints. Covers three pool types:
+/// Compares local spot prices against Jupiter's USD price ratio for the same
+/// two mints. Covers all supported pool types:
 ///
-///   • Raydium AMM v4 / CPMM — pure x*y=k; price from vault reserves.
-///   • Meteora DAMM v2 — Uniswap-v3-style; price from pool account sqrt_price.
+///   • Raydium AMM v4 / CPMM — x*y=k; spot price from vault reserves.
+///   • Meteora DAMM v2 — Uniswap-v3-style; spot price from sqrt_price.
+///   • Orca Whirlpool — CLMM; spot price from pool account sqrt_price.
+///   • Raydium CLMM — CLMM; spot price from pool account sqrt_price.
+///   • Meteora DLMM — bin-based; spot price from active_id + bin_step.
+///   • PumpSwap — x*y=k; spot price from vault reserves.
 ///
-/// CLMM / DLMM / Whirlpool / orderbook and other concentrated-liquidity pools
-/// are still skipped — their prices can't be read without tick-array state.
+/// NOTE: spot price here is NOT the same as an exact-in quote. The validator
+/// only checks that local price roughly agrees with Jupiter's USD mid-price.
+/// Profit calculation lives in arb_cycle.rs, which uses quote_edge for
+/// exact-in simulation. A large validator diff is a sanity alert, not a
+/// signal to trade.
 ///
 /// Token decimals come from the real on-chain mint accounts (RPC, cached), NOT
 /// from Jupiter. Jupiter Price API gives a general USD mid-price, not a quote
@@ -64,8 +71,8 @@ impl Engine {
     }
 }
 
-/// Classify a pool by its owner program id. Returns None for DEXes this
-/// validator deliberately skips (CLMM / DLMM / orderbook).
+/// Classify a pool by its owner program id. Returns None for unsupported DEX
+/// programs (e.g. orderbooks, exotic AMMs not yet wired up).
 fn classify(owner: &Pubkey) -> Option<Engine> {
     if *owner == raydium_amm_v4::PROGRAM_ID {
         Some(Engine::RaydiumAmmV4)

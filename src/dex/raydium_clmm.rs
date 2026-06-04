@@ -448,24 +448,36 @@ where
             let pda = derive_tick_array_pda(pool_id, arr_start);
             let data = get_tick_array(pda).unwrap_or_default();
             if data.len() < tick_array_offsets::MIN_LEN {
-                // Missing or undersized tick array — fall back to single-tick mode.
-                // Return whatever output we've accumulated so far (conservative).
-                return if total_out > 0 { Some(total_out) } else { None };
+                // Required TickArray missing or truncated — exact-in demands full input
+                // consumed; a partial quote here would corrupt the optimizer.
+                return None;
             }
             cached_arr_data = data;
             cached_arr_start = Some(arr_start);
         }
 
-        let liq_net = read_liquidity_net(&cached_arr_data, boundary_tick, arr_start, tick_spacing)
-            .unwrap_or(0i128);
+        // Decode error returns None: unwrap_or(0) would silently fake zero liquidity_net
+        // and produce phantom arbitrage signals.
+        let liq_net = match read_liquidity_net(&cached_arr_data, boundary_tick, arr_start, tick_spacing) {
+            Some(v) => v,
+            None => return None,
+        };
 
         // Uniswap v3 convention: liq_net is added when crossing LEFT→RIGHT (price up).
         // Crossing RIGHT→LEFT (zero_for_one): subtract. Crossing LEFT→RIGHT: add.
+        let next_liq = if zero_for_one {
+            (liquidity as i128).checked_sub(liq_net)?
+        } else {
+            (liquidity as i128).checked_add(liq_net)?
+        };
+        // A non-positive result after cast would wrap to a huge u128 — return None instead.
+        if next_liq <= 0 {
+            return None;
+        }
+        liquidity = next_liq as u128;
         if zero_for_one {
-            liquidity = (liquidity as i128).checked_sub(liq_net)? as u128;
             tick = boundary_tick - 1; // now below the crossed tick
         } else {
-            liquidity = (liquidity as i128).checked_add(liq_net)? as u128;
             tick = boundary_tick;
         }
 
@@ -474,7 +486,15 @@ where
         }
     }
 
-    if total_out == 0 { None } else { Some(total_out) }
+    // If the swap loop hit MAX_TICKS_CROSSED before consuming all input, this is a
+    // partial quote — invalid for exact-in semantics.
+    if amount_left > 0 {
+        return None;
+    }
+    if total_out == 0 {
+        return None;
+    }
+    Some(total_out)
 }
 
 // ── Amount helpers for multi-tick ─────────────────────────────────────────────
