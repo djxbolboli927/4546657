@@ -58,29 +58,33 @@ pub struct ExecutorCtx {
 
 #[derive(Default)]
 pub struct ExecutorMetrics {
-    /// Profitable CycleHits received from arb_cycle (already filtered net > 0).
+    /// Hits received from arb_cycle channel.
     pub cycles_received: AtomicU64,
     /// 3-hop (and higher) hits skipped — not implemented yet.
     pub skipped_hops: AtomicU64,
-    /// Metis /quote pairs initiated.
+    /// Hits dropped because local profit_gross < min_profit_lamports.
+    pub local_filter_drop: AtomicU64,
+    /// Metis /quote pair calls initiated.
     pub metis_calls: AtomicU64,
-    /// Both quotes succeeded AND Metis outAmount >= amount_in + threshold.
-    pub metis_success: AtomicU64,
-    /// Metis says unprofitable (outAmount < threshold).
-    pub metis_unprofitable: AtomicU64,
-    /// Metis /quote call failed (network, timeout, parse).
+    /// Both /quote calls succeeded (valid route obtained from Metis).
+    pub metis_route_ok: AtomicU64,
+    /// Metis /quote call failed (network, timeout, parse error).
     pub metis_error: AtomicU64,
     /// /swap-instructions successfully obtained.
     pub instructions_built: AtomicU64,
-    /// Transaction build failed (overflow, lock count, etc.).
+    /// /swap-instructions call failed.
+    pub swap_ix_error: AtomicU64,
+    /// Transaction build failed (overflow, size, etc.).
     pub build_error: AtomicU64,
-    /// Bundles accepted by Jito REST or gRPC.
-    pub jito_sent: AtomicU64,
+    /// Bundles accepted by Jito REST.
+    pub jito_rest_sent: AtomicU64,
+    /// Bundles accepted by Jito gRPC.
+    pub jito_grpc_sent: AtomicU64,
     /// Jito send returned an error.
     pub jito_error: AtomicU64,
     /// Both rate limiters were full — bundle dropped.
     pub jito_rate_limited: AtomicU64,
-    /// Sum of local profit_gross for all jito_sent transactions.
+    /// Sum of local profit_gross for all jito-sent transactions (lamports).
     pub total_local_profit: AtomicI64,
 }
 
@@ -102,34 +106,42 @@ pub fn spawn_cycle_executor(
         let m = metrics.clone();
         tokio::spawn(async move {
             let mut last_built = 0u64;
-            let mut last_sent = 0u64;
+            let mut last_rest  = 0u64;
+            let mut last_grpc  = 0u64;
             let mut ticker = tokio::time::interval(Duration::from_secs(30));
             ticker.tick().await; // skip the immediate first tick
             loop {
                 ticker.tick().await;
                 let received  = m.cycles_received.load(Relaxed);
                 let skip      = m.skipped_hops.load(Relaxed);
-                let m_ok      = m.metis_success.load(Relaxed);
-                let m_unprof  = m.metis_unprofitable.load(Relaxed);
+                let local_drp = m.local_filter_drop.load(Relaxed);
+                let m_calls   = m.metis_calls.load(Relaxed);
+                let m_ok      = m.metis_route_ok.load(Relaxed);
                 let m_err     = m.metis_error.load(Relaxed);
                 let built     = m.instructions_built.load(Relaxed);
+                let ix_err    = m.swap_ix_error.load(Relaxed);
                 let bld_err   = m.build_error.load(Relaxed);
-                let sent      = m.jito_sent.load(Relaxed);
+                let rest_sent = m.jito_rest_sent.load(Relaxed);
+                let grpc_sent = m.jito_grpc_sent.load(Relaxed);
                 let j_err     = m.jito_error.load(Relaxed);
                 let rate_lim  = m.jito_rate_limited.load(Relaxed);
                 let tot_prof  = m.total_local_profit.load(Relaxed);
+                let total_sent = rest_sent + grpc_sent;
                 let d_built   = built - last_built;
-                let d_sent    = sent  - last_sent;
-                let avg_prof  = if sent > 0 { tot_prof / sent as i64 } else { 0 };
+                let d_rest    = rest_sent - last_rest;
+                let d_grpc    = grpc_sent - last_grpc;
+                let avg_prof  = if total_sent > 0 { tot_prof / total_sent as i64 } else { 0 };
                 eprintln!(
-                    "[executor] recv={received} skip_hops={skip} \
-metis(ok={m_ok} unprof={m_unprof} err={m_err}) \
-built={built}(+{d_built}) build_err={bld_err} \
-jito_sent={sent}(+{d_sent}) jito_err={j_err} rate_lim={rate_lim} \
-avg_local_profit={avg_prof}L"
+                    "[executor] recv={received} skip_hops={skip} local_drop={local_drp} | \
+metis_calls={m_calls} route_ok={m_ok} metis_err={m_err} | \
+built={built}(+{d_built}) ix_err={ix_err} build_err={bld_err} | \
+jito_rest={rest_sent}(+{d_rest}) jito_grpc={grpc_sent}(+{d_grpc}) \
+jito_err={j_err} rate_lim={rate_lim} | \
+avg_local_profit={avg_prof}L total_local={tot_prof}L"
                 );
                 last_built = built;
-                last_sent  = sent;
+                last_rest  = rest_sent;
+                last_grpc  = grpc_sent;
             }
         });
     }
@@ -151,17 +163,29 @@ avg_local_profit={avg_prof}L"
 async fn process_hit(hit: CycleHit, ctx: Arc<ExecutorCtx>, m: Arc<ExecutorMetrics>) {
     m.cycles_received.fetch_add(1, Relaxed);
 
-    // Only 2-hop: WSOL → X → WSOL handled via merge_quotes.
-    // 3-hop needs chained quotes + a different merge path — skip for now.
+    // Only 2-hop: WSOL → X → WSOL, handled via merge_quotes.
     if hit.hops() != 2 {
         m.skipped_hops.fetch_add(1, Relaxed);
+        return;
+    }
+
+    // ── Local profit filter (before any Metis call) ───────────────────────────
+    // profit_gross = amount_out − amount_in from our own on-chain math.
+    // We trust this more than Metis's estimate; Metis is only used for the
+    // instruction bytes, not for the profitability decision.
+    if hit.profit_gross < ctx.min_profit_lamports {
+        m.local_filter_drop.fetch_add(1, Relaxed);
         return;
     }
 
     let x_mint    = hit.intermediate_mints[0].to_string();
     let amount_in = hit.amount_in;
 
-    // ── Stage 1: Metis quotes ────────────────────────────────────────────────
+    // ── Stage 1: Two /quote calls — only for the routePlan, NOT profit check ──
+    // We need q1 + q2 so merge_quotes can concatenate their routePlans into a
+    // single circular instruction.  Metis's outAmount is ignored intentionally:
+    // its math differs from our per-DEX formulas and would incorrectly filter
+    // many valid opportunities.
     m.metis_calls.fetch_add(1, Relaxed);
 
     let q1 = match ctx.metis.get_quote(WSOL_MINT, &x_mint, amount_in, false).await {
@@ -188,27 +212,20 @@ async fn process_hit(hit: CycleHit, ctx: Arc<ExecutorCtx>, m: Arc<ExecutorMetric
         }
     };
 
-    let metis_out: u64 = q2.out_amount.parse().unwrap_or(0);
-    let required = amount_in.saturating_add(ctx.min_profit_lamports);
-    if metis_out < required {
-        tracing::debug!(metis_out, amount_in, required, "executor: Metis unprofitable");
-        m.metis_unprofitable.fetch_add(1, Relaxed);
-        return;
-    }
-
-    m.metis_success.fetch_add(1, Relaxed);
+    // Both routes obtained — no Metis profitability gate here.
+    m.metis_route_ok.fetch_add(1, Relaxed);
 
     // ── Stage 2: Merge + /swap-instructions ──────────────────────────────────
-    // The on-chain revert floor: tx reverts only if it would lose money.
-    // Any profit that shrinks between quote time and landing is acceptable.
-    let min_acceptable_out = amount_in
-        .saturating_add(ctx.tip_lamports)
-        .saturating_add(ctx.base_fee_lamports);
+    // min_acceptable_out = on-chain revert floor.
+    // The transaction reverts if actual out < amount_in + min_profit_lamports.
+    // This is the configurable threshold from config.toml, not a fixed constant.
+    let min_acceptable_out = amount_in.saturating_add(ctx.min_profit_lamports);
 
     let merged = match MetisClient::merge_quotes(&q1, &q2, min_acceptable_out) {
         Ok(q) => q,
         Err(e) => {
             tracing::debug!(err = %e, "executor: merge_quotes failed");
+            m.metis_error.fetch_add(1, Relaxed);
             return;
         }
     };
@@ -217,6 +234,7 @@ async fn process_hit(hit: CycleHit, ctx: Arc<ExecutorCtx>, m: Arc<ExecutorMetric
         Ok(s) => s,
         Err(e) => {
             tracing::debug!(?e, "executor: /swap-instructions failed");
+            m.swap_ix_error.fetch_add(1, Relaxed);
             return;
         }
     };
@@ -248,7 +266,8 @@ async fn process_hit(hit: CycleHit, ctx: Arc<ExecutorCtx>, m: Arc<ExecutorMetric
     };
 
     // ── Stage 4: Submit to Jito ───────────────────────────────────────────────
-    // Acquire the rate limiter lock without holding it across any await point.
+    // Try REST first (5/s), then gRPC fallback (5/s). Total capacity = 10/s.
+    // Acquire the rate limiter lock BEFORE any await point.
     let use_rest = ctx.jito_limiter.lock()
         .map(|mut l| l.try_acquire())
         .unwrap_or(false);
@@ -256,28 +275,28 @@ async fn process_hit(hit: CycleHit, ctx: Arc<ExecutorCtx>, m: Arc<ExecutorMetric
     if use_rest {
         match ctx.jito.send_bundle(&tx).await {
             Ok(id) => {
-                tracing::debug!(bundle_id = id, "executor: Jito REST bundle sent");
-                m.jito_sent.fetch_add(1, Relaxed);
+                tracing::debug!(bundle_id = id, "executor: Jito REST sent");
+                m.jito_rest_sent.fetch_add(1, Relaxed);
             }
             Err(e) => {
-                tracing::debug!(err = %e, "executor: Jito REST send failed");
+                tracing::debug!(err = %e, "executor: Jito REST error");
                 m.jito_error.fetch_add(1, Relaxed);
             }
         }
         return;
     }
 
-    // REST rate limit full — try gRPC fallback.
+    // REST rate limit full — try gRPC.
     if let (Some(grpc), Some(gl)) = (&ctx.jito_grpc, &ctx.jito_grpc_limiter) {
         let use_grpc = gl.lock().map(|mut l| l.try_acquire()).unwrap_or(false);
         if use_grpc {
             match grpc.send_bundle(&tx).await {
                 Ok(id) => {
-                    tracing::debug!(bundle_id = id, "executor: Jito gRPC bundle sent");
-                    m.jito_sent.fetch_add(1, Relaxed);
+                    tracing::debug!(bundle_id = id, "executor: Jito gRPC sent");
+                    m.jito_grpc_sent.fetch_add(1, Relaxed);
                 }
                 Err(e) => {
-                    tracing::debug!(err = %e, "executor: Jito gRPC send failed");
+                    tracing::debug!(err = %e, "executor: Jito gRPC error");
                     m.jito_error.fetch_add(1, Relaxed);
                 }
             }
@@ -285,6 +304,6 @@ async fn process_hit(hit: CycleHit, ctx: Arc<ExecutorCtx>, m: Arc<ExecutorMetric
         }
     }
 
-    // Both limiters full.
+    // Both limiters full — drop.
     m.jito_rate_limited.fetch_add(1, Relaxed);
 }
