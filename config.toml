@@ -180,21 +180,26 @@ positive_slippage_probe = false
 send_no_metis = true
 # Max CycleHit candidates forwarded per scan cycle.
 max_candidates_per_scan = 5
-# Also forward 3-hop cycles.
-enable_3hop_validation = true
 # (unused in send_no_metis mode — kept for validate_local)
+enable_3hop_validation = false
 strict_dex_filter = true
 require_ammkey_match = true
 
 [arb_test.no_metis]
-# Skip RPC simulation — send directly to Jito to see what lands on-chain.
-simulate_first = false
-# Jito tip per bundle (lamports).
-tip_lamports = 5000
-# Safety cap: only send cycles where amount_in <= this value.
-max_amount_lamports = 100000000
-# Send 2-hop and 3-hop cycles.
-enable_2hop = true
-enable_3hop = true
+# Jito tip per bundle (lamports). Large enough to incentivize landing.
+tip_lamports = 100000
+# Safety cap: only send cycles where amount_in <= this value (1 million lamports = 0.001 SOL).
+max_amount_lamports = 1000000
 # Compute unit limit for native transactions.
 cu_limit = 300000
+# test_land_even_if_loss=true: min_out for the last hop = final_min_out_lamports (allow loss).
+# This is to verify the transaction executes at all, not to make profit.
+test_land_even_if_loss = true
+# Minimum output required from the final hop when test_land_even_if_loss=true.
+# 1 = accept any output (pure execution test).
+final_min_out_lamports = 1
+# LiteSVM vs RAM delta threshold. Transactions where |litesvm_profit - ram_profit| <= threshold
+# are considered a match and sent to Jito.
+match_threshold_lamports = 500
+# Number of parallel LiteSVM simulation workers.
+sim_workers = 2

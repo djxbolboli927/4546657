@@ -425,39 +425,59 @@ impl Default for ValidationConfig {
 /// Configuration for the no-Metis native executor.
 #[derive(Debug, Deserialize, Clone)]
 pub struct NoMetisConfig {
-    /// Run RPC simulate_transaction before sending to Jito.
-    #[serde(default)]
-    pub simulate_first: bool,
     /// Jito tip in lamports for each bundle.
     #[serde(default = "default_tip_lamports")]
     pub tip_lamports: u64,
-    /// Maximum amount_in (lamports) per CycleHit to send. Safety cap.
+    /// Maximum amount_in (lamports) per CycleHit. Safety cap for testing.
     #[serde(default = "default_max_amount")]
     pub max_amount_lamports: u64,
-    /// Allow 2-hop cycles.
-    #[serde(default = "default_arb_true")]
-    pub enable_2hop: bool,
-    /// Allow 3-hop cycles (may exceed 1232-byte tx limit — skipped if too large).
-    #[serde(default = "default_arb_true")]
-    pub enable_3hop: bool,
     /// Compute unit limit for native transactions.
     #[serde(default = "default_cu_limit")]
     pub cu_limit: u32,
+    /// If true, min_out for the final hop is `final_min_out_lamports` (allow loss).
+    /// If false, min_out = amount_in (protect principal).
+    #[serde(default)]
+    pub test_land_even_if_loss: bool,
+    /// min_out for the final hop when test_land_even_if_loss=true. Set to 1 to accept any output.
+    #[serde(default = "default_final_min_out")]
+    pub final_min_out_lamports: u64,
+    /// Delta threshold (lamports) for LiteSVM vs RAM match. Transactions within
+    /// ±match_threshold are considered a match and sent to Jito.
+    #[serde(default = "default_match_threshold")]
+    pub match_threshold_lamports: u64,
+    /// Number of LiteSVM simulator workers.
+    #[serde(default = "default_sim_workers")]
+    pub sim_workers: usize,
 }
 
 fn default_tip_lamports() -> u64 { 5_000 }
 fn default_max_amount() -> u64 { 100_000_000 }
 fn default_cu_limit() -> u32 { 300_000 }
+fn default_final_min_out() -> u64 { 1 }
+fn default_match_threshold() -> u64 { 500 }
+fn default_sim_workers() -> usize { 2 }
+
+impl NoMetisConfig {
+    /// Effective min_out for the final hop.
+    pub fn final_min_out(&self, amount_in: u64) -> u64 {
+        if self.test_land_even_if_loss {
+            self.final_min_out_lamports
+        } else {
+            amount_in
+        }
+    }
+}
 
 impl Default for NoMetisConfig {
     fn default() -> Self {
         Self {
-            simulate_first: false,
             tip_lamports: 5_000,
             max_amount_lamports: 100_000_000,
-            enable_2hop: true,
-            enable_3hop: true,
             cu_limit: 300_000,
+            test_land_even_if_loss: false,
+            final_min_out_lamports: 1,
+            match_threshold_lamports: 500,
+            sim_workers: 2,
         }
     }
 }

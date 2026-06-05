@@ -52,6 +52,15 @@ pub struct SimOutcome {
     pub wsol_after: u64,
 }
 
+/// Result of a no-gate simulation (simulate_native).
+pub struct NativeSimResult {
+    pub wsol_before: u64,
+    pub wsol_after: u64,
+    pub compute_units: u64,
+    /// First log line from a revert (None if success).
+    pub revert_log: Option<String>,
+}
+
 pub struct Simulator {
     svm: Mutex<LiteSVM>,
     wsol_ata: Pubkey,
@@ -277,6 +286,67 @@ impl Simulator {
             }
         }
     }
+
+    /// Simulate without profitability gating. Returns raw wsol balances and CU.
+    /// Returns `Err` only if the transaction reverts at the SVM level.
+    pub fn simulate_native(
+        &self,
+        tx: &VersionedTransaction,
+        cache: &AccountCache,
+    ) -> Result<NativeSimResult> {
+        let accounts = collect_tx_accounts(tx, &[]);
+
+        for pk in &accounts {
+            if cache.get(pk).is_none() {
+                if let Err(e) = cache.get_or_fetch(pk) {
+                    debug!(pubkey = %pk, error = %e, "lazy RPC fetch");
+                }
+            }
+        }
+
+        let mut svm = self.svm.lock().unwrap();
+
+        let live_slot = self.current_slot.load(Ordering::Relaxed);
+        svm.warp_to_slot(live_slot);
+
+        for pk in &accounts {
+            if let Some(acct) = cache.get(pk) {
+                if acct.executable() {
+                    continue;
+                }
+                let _ = svm.set_account(pk_to_addr(*pk), acct);
+            }
+        }
+
+        let wsol_before = parse_wsol_amount(&svm, self.wsol_ata);
+        let litesvm_tx = to_litesvm_tx(tx)?;
+
+        match svm.simulate_transaction(litesvm_tx) {
+            Ok(info) => {
+                let wsol_ata_addr = pk_to_addr(self.wsol_ata);
+                let wsol_after = info
+                    .post_accounts
+                    .iter()
+                    .find(|(addr, _)| *addr == wsol_ata_addr)
+                    .and_then(|(_, acc)| parse_token_amount(acc.data()))
+                    .unwrap_or(wsol_before);
+                Ok(NativeSimResult {
+                    wsol_before,
+                    wsol_after,
+                    compute_units: info.meta.compute_units_consumed,
+                    revert_log: None,
+                })
+            }
+            Err(meta) => {
+                let log = meta.meta.logs.first().cloned();
+                anyhow::bail!(
+                    "sim reverted: err={:?} log={:?}",
+                    meta.err,
+                    log
+                )
+            }
+        }
+    }
 }
 
 /// Read the SPL Token amount field from raw account data.
@@ -362,6 +432,15 @@ impl SimulatorPool {
     pub fn acquire(&self) -> Arc<Simulator> {
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.sims.len();
         self.sims[idx].clone()
+    }
+
+    /// Run simulate_native on a round-robin simulator.
+    pub fn simulate_native(
+        &self,
+        tx: &VersionedTransaction,
+        cache: &AccountCache,
+    ) -> Result<NativeSimResult> {
+        self.acquire().simulate_native(tx, cache)
     }
 }
 

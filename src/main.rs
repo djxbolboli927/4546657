@@ -225,7 +225,7 @@ async fn async_main(config: config::Config) -> Result<()> {
                 let (tx, rx) = tokio::sync::mpsc::channel::<arb_cycle::CycleHit>(200);
                 arb_validator::spawn_arb_validator(rx, metis_val, config.arb_test.clone());
                 Some(tx)
-            // 2b. send_no_metis mode: native DEX instructions, direct Jito send.
+            // 2b. send_no_metis mode: native DEX instructions + LiteSVM sim + Jito send.
             } else if config.arb_test.send_no_metis {
                 let blockhash_cache_nm = Arc::new(BlockhashCache::new(rpc_client.clone()));
                 let jito_nm = Arc::new(jito::JitoClient::new(
@@ -258,6 +258,39 @@ async fn async_main(config: config::Config) -> Result<()> {
                     (None, None)
                 };
 
+                // Build LiteSVM simulation pool for pre-send validation.
+                // wsol_mint used for reference only
+                let nm_cache = account_cache::AccountCache::new(rpc_client.clone());
+                // Seed slot and pre-fetch the trading wallet's WSOL ATA.
+                if let Ok(slot) = rpc_client.get_slot() {
+                    nm_cache.seed_slot(slot);
+                }
+                nm_cache.prefetch(&[wsol_ata, trading_keypair.pubkey()]);
+                let nm_cache = Arc::new(nm_cache);
+
+                let nm_sim_pool = match litesvm_sim::SimulatorPool::new(
+                    config.arb_test.no_metis.sim_workers,
+                    &config.simulation.so_dir,
+                    wsol_ata,
+                    true,
+                    nm_cache.stream_slot(),
+                ) {
+                    Ok(p) => {
+                        eprintln!(
+                            "[no_metis] LiteSVM sim pool ready — workers={}",
+                            config.arb_test.no_metis.sim_workers,
+                        );
+                        Some(Arc::new(p))
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[no_metis] LiteSVM sim pool FAILED ({e}) — \
+simulation disabled, ALL transactions will be sent"
+                        );
+                        None
+                    }
+                };
+
                 let cu_limit = config.arb_test.no_metis.cu_limit;
                 let nm_cfg = config.arb_test.no_metis.clone();
 
@@ -272,6 +305,8 @@ async fn async_main(config: config::Config) -> Result<()> {
                     store: store.clone(),
                     cfg: nm_cfg,
                     cu_limit,
+                    sim_pool: nm_sim_pool,
+                    sim_cache: Some(nm_cache),
                 });
 
                 let (tx, rx) = tokio::sync::mpsc::channel::<arb_cycle::CycleHit>(200);
