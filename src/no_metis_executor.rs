@@ -493,6 +493,48 @@ async fn process_hit(hit: CycleHit, ctx: Arc<NoMetisCtx>, m: Arc<NoMetisMetrics>
     let hops = hit.hops();
     let cfg = &ctx.cfg;
 
+    if cfg.dry_run {
+        // ── Dry-run: simulate all hop counts, record delta, no Jito send ─────
+        // Only skip paths where every hop shares the same DEX family.
+        let fam0 = dex_family(hit.dex_names[0]);
+        if (1..hops).all(|i| dex_family(hit.dex_names[i]) == fam0) {
+            m.skipped_same_family.fetch_add(1, Relaxed);
+            return;
+        }
+
+        let (Some(sim_pool), Some(sim_cache)) = (ctx.sim_pool.clone(), ctx.sim_cache.clone()) else { return };
+
+        let wsol = Pubkey::from_str_const(WSOL_MINT);
+        let user = ctx.trading_keypair.pubkey();
+        let blockhash = ctx.blockhash_cache.get();
+
+        let pools_str = hit.pools.iter()
+            .map(|p| p.to_string()[..8].to_string())
+            .collect::<Vec<_>>()
+            .join("→");
+
+        let hop_records = simulate_hops(
+            &hit, &ctx, sim_pool, sim_cache,
+            user, wsol, blockhash,
+        ).await;
+
+        let all_ok = hop_records.iter().all(|h| h.sim_out.is_some());
+        if all_ok { m.sim_ok.fetch_add(1, Relaxed); } else { m.sim_revert.fetch_add(1, Relaxed); }
+
+        if let Ok(mut acc) = dif.lock() {
+            acc.add(PathRecord {
+                hit_serial,
+                pools_str,
+                amount_in: hit.amount_in,
+                ram_profit: hit.profit_gross as i64,
+                hops: hop_records,
+            });
+        }
+        return;
+    }
+
+    // ── Live path ─────────────────────────────────────────────────────────────
+
     // Only 2-hop for now (3-hop usually exceeds 1232 bytes without ALTs).
     if hops != 2 {
         m.skipped_hops.fetch_add(1, Relaxed);
@@ -620,12 +662,7 @@ async fn process_hit(hit: CycleHit, ctx: Arc<NoMetisCtx>, m: Arc<NoMetisMetrics>
             acc.add(path_rec);
         }
 
-        if !all_ok || cfg.dry_run {
-            return;
-        }
-    } else {
-        // No sim pool — dry_run still prevents sending.
-        if cfg.dry_run {
+        if !all_ok {
             return;
         }
     }
@@ -770,7 +807,7 @@ pub fn spawn_no_metis_executor(
     let has_litesvm = ctx.sim_pool.is_some();
 
     // Shared per-hop diagnostic accumulator.
-    let dif_path = "/home/user/4546657/dif".to_string();
+    let dif_path = "/root/c/dif".to_string();
     let dif = Arc::new(Mutex::new(DifAccum::new(dif_path.clone())));
 
     // 5-minute reporter.
