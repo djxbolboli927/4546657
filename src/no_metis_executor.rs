@@ -141,6 +141,37 @@ fn jito_tip_ix(payer: &Pubkey, tip_lamports: u64) -> Instruction {
 
 // ── Per-hit processing ────────────────────────────────────────────────────────
 
+/// Build a valid-but-empty SPL Token account for simulation injection.
+/// Intermediate-hop ATAs for the user's wallet don't appear in the Yellowstone
+/// cache (which filters by DEX program owner, not user wallet). Without a valid
+/// initialized account, LiteSVM gives LiteSVM gives a zero-byte account and SPL Token
+/// rejects the swap with "insufficient funds".
+fn make_spl_token_account(mint: &Pubkey, owner: &Pubkey) -> solana_account::Account {
+    // SPL Token Account layout (165 bytes):
+    //   [0..32]    mint
+    //   [32..64]   owner
+    //   [64..72]   amount (u64 LE, 0 = empty)
+    //   [72..76]   delegate discriminant (0 = None)
+    //   [76..108]  delegate pubkey (zeroed)
+    //   [108]      state (1 = Initialized)
+    //   [109..113] is_native discriminant (0 = None)
+    //   [113..121] is_native value (zeroed)
+    //   [121..129] delegated_amount (u64 LE)
+    //   [129..133] close_authority discriminant (0 = None)
+    //   [133..165] close_authority pubkey (zeroed)
+    let mut data = vec![0u8; 165];
+    data[0..32].copy_from_slice(&mint.to_bytes());
+    data[32..64].copy_from_slice(&owner.to_bytes());
+    data[108] = 1; // AccountState::Initialized
+    solana_account::Account {
+        lamports: 2_039_280, // rent-exempt minimum for a 165-byte account
+        data,
+        owner: solana_address::Address::from(native_ix::SPL_TOKEN.to_bytes()),
+        executable: false,
+        rent_epoch: u64::MAX,
+    }
+}
+
 async fn process_hit(hit: CycleHit, ctx: Arc<NoMetisCtx>, m: Arc<NoMetisMetrics>, hit_serial: u64) {
     let hops = hit.hops();
     let cfg = &ctx.cfg;
@@ -255,6 +286,25 @@ pools={} dexes={} tx_bytes={} tip={}",
     // ── LiteSVM simulation ────────────────────────────────────────────────────
     let mut sim_passed = true;
     if let (Some(sim_pool), Some(sim_cache)) = (&ctx.sim_pool, &ctx.sim_cache) {
+        // Inject valid empty SPL token ATAs for every intermediate hop mint.
+        // The Yellowstone subscription covers only DEX-program-owned accounts
+        // and the user's WSOL ATA. Intermediate token ATAs for the user wallet
+        // never stream in, so LiteSVM would see a zero-byte account and SPL Token
+        // would reject the swap with "insufficient funds". We pre-populate the
+        // cache with a 165-byte Initialized account so the program can read/write it.
+        for intermediate_mint in &hit.intermediate_mints {
+            let ata = spl_associated_token_account::get_associated_token_address(
+                &user, intermediate_mint,
+            );
+            let needs_inject = match sim_cache.get(&ata) {
+                None => true,
+                Some(ref acct) => acct.data.len() < 109 || acct.data[108] != 1,
+            };
+            if needs_inject {
+                sim_cache.inject_account(ata, make_spl_token_account(intermediate_mint, &user));
+            }
+        }
+
         // Run simulation on a blocking thread (LiteSVM is CPU-bound).
         let tx_clone = tx.clone();
         let sim_pool = sim_pool.clone();
@@ -286,11 +336,18 @@ delta={delta:+} units={}",
                 let threshold = cfg.match_threshold_lamports as i64;
                 if delta.abs() > threshold {
                     m.sim_mismatch.fetch_add(1, Relaxed);
-                    eprintln!(
-                        "[no_metis_sim] hit={hit_serial} MISMATCH delta={delta:+} \
+                    if cfg.dry_run {
+                        eprintln!(
+                            "[no_metis_sim] hit={hit_serial} MISMATCH delta={delta:+} \
+threshold=±{threshold} (dry_run: not blocking)"
+                        );
+                    } else {
+                        eprintln!(
+                            "[no_metis_sim] hit={hit_serial} MISMATCH delta={delta:+} \
 threshold=±{threshold} — NOT sending"
-                    );
-                    sim_passed = false;
+                        );
+                        sim_passed = false;
+                    }
                 }
             }
             Ok(Err(e)) => {
@@ -310,6 +367,11 @@ threshold=±{threshold} — NOT sending"
     }
 
     if !sim_passed {
+        return;
+    }
+
+    // In dry-run mode: simulate everything but never send to Jito.
+    if cfg.dry_run {
         return;
     }
 
@@ -412,14 +474,18 @@ pub fn spawn_no_metis_executor(
     let metrics = Arc::new(NoMetisMetrics::default());
     let has_litesvm = ctx.sim_pool.is_some();
 
-    // Periodic stats reporter every 30 s.
+    // Periodic stats reporter: cumulative every 30 s, per-minute delta every 60 s.
     {
         let m = metrics.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(30));
             ticker.tick().await;
+            let mut tick_count: u64 = 0;
+            let mut snap_sim_ok: u64 = 0;
+            let mut snap_sim_rev: u64 = 0;
             loop {
                 ticker.tick().await;
+                tick_count += 1;
                 let recv       = m.received.load(Relaxed);
                 let skip_h     = m.skipped_hops.load(Relaxed);
                 let skip_fam   = m.skipped_same_family.load(Relaxed);
@@ -442,6 +508,18 @@ skip_amt={skip_amt} no_builder={skip_bldr} tx_large={skip_sz} | \
 sim_ok={sim_ok} revert={sim_rev} mismatch={sim_mis} avg_delta={avg_delta}L | \
 rest_sent={rest} grpc_sent={grpc} rate_lim={rl} jito_err={jerr}"
                 );
+                // Every 2 ticks = 60 s: print per-minute simulation rate.
+                if tick_count % 2 == 0 {
+                    let ok_delta  = sim_ok.saturating_sub(snap_sim_ok);
+                    let rev_delta = sim_rev.saturating_sub(snap_sim_rev);
+                    snap_sim_ok  = sim_ok;
+                    snap_sim_rev = sim_rev;
+                    eprintln!(
+                        "[no_metis_1m] sim_ok/min={ok_delta} sim_revert/min={rev_delta} \
+total_sim={}",
+                        sim_ok + sim_rev
+                    );
+                }
             }
         });
     }
@@ -449,8 +527,9 @@ rest_sent={rest} grpc_sent={grpc} rate_lim={rl} jito_err={jerr}"
     let m = metrics.clone();
     tokio::spawn(async move {
         eprintln!(
-            "[no_metis_executor] started — litesvm={has_litesvm} tip={}L \
+            "[no_metis_executor] started — litesvm={has_litesvm} dry_run={} tip={}L \
 max_amount={}L match_threshold=±{}L final_min_out={}L",
+            ctx.cfg.dry_run,
             ctx.cfg.tip_lamports,
             ctx.cfg.max_amount_lamports,
             ctx.cfg.match_threshold_lamports,

@@ -448,6 +448,10 @@ pub struct NoMetisConfig {
     /// Number of LiteSVM simulator workers.
     #[serde(default = "default_sim_workers")]
     pub sim_workers: usize,
+    /// Dry-run mode: simulate everything but never send to Jito.
+    /// Use to measure sim success/fail rates without risking funds.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 fn default_tip_lamports() -> u64 { 5_000 }
@@ -478,6 +482,7 @@ impl Default for NoMetisConfig {
             final_min_out_lamports: 1,
             match_threshold_lamports: 500,
             sim_workers: 2,
+            dry_run: false,
         }
     }
 }
