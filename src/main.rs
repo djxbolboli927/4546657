@@ -16,6 +16,8 @@ mod jito_grpc;
 mod litesvm_sim;
 mod metis;
 mod metrics;
+mod native_ix;
+mod no_metis_executor;
 mod program_registry;
 mod rate_limiter;
 mod pool_state_socket;
@@ -223,7 +225,59 @@ async fn async_main(config: config::Config) -> Result<()> {
                 let (tx, rx) = tokio::sync::mpsc::channel::<arb_cycle::CycleHit>(200);
                 arb_validator::spawn_arb_validator(rx, metis_val, config.arb_test.clone());
                 Some(tx)
-            // 2b. Optionally init execution stack and forward hits to Jito.
+            // 2b. send_no_metis mode: native DEX instructions, direct Jito send.
+            } else if config.arb_test.send_no_metis {
+                let blockhash_cache_nm = Arc::new(BlockhashCache::new(rpc_client.clone()));
+                let jito_nm = Arc::new(jito::JitoClient::new(
+                    &config.jito.urls,
+                    &config.jito.uuid,
+                ));
+                let jito_lim_nm = Arc::new(Mutex::new(
+                    RateLimiter::new(config.jito.max_bundles_per_second),
+                ));
+
+                let (jito_grpc_nm, grpc_lim_nm) = if config.jito_grpc.enabled {
+                    match jito_grpc::JitoGrpcClient::new(
+                        &config.jito_grpc.endpoints,
+                        &config.jito_grpc.auth_keypair,
+                    )
+                    .await
+                    {
+                        Ok(client) => {
+                            let lim = Arc::new(Mutex::new(RateLimiter::new(
+                                config.jito_grpc.max_bundles_per_second,
+                            )));
+                            (Some(Arc::new(client)), Some(lim))
+                        }
+                        Err(e) => {
+                            eprintln!("[no_metis] Jito gRPC init failed: {e} — REST-only");
+                            (None, None)
+                        }
+                    }
+                } else {
+                    (None, None)
+                };
+
+                let cu_limit = config.arb_test.no_metis.cu_limit;
+                let nm_cfg = config.arb_test.no_metis.clone();
+
+                let ctx = Arc::new(no_metis_executor::NoMetisCtx {
+                    jito: jito_nm,
+                    jito_grpc: jito_grpc_nm,
+                    jito_limiter: jito_lim_nm,
+                    jito_grpc_limiter: grpc_lim_nm,
+                    trading_keypair: trading_keypair.clone(),
+                    rpc_client: rpc_client.clone(),
+                    blockhash_cache: blockhash_cache_nm,
+                    store: store.clone(),
+                    cfg: nm_cfg,
+                    cu_limit,
+                });
+
+                let (tx, rx) = tokio::sync::mpsc::channel::<arb_cycle::CycleHit>(200);
+                no_metis_executor::spawn_no_metis_executor(rx, ctx);
+                Some(tx)
+            // 2c. Optionally init execution stack and forward hits to Jito.
             } else if config.validation.execute_cycles {
                 let blockhash_cache_exec = Arc::new(BlockhashCache::new(rpc_client.clone()));
                 let alt_cache_exec = AltCache::new(transaction::jito_tip_pubkeys());

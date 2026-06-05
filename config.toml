@@ -173,16 +173,28 @@ min_exec_profit_lamports = 6600
 
 [arb_test]
 # Mode 1: per-hop strict Metis quote + ammKey match — no Jito sends.
-validate_local = true
+validate_local = false
 # Mode 2: send bundle only when Metis output is close to floor (disabled).
 positive_slippage_probe = false
-# Mode 3: native DEX instructions without Metis (disabled — needs ix builders).
-send_no_metis = false
-# Max CycleHit candidates to validate per scan.
+# Mode 3: native DEX instructions without Metis — ACTIVE.
+send_no_metis = true
+# Max CycleHit candidates forwarded per scan cycle.
 max_candidates_per_scan = 5
-# Also validate 3-hop cycles in validate_local mode.
+# Also forward 3-hop cycles.
 enable_3hop_validation = true
-# Restrict Metis /quote to the same DEX type as the local pool.
+# (unused in send_no_metis mode — kept for validate_local)
 strict_dex_filter = true
-# Require routePlan[0].swapInfo.ammKey == local pool pubkey.
 require_ammkey_match = true
+
+[arb_test.no_metis]
+# Skip RPC simulation — send directly to Jito to see what lands on-chain.
+simulate_first = false
+# Jito tip per bundle (lamports).
+tip_lamports = 5000
+# Safety cap: only send cycles where amount_in <= this value.
+max_amount_lamports = 100000000
+# Send 2-hop and 3-hop cycles.
+enable_2hop = true
+enable_3hop = true
+# Compute unit limit for native transactions.
+cu_limit = 300000

@@ -422,11 +422,51 @@ impl Default for ValidationConfig {
 
 // ── Arb test / validate_local config ─────────────────────────────────────────
 
+/// Configuration for the no-Metis native executor.
+#[derive(Debug, Deserialize, Clone)]
+pub struct NoMetisConfig {
+    /// Run RPC simulate_transaction before sending to Jito.
+    #[serde(default)]
+    pub simulate_first: bool,
+    /// Jito tip in lamports for each bundle.
+    #[serde(default = "default_tip_lamports")]
+    pub tip_lamports: u64,
+    /// Maximum amount_in (lamports) per CycleHit to send. Safety cap.
+    #[serde(default = "default_max_amount")]
+    pub max_amount_lamports: u64,
+    /// Allow 2-hop cycles.
+    #[serde(default = "default_arb_true")]
+    pub enable_2hop: bool,
+    /// Allow 3-hop cycles (may exceed 1232-byte tx limit — skipped if too large).
+    #[serde(default = "default_arb_true")]
+    pub enable_3hop: bool,
+    /// Compute unit limit for native transactions.
+    #[serde(default = "default_cu_limit")]
+    pub cu_limit: u32,
+}
+
+fn default_tip_lamports() -> u64 { 5_000 }
+fn default_max_amount() -> u64 { 100_000_000 }
+fn default_cu_limit() -> u32 { 300_000 }
+
+impl Default for NoMetisConfig {
+    fn default() -> Self {
+        Self {
+            simulate_first: false,
+            tip_lamports: 5_000,
+            max_amount_lamports: 100_000_000,
+            enable_2hop: true,
+            enable_3hop: true,
+            cu_limit: 300_000,
+        }
+    }
+}
+
 /// Configuration for the three-mode arb-test system.
 ///
 /// Mode 1 (validate_local): per-hop strict Metis /quote + ammKey match logging.
 /// Mode 2 (positive_slippage_probe): conditional bundle send (future).
-/// Mode 3 (send_no_metis): native DEX instructions without Metis (future).
+/// Mode 3 (send_no_metis): native DEX instructions without Metis.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ArbTestConfig {
     /// Enable per-hop Metis /quote validation and ammKey matching. No Jito sends.
@@ -435,7 +475,7 @@ pub struct ArbTestConfig {
     /// Enable conditional bundle send when Metis output is near the floor.
     #[serde(default)]
     pub positive_slippage_probe: bool,
-    /// Enable native DEX instruction send without Metis (future).
+    /// Enable native DEX instruction send without Metis.
     #[serde(default)]
     pub send_no_metis: bool,
     /// Maximum CycleHit candidates to validate per scan cycle.
@@ -450,6 +490,9 @@ pub struct ArbTestConfig {
     /// Require routePlan[0].swapInfo.ammKey to equal the local pool pubkey.
     #[serde(default = "default_arb_true")]
     pub require_ammkey_match: bool,
+    /// Settings for send_no_metis mode.
+    #[serde(default)]
+    pub no_metis: NoMetisConfig,
 }
 
 fn default_max_candidates() -> usize { 5 }
@@ -465,6 +508,7 @@ impl Default for ArbTestConfig {
             enable_3hop_validation: true,
             strict_dex_filter: true,
             require_ammkey_match: true,
+            no_metis: NoMetisConfig::default(),
         }
     }
 }
