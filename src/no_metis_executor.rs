@@ -279,6 +279,8 @@ pub struct NoMetisMetrics {
     pub skipped_amount: AtomicU64,
     pub skipped_no_builder: AtomicU64,
     pub skipped_tx_too_large: AtomicU64,
+    /// Dry-run: returned early because LiteSVM sim pool not initialized.
+    pub skipped_no_sim: AtomicU64,
     /// LiteSVM simulation succeeded (tx did not revert).
     pub sim_ok: AtomicU64,
     /// LiteSVM simulation reverted.
@@ -502,7 +504,10 @@ async fn process_hit(hit: CycleHit, ctx: Arc<NoMetisCtx>, m: Arc<NoMetisMetrics>
             return;
         }
 
-        let (Some(sim_pool), Some(sim_cache)) = (ctx.sim_pool.clone(), ctx.sim_cache.clone()) else { return };
+        let (Some(sim_pool), Some(sim_cache)) = (ctx.sim_pool.clone(), ctx.sim_cache.clone()) else {
+            m.skipped_no_sim.fetch_add(1, Relaxed);
+            return;
+        };
 
         let wsol = Pubkey::from_str_const(WSOL_MINT);
         let user = ctx.trading_keypair.pubkey();
@@ -826,13 +831,24 @@ pub fn spawn_no_metis_executor(
                     let rev = m.sim_revert.load(Relaxed);
                     (acc.flush_five_min(), ok, rev)
                 };
+                // Always print full counter breakdown so we can see where hits go.
+                eprintln!(
+                    "[dif_5m] recv={} skip_fam={} skip_hops={} skip_amt={} \
+skip_no_bld={} skip_large={} skip_no_sim={} sim_ok={ok} sim_rev={rev} mismatch={}",
+                    m.received.load(Relaxed),
+                    m.skipped_same_family.load(Relaxed),
+                    m.skipped_hops.load(Relaxed),
+                    m.skipped_amount.load(Relaxed),
+                    m.skipped_no_builder.load(Relaxed),
+                    m.skipped_tx_too_large.load(Relaxed),
+                    m.skipped_no_sim.load(Relaxed),
+                    m.sim_mismatch.load(Relaxed),
+                );
                 if report.is_empty() {
-                    eprintln!("[dif_5m] no sims in last 5 min (total ok={ok} revert={rev})");
                     continue;
                 }
-                // Terminal: summary line
-                let first_two: Vec<&str> = report.lines().take(4).collect();
-                for ln in &first_two { eprintln!("{ln}"); }
+                // Terminal: first 4 lines of the per-path report
+                for ln in report.lines().take(4) { eprintln!("{ln}"); }
                 // File: full report
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true).append(true).open(&dif_path_5m)
@@ -885,6 +901,13 @@ max_amount={}L dif={}",
         while let Some(hit) = rx.recv().await {
             hit_serial += 1;
             m.received.fetch_add(1, Relaxed);
+            // Log first 5 hits and every 500th so we know the pipeline is alive.
+            if hit_serial <= 5 || hit_serial % 500 == 0 {
+                eprintln!(
+                    "[no_metis_rx] serial={hit_serial} hops={} dex0={} profit={}",
+                    hit.hops(), hit.dex_names[0], hit.profit_gross,
+                );
+            }
             let ctx = ctx.clone();
             let m = m.clone();
             let dif = dif.clone();
