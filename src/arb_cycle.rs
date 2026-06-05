@@ -592,6 +592,10 @@ pub struct CycleHit {
     pub dex_names: Vec<&'static str>,
     /// Intermediate mint symbols (as base58; caller may resolve to ticker later).
     pub intermediate_mints: Vec<Pubkey>,
+    /// Token amounts at each intermediate hop output.
+    /// 2-hop: [mid]  (output of hop 1 = input of hop 2)
+    /// 3-hop: [mid1, mid2]
+    pub intermediate_amounts: Vec<u64>,
     pub amount_in: u64,
     pub amount_out: u64,
     /// amount_out − amount_in (always > 0 for a CycleHit).
@@ -665,6 +669,7 @@ pub fn find_cycles_in_store(
                     pools: vec![e1.pool, e2.pool],
                     dex_names: vec![e1.dex_kind.name(), e2.dex_kind.name()],
                     intermediate_mints: vec![x],
+                    intermediate_amounts: vec![mid],
                     amount_in,
                     amount_out: out,
                     profit_gross: gross,
@@ -718,6 +723,7 @@ pub fn find_cycles_in_store(
                         pools: vec![e1.pool, e2.pool, e3.pool],
                         dex_names: vec![e1.dex_kind.name(), e2.dex_kind.name(), e3.dex_kind.name()],
                         intermediate_mints: vec![x, y],
+                        intermediate_amounts: vec![mid1, mid2],
                         amount_in,
                         amount_out: out,
                         profit_gross: gross,
@@ -792,10 +798,12 @@ pub fn find_cycles_in_store(
                     let out = final_amt + final_gross;
                     let net = (out as i64) - (final_amt as i64) - (tx_cost as i64)
                         - (error_margin_per_hop as i64 * 2);
+                    let mid_amt = quote_edge(&edges[i1], final_amt, store).unwrap_or(0);
                     opt_hits.push(CycleHit {
                         pools: hit.pools.clone(),
                         dex_names: hit.dex_names.clone(),
                         intermediate_mints: hit.intermediate_mints.clone(),
+                        intermediate_amounts: vec![mid_amt],
                         amount_in: final_amt,
                         amount_out: out,
                         profit_gross: final_gross,
@@ -821,10 +829,13 @@ pub fn find_cycles_in_store(
                     let out = final_amt + final_gross;
                     let net = (out as i64) - (final_amt as i64) - (tx_cost as i64)
                         - (error_margin_per_hop as i64 * 3);
+                    let mid1_amt = quote_edge(&edges[i1], final_amt, store).unwrap_or(0);
+                    let mid2_amt = quote_edge(&edges[i2], mid1_amt, store).unwrap_or(0);
                     opt_hits.push(CycleHit {
                         pools: hit.pools.clone(),
                         dex_names: hit.dex_names.clone(),
                         intermediate_mints: hit.intermediate_mints.clone(),
+                        intermediate_amounts: vec![mid1_amt, mid2_amt],
                         amount_in: final_amt,
                         amount_out: out,
                         profit_gross: final_gross,
@@ -1117,11 +1128,9 @@ path=[{}]  via=[{}]",
                 );
             }
 
-            // Forward net-positive 2-hop hits to the executor (non-blocking).
-            // 3-hop support requires merge_quotes_3 — skip until implemented.
+            // Forward all net-positive hits to the executor or validator (non-blocking).
             if let Some(ref sender) = *hit_tx {
-                for hit in hits.iter().filter(|h| h.profit_net > 0 && h.hops() == 2) {
-                    // try_send never blocks — drops hit if executor is behind.
+                for hit in hits.iter().filter(|h| h.profit_net > 0) {
                     let _ = sender.try_send(hit.clone());
                 }
             }

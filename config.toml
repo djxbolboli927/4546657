@@ -166,7 +166,23 @@ interval_secs = 5
 max_pools_log = 0
 # وقتی true است: cycleهای net-positive به Metis برای ساخت اینستراکشن
 # فرستاده شده و سپس به Jito ارسال می‌شوند.
-execute_cycles = true
+execute_cycles = false
 # حداقل سود محلی (و تأیید Metis) به لمپرت قبل از رفتن به /swap-instructions.
 # 6600 = tx_fee(5000) + jito_tip(1000) + margin(600)
 min_exec_profit_lamports = 6600
+
+[arb_test]
+# Mode 1: per-hop strict Metis quote + ammKey match — no Jito sends.
+validate_local = true
+# Mode 2: send bundle only when Metis output is close to floor (disabled).
+positive_slippage_probe = false
+# Mode 3: native DEX instructions without Metis (disabled — needs ix builders).
+send_no_metis = false
+# Max CycleHit candidates to validate per scan.
+max_candidates_per_scan = 5
+# Also validate 3-hop cycles in validate_local mode.
+enable_3hop_validation = true
+# Restrict Metis /quote to the same DEX type as the local pool.
+strict_dex_filter = true
+# Require routePlan[0].swapInfo.ammKey == local pool pubkey.
+require_ammkey_match = true

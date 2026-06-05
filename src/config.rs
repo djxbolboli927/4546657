@@ -22,6 +22,8 @@ pub struct Config {
     pub jupiter_price: JupiterPriceConfig,
     #[serde(default)]
     pub validation: ValidationConfig,
+    #[serde(default)]
+    pub arb_test: ArbTestConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -414,6 +416,55 @@ impl Default for ValidationConfig {
             max_pools_log: 0,
             execute_cycles: false,
             min_exec_profit_lamports: 6_600,
+        }
+    }
+}
+
+// ── Arb test / validate_local config ─────────────────────────────────────────
+
+/// Configuration for the three-mode arb-test system.
+///
+/// Mode 1 (validate_local): per-hop strict Metis /quote + ammKey match logging.
+/// Mode 2 (positive_slippage_probe): conditional bundle send (future).
+/// Mode 3 (send_no_metis): native DEX instructions without Metis (future).
+#[derive(Debug, Deserialize, Clone)]
+pub struct ArbTestConfig {
+    /// Enable per-hop Metis /quote validation and ammKey matching. No Jito sends.
+    #[serde(default)]
+    pub validate_local: bool,
+    /// Enable conditional bundle send when Metis output is near the floor.
+    #[serde(default)]
+    pub positive_slippage_probe: bool,
+    /// Enable native DEX instruction send without Metis (future).
+    #[serde(default)]
+    pub send_no_metis: bool,
+    /// Maximum CycleHit candidates to validate per scan cycle.
+    #[serde(default = "default_max_candidates")]
+    pub max_candidates_per_scan: usize,
+    /// Also validate 3-hop cycles in validate_local mode.
+    #[serde(default = "default_arb_true")]
+    pub enable_3hop_validation: bool,
+    /// Restrict each per-hop Metis /quote to the same DEX label as the local pool.
+    #[serde(default = "default_arb_true")]
+    pub strict_dex_filter: bool,
+    /// Require routePlan[0].swapInfo.ammKey to equal the local pool pubkey.
+    #[serde(default = "default_arb_true")]
+    pub require_ammkey_match: bool,
+}
+
+fn default_max_candidates() -> usize { 5 }
+fn default_arb_true() -> bool { true }
+
+impl Default for ArbTestConfig {
+    fn default() -> Self {
+        Self {
+            validate_local: false,
+            positive_slippage_probe: false,
+            send_no_metis: false,
+            max_candidates_per_scan: 5,
+            enable_3hop_validation: true,
+            strict_dex_filter: true,
+            require_ammkey_match: true,
         }
     }
 }

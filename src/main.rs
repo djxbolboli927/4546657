@@ -3,6 +3,7 @@ mod account_cache;
 mod alt_cache;
 mod arbitrage;
 mod arb_cycle;
+mod arb_validator;
 mod blockhash_cache;
 mod config;
 mod cycle_executor;
@@ -212,8 +213,18 @@ async fn async_main(config: config::Config) -> Result<()> {
                 config.jupiter_price.clone(),
             );
 
-            // 2. Optionally init execution stack and forward hits to Jito.
-            let hit_tx = if config.validation.execute_cycles {
+            // 2a. validate_local mode: per-hop Metis /quote comparison, no Jito sends.
+            //     Takes priority over execute_cycles when both are enabled.
+            let hit_tx = if config.arb_test.validate_local {
+                let metis_val = Arc::new(metis::MetisClient::new(
+                    &config.metis.url,
+                    config.performance.quote_timeout_ms,
+                ));
+                let (tx, rx) = tokio::sync::mpsc::channel::<arb_cycle::CycleHit>(200);
+                arb_validator::spawn_arb_validator(rx, metis_val, config.arb_test.clone());
+                Some(tx)
+            // 2b. Optionally init execution stack and forward hits to Jito.
+            } else if config.validation.execute_cycles {
                 let blockhash_cache_exec = Arc::new(BlockhashCache::new(rpc_client.clone()));
                 let alt_cache_exec = AltCache::new(transaction::jito_tip_pubkeys());
                 let metis_exec = Arc::new(metis::MetisClient::new(

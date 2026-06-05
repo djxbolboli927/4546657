@@ -78,6 +78,65 @@ pub struct AccountMeta {
     pub is_writable: bool,
 }
 
+/// Extracted info from the first hop of a /quote routePlan.
+///
+/// Used by `arb_validator` to verify that Metis routed through the exact same
+/// pool as the local calculator (`ammKey == local_pool`), same DEX label, and
+/// same mint pair — before comparing in/out amounts.
+#[derive(Debug, Clone)]
+pub struct RouteHopInfo {
+    /// `swapInfo.ammKey` — the on-chain pool address Metis chose.
+    pub amm_key: Option<String>,
+    /// `swapInfo.label` — the DEX label string (e.g. "Raydium CLMM").
+    pub label: Option<String>,
+    pub input_mint: Option<String>,
+    pub output_mint: Option<String>,
+    /// `swapInfo.inAmount` parsed as u64.
+    pub in_amount: Option<u64>,
+    /// `swapInfo.outAmount` parsed as u64.
+    pub out_amount: Option<u64>,
+    /// Number of hops in the routePlan (1 = direct/strict, >1 = multi-hop).
+    pub route_len: usize,
+}
+
+impl MetisClient {
+    /// Extract the first-hop details from a `/quote` response routePlan.
+    ///
+    /// Returns a `RouteHopInfo` with `route_len` set to the full array length.
+    /// When `route_len > 1` the quote used an intermediate pool; the validator
+    /// should reject it (`strict_match = false`).
+    pub fn extract_first_hop(quote: &QuoteResponse) -> RouteHopInfo {
+        let route_arr = quote.route_plan.as_array();
+        let route_len = route_arr.map(|a| a.len()).unwrap_or(0);
+        let swap_info = route_arr
+            .and_then(|a| a.first())
+            .and_then(|h| h.get("swapInfo"));
+
+        let get_str = |key: &str| {
+            swap_info
+                .and_then(|si| si.get(key))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        };
+        let parse_u64 = |key: &str| {
+            swap_info
+                .and_then(|si| si.get(key))
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+        };
+
+        RouteHopInfo {
+            amm_key: get_str("ammKey"),
+            label: get_str("label"),
+            input_mint: get_str("inputMint"),
+            output_mint: get_str("outputMint"),
+            in_amount: parse_u64("inAmount"),
+            out_amount: parse_u64("outAmount"),
+            route_len,
+        }
+    }
+}
+
 /// Why a /swap-instructions call failed. Lets the caller break down the
 /// (often large) swap_ix_fail count by root cause instead of one opaque total.
 #[derive(Debug, Clone, Copy)]
