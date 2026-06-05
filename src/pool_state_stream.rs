@@ -309,7 +309,7 @@ fn spawn_one_stream(
 /// No per-update logging — this is the only periodic visibility into the stream.
 fn spawn_stats_reporter(store: Arc<PoolStateStore>, total_accounts: usize) {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        let mut ticker = tokio::time::interval(Duration::from_secs(60));
         loop {
             ticker.tick().await;
             let live_accounts = store.account_count();

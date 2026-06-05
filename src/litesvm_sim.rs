@@ -338,11 +338,18 @@ impl Simulator {
                 })
             }
             Err(meta) => {
-                let log = meta.meta.logs.first().cloned();
+                // Show the last few log lines — the relevant program error is
+                // typically at the end, after the invoke chain.
+                let logs = &meta.meta.logs;
+                let excerpt = if logs.len() <= 6 {
+                    logs.join(" | ")
+                } else {
+                    logs[logs.len() - 6..].join(" | ")
+                };
                 anyhow::bail!(
-                    "sim reverted: err={:?} log={:?}",
+                    "sim reverted: err={:?} logs=[{}]",
                     meta.err,
-                    log
+                    excerpt,
                 )
             }
         }

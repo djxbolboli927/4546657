@@ -528,6 +528,19 @@ spot_atomic={sa:.8} local={lo:.8} jup_ratio={jp:.8} diff={d:.1}bps slot={sl}",
     let max = diffs.first().map(|(d, _)| *d).unwrap_or(0.0);
     let min = diffs.last().map(|(d, _)| *d).unwrap_or(0.0);
 
+    // Count pool accounts not updated in the last 2 minutes (stale = no on-chain trades).
+    // Growing stale_count explains divergence from Jupiter: unchanged pools have correct
+    // prices but Jupiter may reflect newer trades in other sources.
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let stale_2m = live.iter().filter(|d| {
+        store.accounts.get(&d.pool)
+            .map(|r| now_ns.saturating_sub(r.updated_at_unix_ns) > 120_000_000_000)
+            .unwrap_or(false)
+    }).count();
+
     let dmm_live = live.iter().filter(|d| d.engine == Engine::MeteoraDammV2).count();
     let wpool_live = live.iter().filter(|d| d.engine == Engine::OrcaWhirlpool).count();
     let rclmm_live = live.iter().filter(|d| d.engine == Engine::RaydiumClmm).count();
@@ -537,7 +550,7 @@ spot_atomic={sa:.8} local={lo:.8} jup_ratio={jp:.8} diff={d:.1}bps slot={sl}",
     eprintln!(
         "[validator] pools_live={live} (cp={cp} damm_v2={dmm} whirlpool={wp} ray_clmm={rc} pumpswap={ps} dlmm={dl}) \
 compared={ok} skipped_unsupported={skip} no_jup={nj} no_decimals={nd} \
-avg={avg:.1}bps max={max:.1}bps min={min:.1}bps",
+avg={avg:.1}bps max={max:.1}bps min={min:.1}bps stale_2m={stale_2m}",
         live = live.len(),
         cp = cp_live,
         dmm = dmm_live,

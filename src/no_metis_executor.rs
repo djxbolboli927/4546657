@@ -148,12 +148,6 @@ async fn process_hit(hit: CycleHit, ctx: Arc<NoMetisCtx>, m: Arc<NoMetisMetrics>
     // Only 2-hop for now (3-hop usually exceeds 1232 bytes without ALTs).
     if hops != 2 {
         m.skipped_hops.fetch_add(1, Relaxed);
-        eprintln!(
-            "[no_metis_skip] hit={hit_serial} reason=only_2hop_enabled hops={hops} \
-pools={} dexes={}",
-            hit.pools.iter().map(|p| p.to_string()[..8].to_string()).collect::<Vec<_>>().join("→"),
-            hit.dex_names.join("→"),
-        );
         return;
     }
 
@@ -162,22 +156,12 @@ pools={} dexes={}",
     let fam1 = dex_family(hit.dex_names[1]);
     if fam0 == fam1 {
         m.skipped_same_family.fetch_add(1, Relaxed);
-        eprintln!(
-            "[no_metis_skip] hit={hit_serial} reason=same_dex_family family={fam0} \
-dex0={} dex1={}",
-            hit.dex_names[0], hit.dex_names[1],
-        );
         return;
     }
 
     // Amount cap.
     if hit.amount_in > cfg.max_amount_lamports {
         m.skipped_amount.fetch_add(1, Relaxed);
-        eprintln!(
-            "[no_metis_skip] hit={hit_serial} reason=amount_too_large \
-amount={} max={}",
-            hit.amount_in, cfg.max_amount_lamports,
-        );
         return;
     }
 
@@ -212,12 +196,6 @@ amount={} max={}",
         let dex_name = hit.dex_names[hop_idx];
         let pool = &hit.pools[hop_idx];
 
-        eprintln!(
-            "[no_metis_hop] hit={hit_serial} hop={hop_idx} dex={dex_name} pool={:.8} \
-mint_in={:.8} mint_out={:.8} amount_in={amount_in} min_out={min_out}",
-            pool, mint_in, mint_out,
-        );
-
         match native_ix::build_swap(
             dex_name, pool, &user, &mint_in, &mint_out,
             amount_in, min_out, &ctx.store,
@@ -242,36 +220,23 @@ mint_in={:.8} mint_out={:.8} amount_in={amount_in} min_out={min_out}",
 
     let msg = match v0::Message::try_compile(&user, &all_ixs, &[], blockhash) {
         Ok(m) => m,
-        Err(e) => {
-            eprintln!("[no_metis_skip] hit={hit_serial} reason=msg_compile_failed err={e}");
-            return;
-        }
+        Err(_) => return,
     };
     let tx = match VersionedTransaction::try_new(
         VersionedMessage::V0(msg),
         &[ctx.trading_keypair.as_ref()],
     ) {
         Ok(t) => t,
-        Err(e) => {
-            eprintln!("[no_metis_skip] hit={hit_serial} reason=sign_failed err={e}");
-            return;
-        }
+        Err(_) => return,
     };
 
     // Size check: Solana max serialized transaction = 1232 bytes.
     let tx_bytes = match bincode::serialize(&tx) {
         Ok(b) => b,
-        Err(e) => {
-            eprintln!("[no_metis_skip] hit={hit_serial} reason=serialize_failed err={e}");
-            return;
-        }
+        Err(_) => return,
     };
     if tx_bytes.len() > 1232 {
         m.skipped_tx_too_large.fetch_add(1, Relaxed);
-        eprintln!(
-            "[no_metis_skip] hit={hit_serial} reason=tx_too_large size={} hops={hops}",
-            tx_bytes.len(),
-        );
         return;
     }
 
