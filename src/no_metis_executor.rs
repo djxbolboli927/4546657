@@ -15,6 +15,8 @@
 //!   8. Send to Jito if sim succeeded and delta within match_threshold.
 //!      → REST first, gRPC fallback.
 
+use std::collections::HashMap;
+use std::io::Write as IoWrite;
 use std::sync::{
     atomic::{AtomicI64, AtomicU64, Ordering::Relaxed},
     Arc, Mutex,
@@ -71,6 +73,181 @@ fn dex_family(name: &str) -> &str {
         "PumpSwap" => "PumpFun",
         other => other,
     }
+}
+
+// ── Dif accumulator ──────────────────────────────────────────────────────────
+
+struct HopRecord {
+    dex: &'static str,
+    pool_short: String,
+    amount_in: u64,
+    ram_out: u64,
+    sim_out: Option<u64>,
+    revert_msg: Option<String>,
+}
+
+struct PathRecord {
+    hit_serial: u64,
+    pools_str: String,
+    amount_in: u64,
+    ram_profit: i64,
+    hops: Vec<HopRecord>,
+}
+
+#[derive(Default, Clone)]
+struct HopStats {
+    ok: u64,
+    revert: u64,
+    delta_sum: i64,
+    delta_n: u64,
+    delta_min: i64,
+    delta_max: i64,
+}
+
+impl HopStats {
+    fn record(&mut self, sim_out: Option<u64>, ram_out: u64) {
+        match sim_out {
+            Some(out) => {
+                self.ok += 1;
+                let delta = (out as i64) - (ram_out as i64);
+                self.delta_sum += delta;
+                if self.delta_n == 0 {
+                    self.delta_min = delta;
+                    self.delta_max = delta;
+                } else {
+                    if delta < self.delta_min { self.delta_min = delta; }
+                    if delta > self.delta_max { self.delta_max = delta; }
+                }
+                self.delta_n += 1;
+            }
+            None => self.revert += 1,
+        }
+    }
+    fn avg(&self) -> i64 {
+        if self.delta_n > 0 { self.delta_sum / self.delta_n as i64 } else { 0 }
+    }
+}
+
+struct DifAccum {
+    five_min_records: Vec<PathRecord>,
+    hour_hop_stats: Vec<HopStats>,
+    hour_ok: u64,
+    hour_revert: u64,
+    dif_path: String,
+}
+
+impl DifAccum {
+    fn new(dif_path: String) -> Self {
+        Self {
+            five_min_records: Vec::new(),
+            hour_hop_stats: vec![HopStats::default(); 4],
+            hour_ok: 0,
+            hour_revert: 0,
+            dif_path,
+        }
+    }
+
+    fn add(&mut self, rec: PathRecord) {
+        // Update hour stats.
+        let all_ok = rec.hops.iter().all(|h| h.sim_out.is_some());
+        if all_ok { self.hour_ok += 1; } else { self.hour_revert += 1; }
+        for (i, h) in rec.hops.iter().enumerate() {
+            while self.hour_hop_stats.len() <= i {
+                self.hour_hop_stats.push(HopStats::default());
+            }
+            self.hour_hop_stats[i].record(h.sim_out, h.ram_out);
+        }
+        self.five_min_records.push(rec);
+    }
+
+    fn flush_five_min(&mut self) -> String {
+        use std::fmt::Write as _;
+        let records = std::mem::take(&mut self.five_min_records);
+        if records.is_empty() {
+            return String::new();
+        }
+
+        // Compute 5-min hop stats from these records.
+        let mut hop_stats: Vec<HopStats> = Vec::new();
+        let mut ok_paths: u64 = 0;
+        let mut rev_paths: u64 = 0;
+        for rec in &records {
+            let all_ok = rec.hops.iter().all(|h| h.sim_out.is_some());
+            if all_ok { ok_paths += 1; } else { rev_paths += 1; }
+            for (i, h) in rec.hops.iter().enumerate() {
+                while hop_stats.len() <= i {
+                    hop_stats.push(HopStats::default());
+                }
+                hop_stats[i].record(h.sim_out, h.ram_out);
+            }
+        }
+
+        let ts = chrono_like_ts();
+        let mut out = String::new();
+        let _ = writeln!(out, "=== 5-min [{}] paths={} ok={} revert={} ===",
+            ts, records.len(), ok_paths, rev_paths);
+        for (i, hs) in hop_stats.iter().enumerate() {
+            let _ = writeln!(out,
+                "  hop[{i}] ok={} revert={} avg_delta={:+} min={:+} max={:+}",
+                hs.ok, hs.revert, hs.avg(), hs.delta_min, hs.delta_max);
+        }
+        let _ = writeln!(out, "--- records ---");
+        for rec in &records {
+            let _ = writeln!(out, "  hit={} pools={} amount_in={} ram_profit={:+}",
+                rec.hit_serial, rec.pools_str, rec.amount_in, rec.ram_profit);
+            for (i, h) in rec.hops.iter().enumerate() {
+                let sim_str = match h.sim_out {
+                    Some(v) => {
+                        let delta = (v as i64) - (h.ram_out as i64);
+                        format!("sim_out={v} delta={delta:+}")
+                    }
+                    None => {
+                        let msg = h.revert_msg.as_deref().unwrap_or("?");
+                        format!("REVERT err=\"{}\"", &msg[..msg.len().min(80)])
+                    }
+                };
+                let _ = writeln!(out,
+                    "    h{i} {} pool={} in={} ram_out={} {}",
+                    h.dex, h.pool_short, h.amount_in, h.ram_out, sim_str);
+            }
+        }
+        out
+    }
+
+    fn hour_summary(&self) -> String {
+        use std::fmt::Write as _;
+        let ts = chrono_like_ts();
+        let mut out = String::new();
+        let total = self.hour_ok + self.hour_revert;
+        let _ = writeln!(out, "=== 1-hour [{}] paths={} ok={} revert={} ===",
+            ts, total, self.hour_ok, self.hour_revert);
+        for (i, hs) in self.hour_hop_stats.iter().enumerate() {
+            if hs.ok + hs.revert == 0 { continue; }
+            let _ = writeln!(out,
+                "  hop[{i}] ok={} revert={} avg_delta={:+} min={:+} max={:+}",
+                hs.ok, hs.revert, hs.avg(), hs.delta_min, hs.delta_max);
+        }
+        out
+    }
+
+    fn reset_hour(&mut self) {
+        self.hour_hop_stats = vec![HopStats::default(); 4];
+        self.hour_ok = 0;
+        self.hour_revert = 0;
+    }
+}
+
+fn chrono_like_ts() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+    format!("day{days}T{h:02}:{m:02}:{s:02}Z")
 }
 
 // ── Context ───────────────────────────────────────────────────────────────────
@@ -172,7 +349,147 @@ fn make_spl_token_account(mint: &Pubkey, owner: &Pubkey) -> solana_account::Acco
     }
 }
 
-async fn process_hit(hit: CycleHit, ctx: Arc<NoMetisCtx>, m: Arc<NoMetisMetrics>, hit_serial: u64) {
+/// Same as `make_spl_token_account` but with a non-zero token balance.
+/// For WSOL, lamports includes the wrapped amount (rent + amount).
+fn make_spl_token_account_with_amount(
+    mint: &Pubkey,
+    owner: &Pubkey,
+    amount: u64,
+) -> solana_account::Account {
+    let mut account = make_spl_token_account(mint, owner);
+    account.data[64..72].copy_from_slice(&amount.to_le_bytes());
+    account.lamports = 2_039_280 + amount;
+    account
+}
+
+// ── Per-hop simulation ────────────────────────────────────────────────────────
+
+/// Simulate each hop of `hit` as an independent single-instruction transaction.
+/// Chained: hop N's sim output becomes hop N+1's injected input.
+/// Returns one `HopRecord` per hop (or fewer if instruction-build fails).
+async fn simulate_hops(
+    hit: &CycleHit,
+    ctx: &NoMetisCtx,
+    sim_pool: Arc<crate::litesvm_sim::SimulatorPool>,
+    sim_cache: Arc<AccountCache>,
+    user: Pubkey,
+    wsol: Pubkey,
+    blockhash: solana_sdk::hash::Hash,
+) -> Vec<HopRecord> {
+    let hops = hit.hops();
+    let mut results: Vec<HopRecord> = Vec::with_capacity(hops);
+    let mut prev_sim_out: Option<u64> = None;
+
+    for hop_idx in 0..hops {
+        let mint_in = if hop_idx == 0 { wsol } else { hit.intermediate_mints[hop_idx - 1] };
+        let mint_out = if hop_idx + 1 == hops { wsol } else { hit.intermediate_mints[hop_idx] };
+
+        let amount_in = if hop_idx == 0 {
+            hit.amount_in
+        } else {
+            prev_sim_out.unwrap_or_else(|| hit.intermediate_amounts.get(hop_idx - 1).copied().unwrap_or(0))
+        };
+
+        let ram_out = if hop_idx + 1 == hops {
+            hit.amount_in + hit.profit_gross
+        } else {
+            hit.intermediate_amounts.get(hop_idx).copied().unwrap_or(0)
+        };
+
+        let dex_name = hit.dex_names[hop_idx];
+        let pool = hit.pools[hop_idx];
+        let pool_short = pool.to_string()[..8].to_string();
+
+        let swap_ix = match native_ix::build_swap(
+            dex_name, &pool, &user, &mint_in, &mint_out,
+            amount_in, 1, &ctx.store,
+        ) {
+            Ok(ix) => ix,
+            Err(e) => {
+                results.push(HopRecord {
+                    dex: dex_name, pool_short, amount_in, ram_out,
+                    sim_out: None,
+                    revert_msg: Some(format!("build_swap: {e}")),
+                });
+                prev_sim_out = None;
+                continue;
+            }
+        };
+
+        let all_ixs = vec![compute_budget_ix(ctx.cu_limit), swap_ix];
+        let msg = match solana_sdk::message::v0::Message::try_compile(&user, &all_ixs, &[], blockhash) {
+            Ok(m) => m,
+            Err(e) => {
+                results.push(HopRecord {
+                    dex: dex_name, pool_short, amount_in, ram_out,
+                    sim_out: None,
+                    revert_msg: Some(format!("compile: {e}")),
+                });
+                prev_sim_out = None;
+                continue;
+            }
+        };
+        let tx = match VersionedTransaction::try_new(
+            VersionedMessage::V0(msg),
+            &[ctx.trading_keypair.as_ref()],
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                results.push(HopRecord {
+                    dex: dex_name, pool_short, amount_in, ram_out,
+                    sim_out: None,
+                    revert_msg: Some(format!("sign: {e}")),
+                });
+                prev_sim_out = None;
+                continue;
+            }
+        };
+
+        // Inject input ATA with exact amount; output ATA with 0.
+        let input_ata = spl_associated_token_account::get_associated_token_address(&user, &mint_in);
+        let output_ata = spl_associated_token_account::get_associated_token_address(&user, &mint_out);
+        let mut overrides: HashMap<Pubkey, solana_account::Account> = HashMap::new();
+        overrides.insert(input_ata, make_spl_token_account_with_amount(&mint_in, &user, amount_in));
+        overrides.insert(output_ata, make_spl_token_account(&mint_out, &user));
+
+        let sp = sim_pool.clone();
+        let sc = sim_cache.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            sp.simulate_hop(&tx, &sc, &overrides, output_ata)
+        }).await;
+
+        match outcome {
+            Ok(Ok(o)) => {
+                prev_sim_out = Some(o.out_balance);
+                results.push(HopRecord {
+                    dex: dex_name, pool_short, amount_in, ram_out,
+                    sim_out: Some(o.out_balance),
+                    revert_msg: None,
+                });
+            }
+            Ok(Err(e)) => {
+                prev_sim_out = None;
+                let msg = e.to_string();
+                results.push(HopRecord {
+                    dex: dex_name, pool_short, amount_in, ram_out,
+                    sim_out: None,
+                    revert_msg: Some(msg),
+                });
+            }
+            Err(e) => {
+                prev_sim_out = None;
+                results.push(HopRecord {
+                    dex: dex_name, pool_short, amount_in, ram_out,
+                    sim_out: None,
+                    revert_msg: Some(format!("spawn: {e}")),
+                });
+            }
+        }
+    }
+    results
+}
+
+async fn process_hit(hit: CycleHit, ctx: Arc<NoMetisCtx>, m: Arc<NoMetisMetrics>, hit_serial: u64, dif: Arc<Mutex<DifAccum>>) {
     let hops = hit.hops();
     let cfg = &ctx.cfg;
 
@@ -271,27 +588,52 @@ async fn process_hit(hit: CycleHit, ctx: Arc<NoMetisCtx>, m: Arc<NoMetisMetrics>
         return;
     }
 
-    let pool_labels: Vec<String> = hit.pools.iter()
-        .map(|p| p.to_string()[..8].to_string())
-        .collect();
-    eprintln!(
-        "[no_metis_candidate] hit={hit_serial} hops={hops} amount_in={} profit_gross={} \
-pools={} dexes={} tx_bytes={} tip={}",
-        hit.amount_in, hit.profit_gross,
-        pool_labels.join("→"),
-        hit.dex_names.join("→"),
-        tx_bytes.len(), cfg.tip_lamports,
-    );
+    // ── Per-hop LiteSVM simulation ────────────────────────────────────────────
+    if let (Some(sim_pool), Some(sim_cache)) = (&ctx.sim_pool, &ctx.sim_cache) {
+        let pools_str = hit.pools.iter()
+            .map(|p| p.to_string()[..8].to_string())
+            .collect::<Vec<_>>()
+            .join("→");
 
-    // ── LiteSVM simulation ────────────────────────────────────────────────────
+        let hop_records = simulate_hops(
+            &hit, &ctx, sim_pool.clone(), sim_cache.clone(),
+            user, wsol, blockhash,
+        ).await;
+
+        // Update counters.
+        let all_ok = hop_records.iter().all(|h| h.sim_out.is_some());
+        if all_ok {
+            m.sim_ok.fetch_add(1, Relaxed);
+        } else {
+            m.sim_revert.fetch_add(1, Relaxed);
+        }
+
+        let ram_profit = hit.profit_gross as i64;
+        let path_rec = PathRecord {
+            hit_serial,
+            pools_str,
+            amount_in: hit.amount_in,
+            ram_profit,
+            hops: hop_records,
+        };
+        if let Ok(mut acc) = dif.lock() {
+            acc.add(path_rec);
+        }
+
+        if !all_ok || cfg.dry_run {
+            return;
+        }
+    } else {
+        // No sim pool — dry_run still prevents sending.
+        if cfg.dry_run {
+            return;
+        }
+    }
+
+    // Keep the full-tx mismatch guard when NOT in dry_run and sim is available.
+    // (Re-run full-tx sim for the send decision so we know the exact WSOL delta.)
     let mut sim_passed = true;
     if let (Some(sim_pool), Some(sim_cache)) = (&ctx.sim_pool, &ctx.sim_cache) {
-        // Inject valid empty SPL token ATAs for every intermediate hop mint.
-        // The Yellowstone subscription covers only DEX-program-owned accounts
-        // and the user's WSOL ATA. Intermediate token ATAs for the user wallet
-        // never stream in, so LiteSVM would see a zero-byte account and SPL Token
-        // would reject the swap with "insufficient funds". We pre-populate the
-        // cache with a 165-byte Initialized account so the program can read/write it.
         for intermediate_mint in &hit.intermediate_mints {
             let ata = spl_associated_token_account::get_associated_token_address(
                 &user, intermediate_mint,
@@ -304,74 +646,27 @@ pools={} dexes={} tx_bytes={} tip={}",
                 sim_cache.inject_account(ata, make_spl_token_account(intermediate_mint, &user));
             }
         }
-
-        // Run simulation on a blocking thread (LiteSVM is CPU-bound).
         let tx_clone = tx.clone();
-        let sim_pool = sim_pool.clone();
-        let sim_cache = sim_cache.clone();
-        let sim_result = tokio::task::spawn_blocking(move || {
-            sim_pool.simulate_native(&tx_clone, &sim_cache)
-        }).await;
-
-        match sim_result {
+        let sp = sim_pool.clone();
+        let sc = sim_cache.clone();
+        match tokio::task::spawn_blocking(move || sp.simulate_native(&tx_clone, &sc)).await {
             Ok(Ok(result)) => {
-                // delta = LiteSVM profit - RAM profit
                 let litesvm_profit = (result.wsol_after as i64) - (result.wsol_before as i64);
                 let ram_profit = hit.profit_gross as i64;
                 let delta = litesvm_profit - ram_profit;
-                let delta_abs = delta.unsigned_abs() as i64;
-
-                m.sim_ok.fetch_add(1, Relaxed);
-                m.sum_delta_abs.fetch_add(delta_abs, Relaxed);
+                m.sum_delta_abs.fetch_add(delta.unsigned_abs() as i64, Relaxed);
                 m.delta_count.fetch_add(1, Relaxed);
-
-                eprintln!(
-                    "[no_metis_sim] hit={hit_serial} ok=true \
-wsol_before={} wsol_after={} litesvm_profit={:+} ram_profit={ram_profit:+} \
-delta={delta:+} units={}",
-                    result.wsol_before, result.wsol_after, litesvm_profit,
-                    result.compute_units,
-                );
-
                 let threshold = cfg.match_threshold_lamports as i64;
                 if delta.abs() > threshold {
                     m.sim_mismatch.fetch_add(1, Relaxed);
-                    if cfg.dry_run {
-                        eprintln!(
-                            "[no_metis_sim] hit={hit_serial} MISMATCH delta={delta:+} \
-threshold=±{threshold} (dry_run: not blocking)"
-                        );
-                    } else {
-                        eprintln!(
-                            "[no_metis_sim] hit={hit_serial} MISMATCH delta={delta:+} \
-threshold=±{threshold} — NOT sending"
-                        );
-                        sim_passed = false;
-                    }
+                    sim_passed = false;
                 }
             }
-            Ok(Err(e)) => {
-                m.sim_revert.fetch_add(1, Relaxed);
-                eprintln!(
-                    "[no_metis_sim] hit={hit_serial} ok=false err={e} — NOT sending"
-                );
-                sim_passed = false;
-            }
-            Err(e) => {
-                eprintln!(
-                    "[no_metis_sim] hit={hit_serial} spawn_blocking_err={e} — NOT sending"
-                );
-                sim_passed = false;
-            }
+            Ok(Err(_)) | Err(_) => sim_passed = false,
         }
     }
 
     if !sim_passed {
-        return;
-    }
-
-    // In dry-run mode: simulate everything but never send to Jito.
-    if cfg.dry_run {
         return;
     }
 
@@ -474,51 +769,68 @@ pub fn spawn_no_metis_executor(
     let metrics = Arc::new(NoMetisMetrics::default());
     let has_litesvm = ctx.sim_pool.is_some();
 
-    // Periodic stats reporter: cumulative every 30 s, per-minute delta every 60 s.
+    // Shared per-hop diagnostic accumulator.
+    let dif_path = "/home/user/4546657/dif".to_string();
+    let dif = Arc::new(Mutex::new(DifAccum::new(dif_path.clone())));
+
+    // 5-minute reporter.
     {
+        let dif = dif.clone();
         let m = metrics.clone();
+        let dif_path_5m = dif_path.clone();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(30));
-            ticker.tick().await;
-            let mut tick_count: u64 = 0;
-            let mut snap_sim_ok: u64 = 0;
-            let mut snap_sim_rev: u64 = 0;
+            let mut ticker = tokio::time::interval(Duration::from_secs(300));
+            ticker.tick().await; // skip first immediate tick
             loop {
                 ticker.tick().await;
-                tick_count += 1;
-                let recv       = m.received.load(Relaxed);
-                let skip_h     = m.skipped_hops.load(Relaxed);
-                let skip_fam   = m.skipped_same_family.load(Relaxed);
-                let skip_amt   = m.skipped_amount.load(Relaxed);
-                let skip_bldr  = m.skipped_no_builder.load(Relaxed);
-                let skip_sz    = m.skipped_tx_too_large.load(Relaxed);
-                let sim_ok     = m.sim_ok.load(Relaxed);
-                let sim_rev    = m.sim_revert.load(Relaxed);
-                let sim_mis    = m.sim_mismatch.load(Relaxed);
-                let d_count    = m.delta_count.load(Relaxed);
-                let d_sum      = m.sum_delta_abs.load(Relaxed);
-                let avg_delta  = if d_count > 0 { d_sum / d_count as i64 } else { 0 };
-                let rest       = m.jito_rest_sent.load(Relaxed);
-                let grpc       = m.jito_grpc_sent.load(Relaxed);
-                let rl         = m.jito_rate_limited.load(Relaxed);
-                let jerr       = m.jito_error.load(Relaxed);
-                eprintln!(
-                    "[no_metis] recv={recv} skip_hops={skip_h} same_family={skip_fam} \
-skip_amt={skip_amt} no_builder={skip_bldr} tx_large={skip_sz} | \
-sim_ok={sim_ok} revert={sim_rev} mismatch={sim_mis} avg_delta={avg_delta}L | \
-rest_sent={rest} grpc_sent={grpc} rate_lim={rl} jito_err={jerr}"
-                );
-                // Every 2 ticks = 60 s: print per-minute simulation rate.
-                if tick_count % 2 == 0 {
-                    let ok_delta  = sim_ok.saturating_sub(snap_sim_ok);
-                    let rev_delta = sim_rev.saturating_sub(snap_sim_rev);
-                    snap_sim_ok  = sim_ok;
-                    snap_sim_rev = sim_rev;
-                    eprintln!(
-                        "[no_metis_1m] sim_ok/min={ok_delta} sim_revert/min={rev_delta} \
-total_sim={}",
-                        sim_ok + sim_rev
-                    );
+                let (report, ok, rev) = {
+                    let mut acc = match dif.lock() { Ok(a) => a, Err(_) => continue };
+                    let ok = m.sim_ok.load(Relaxed);
+                    let rev = m.sim_revert.load(Relaxed);
+                    (acc.flush_five_min(), ok, rev)
+                };
+                if report.is_empty() {
+                    eprintln!("[dif_5m] no sims in last 5 min (total ok={ok} revert={rev})");
+                    continue;
+                }
+                // Terminal: summary line
+                let first_two: Vec<&str> = report.lines().take(4).collect();
+                for ln in &first_two { eprintln!("{ln}"); }
+                // File: full report
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true).open(&dif_path_5m)
+                {
+                    let _ = f.write_all(report.as_bytes());
+                    let _ = writeln!(f);
+                }
+            }
+        });
+    }
+
+    // 1-hour reporter.
+    {
+        let dif = dif.clone();
+        let dif_path_1h = dif_path.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(3600));
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let summary = {
+                    let mut acc = match dif.lock() { Ok(a) => a, Err(_) => continue };
+                    let s = acc.hour_summary();
+                    acc.reset_hour();
+                    s
+                };
+                if summary.is_empty() { continue; }
+                // Terminal: full summary
+                for ln in summary.lines() { eprintln!("{ln}"); }
+                // File: append
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true).open(&dif_path_1h)
+                {
+                    let _ = f.write_all(summary.as_bytes());
+                    let _ = writeln!(f);
                 }
             }
         });
@@ -528,12 +840,8 @@ total_sim={}",
     tokio::spawn(async move {
         eprintln!(
             "[no_metis_executor] started — litesvm={has_litesvm} dry_run={} tip={}L \
-max_amount={}L match_threshold=±{}L final_min_out={}L",
-            ctx.cfg.dry_run,
-            ctx.cfg.tip_lamports,
-            ctx.cfg.max_amount_lamports,
-            ctx.cfg.match_threshold_lamports,
-            ctx.cfg.final_min_out_lamports,
+max_amount={}L dif={}",
+            ctx.cfg.dry_run, ctx.cfg.tip_lamports, ctx.cfg.max_amount_lamports, dif_path,
         );
 
         let mut hit_serial: u64 = 0;
@@ -542,8 +850,9 @@ max_amount={}L match_threshold=±{}L final_min_out={}L",
             m.received.fetch_add(1, Relaxed);
             let ctx = ctx.clone();
             let m = m.clone();
+            let dif = dif.clone();
             let serial = hit_serial;
-            tokio::spawn(async move { process_hit(hit, ctx, m, serial).await });
+            tokio::spawn(async move { process_hit(hit, ctx, m, serial, dif).await });
         }
 
         eprintln!("[no_metis_executor] channel closed — exiting");

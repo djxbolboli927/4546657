@@ -56,6 +56,13 @@ pub struct SimOutcome {
     pub wsol_after: u64,
 }
 
+/// Output of a per-hop simulation (single swap instruction).
+pub struct HopSimOutcome {
+    pub compute_units: u64,
+    /// Balance of the output token ATA after the hop executes.
+    pub out_balance: u64,
+}
+
 /// Result of a no-gate simulation (simulate_native).
 pub struct NativeSimResult {
     pub wsol_before: u64,
@@ -380,6 +387,67 @@ impl Simulator {
             }
         }
     }
+
+    /// Simulate a single swap instruction with explicit account overrides.
+    /// Overrides are applied on top of the Yellowstone cache but are NOT
+    /// written back to the cache, so concurrent simulations are unaffected.
+    /// Use for per-hop diagnostic simulation with injected input/output ATAs.
+    pub fn simulate_hop(
+        &self,
+        tx: &VersionedTransaction,
+        cache: &AccountCache,
+        overrides: &std::collections::HashMap<Pubkey, solana_account::Account>,
+        output_ata: Pubkey,
+    ) -> Result<HopSimOutcome> {
+        let accounts = collect_tx_accounts(tx, &[]);
+
+        let mut svm = self.svm.lock().unwrap();
+
+        let live_slot = self.current_slot.load(Ordering::Relaxed);
+        svm.warp_to_slot(live_slot);
+        {
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let mut clock = svm.get_sysvar::<LsClock>();
+            clock.unix_timestamp = now_unix;
+            svm.set_sysvar(&clock);
+        }
+
+        for pk in &accounts {
+            let acct = overrides.get(pk).cloned().or_else(|| cache.get(pk));
+            if let Some(acct) = acct {
+                if acct.executable() { continue; }
+                let _ = svm.set_account(pk_to_addr(*pk), acct);
+            }
+        }
+
+        let litesvm_tx = to_litesvm_tx(tx)?;
+
+        match svm.simulate_transaction(litesvm_tx) {
+            Ok(info) => {
+                let out_addr = pk_to_addr(output_ata);
+                let out_balance = info.post_accounts.iter()
+                    .find(|(addr, _)| *addr == out_addr)
+                    .and_then(|(_, acc)| parse_token_amount(acc.data()))
+                    .unwrap_or(0);
+                Ok(HopSimOutcome {
+                    compute_units: info.meta.compute_units_consumed,
+                    out_balance,
+                })
+            }
+            Err(meta) => {
+                let logs = &meta.meta.logs;
+                let excerpt = if logs.len() <= 6 {
+                    logs.join(" | ")
+                } else {
+                    logs[logs.len() - 6..].join(" | ")
+                };
+                anyhow::bail!("sim reverted: err={:?} logs=[{}]", meta.err, excerpt)
+            }
+        }
+    }
 }
 
 /// Read the SPL Token amount field from raw account data.
@@ -474,6 +542,17 @@ impl SimulatorPool {
         cache: &AccountCache,
     ) -> Result<NativeSimResult> {
         self.acquire().simulate_native(tx, cache)
+    }
+
+    /// Run simulate_hop on a round-robin simulator.
+    pub fn simulate_hop(
+        &self,
+        tx: &VersionedTransaction,
+        cache: &AccountCache,
+        overrides: &std::collections::HashMap<Pubkey, solana_account::Account>,
+        output_ata: Pubkey,
+    ) -> Result<HopSimOutcome> {
+        self.acquire().simulate_hop(tx, cache, overrides, output_ata)
     }
 }
 
