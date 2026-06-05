@@ -237,6 +237,7 @@ async fn run_cycle(
     jup_cfg: &JupiterPriceConfig,
     max_log: usize,
     debug: bool,
+    verbose: bool,
 ) {
     // ── 1. Collect live pools — CP pools from vaults, DAMM v2 from pool account ─
     let mut live: Vec<LivePool> = Vec::new();
@@ -454,11 +455,13 @@ async fn run_cycle(
     }
 
     if live.is_empty() {
-        eprintln!(
-            "[validator] waiting for state — subscribed_pools={} live=0 skipped_unsupported={}",
-            pairs.len(),
-            skipped_dex
-        );
+        if verbose {
+            eprintln!(
+                "[validator] waiting for state — subscribed_pools={} live=0 skipped_unsupported={}",
+                pairs.len(),
+                skipped_dex
+            );
+        }
         return;
     }
 
@@ -547,33 +550,35 @@ spot_atomic={sa:.8} local={lo:.8} jup_ratio={jp:.8} diff={d:.1}bps slot={sl}",
     let pump_live = live.iter().filter(|d| d.engine == Engine::PumpSwap).count();
     let dlmm_live = live.iter().filter(|d| d.engine == Engine::MeteoraDlmm).count();
     let cp_live = live.len() - dmm_live - wpool_live - rclmm_live - pump_live - dlmm_live;
-    eprintln!(
-        "[validator] pools_live={live} (cp={cp} damm_v2={dmm} whirlpool={wp} ray_clmm={rc} pumpswap={ps} dlmm={dl}) \
+    if verbose {
+        eprintln!(
+            "[validator] pools_live={live} (cp={cp} damm_v2={dmm} whirlpool={wp} ray_clmm={rc} pumpswap={ps} dlmm={dl}) \
 compared={ok} skipped_unsupported={skip} no_jup={nj} no_decimals={nd} \
 avg={avg:.1}bps max={max:.1}bps min={min:.1}bps stale_2m={stale_2m}",
-        live = live.len(),
-        cp = cp_live,
-        dmm = dmm_live,
-        wp = wpool_live,
-        rc = rclmm_live,
-        ps = pump_live,
-        dl = dlmm_live,
-        ok = diffs.len(),
-        skip = skipped_dex,
-        nj = no_jup,
-        nd = no_dec,
-        avg = avg,
-        max = max,
-        min = min,
-    );
-    // Individual pool lines: only in VALIDATOR_DEBUG=1 mode or when max_pools_log > 0.
-    if debug {
-        for (_, line) in diffs.iter() {
-            eprintln!("[validator]   {line}");
-        }
-    } else if max_log > 0 {
-        for (_, line) in diffs.iter().take(max_log) {
-            eprintln!("[validator]   {line}");
+            live = live.len(),
+            cp = cp_live,
+            dmm = dmm_live,
+            wp = wpool_live,
+            rc = rclmm_live,
+            ps = pump_live,
+            dl = dlmm_live,
+            ok = diffs.len(),
+            skip = skipped_dex,
+            nj = no_jup,
+            nd = no_dec,
+            avg = avg,
+            max = max,
+            min = min,
+        );
+        // Individual pool lines: only in VALIDATOR_DEBUG=1 mode or when max_pools_log > 0.
+        if debug {
+            for (_, line) in diffs.iter() {
+                eprintln!("[validator]   {line}");
+            }
+        } else if max_log > 0 {
+            for (_, line) in diffs.iter().take(max_log) {
+                eprintln!("[validator]   {line}");
+            }
         }
     }
 }
@@ -590,12 +595,14 @@ pub fn spawn_validator(
     let debug = std::env::var("VALIDATOR_DEBUG")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
+    // Set VERBOSE_STATS=1 to re-enable [validator] per-cycle summary lines.
+    let verbose = std::env::var("VERBOSE_STATS").map(|v| v == "1").unwrap_or(false);
 
     let total_pairs = pairs.len();
     eprintln!(
         "[validator] started — {total_pairs} pool pairs \
 (Raydium AMM v4/CPMM/CLMM, Meteora DAMM v2/DLMM, Orca Whirlpool, PumpSwap), \
-interval={s}s, max_log={m}, debug={debug}",
+interval={s}s, max_log={m}, debug={debug} (set VERBOSE_STATS=1 to show cycle stats)",
         s = val_cfg.interval_secs,
         m = val_cfg.max_pools_log,
     );
@@ -620,6 +627,7 @@ interval={s}s, max_log={m}, debug={debug}",
                 &jup_cfg,
                 val_cfg.max_pools_log,
                 debug,
+                verbose,
             )
             .await;
             tokio::time::sleep(wait).await;

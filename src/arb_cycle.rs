@@ -1015,6 +1015,8 @@ pub fn spawn_cycle_scanner(
     let metrics = Arc::new(CycleMetrics::default());
     let pairs = Arc::new(pairs);
     let hit_tx = Arc::new(hit_tx);
+    // Set VERBOSE_STATS=1 to re-enable [cycle] per-scan log lines.
+    let verbose = std::env::var("VERBOSE_STATS").map(|v| v == "1").unwrap_or(false);
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
@@ -1057,7 +1059,7 @@ pub fn spawn_cycle_scanner(
             };
 
             if edge_count == 0 {
-                eprintln!("[cycle] no live edges yet (live_pools={live_pools})");
+                if verbose { eprintln!("[cycle] no live edges yet (live_pools={live_pools})"); }
                 continue;
             }
 
@@ -1087,45 +1089,47 @@ pub fn spawn_cycle_scanner(
                 }
             }
 
-            eprintln!(
-                "[cycle] scan={scans} live_pools={live_pools} edges={edge_count} \
-hits(gross+)={gross_pos} hits(net+)={net_pos} best_gross={} best_net={}",
-                hits.first().map(|h| h.profit_gross).unwrap_or(0),
-                hits.first().map(|h| h.profit_net).unwrap_or(0),
-            );
-
-            // Print top hits.
-            for (rank, hit) in hits.iter().take(max_log).enumerate() {
-                let path: Vec<String> = hit
-                    .pools
-                    .iter()
-                    .zip(hit.dex_names.iter())
-                    .map(|(p, d)| format!("{d}:{}", &p.to_string()[..8]))
-                    .collect();
-                let mints: Vec<String> = hit
-                    .intermediate_mints
-                    .iter()
-                    .map(|m| m.to_string()[..8].to_string())
-                    .collect();
-                let opt_tag = if hit.optimized {
-                    if let Some(seed) = hit.coarse_seed_amount {
-                        format!(" opt=1 seed={:.4}SOL", seed as f64 / 1e9)
-                    } else {
-                        " opt=1".to_string()
-                    }
-                } else {
-                    String::new()
-                };
+            if verbose {
                 eprintln!(
-                    "[cycle]   #{rank} {}-hop{opt_tag}  in={:.4}SOL gross={:+}L net={:+}L  \
-path=[{}]  via=[{}]",
-                    hit.hops(),
-                    hit.amount_in as f64 / 1e9,
-                    hit.profit_gross as i64,
-                    hit.profit_net,
-                    path.join("→"),
-                    if mints.is_empty() { "direct".to_string() } else { mints.join("→") },
+                    "[cycle] scan={scans} live_pools={live_pools} edges={edge_count} \
+hits(gross+)={gross_pos} hits(net+)={net_pos} best_gross={} best_net={}",
+                    hits.first().map(|h| h.profit_gross).unwrap_or(0),
+                    hits.first().map(|h| h.profit_net).unwrap_or(0),
                 );
+
+                // Print top hits.
+                for (rank, hit) in hits.iter().take(max_log).enumerate() {
+                    let path: Vec<String> = hit
+                        .pools
+                        .iter()
+                        .zip(hit.dex_names.iter())
+                        .map(|(p, d)| format!("{d}:{}", &p.to_string()[..8]))
+                        .collect();
+                    let mints: Vec<String> = hit
+                        .intermediate_mints
+                        .iter()
+                        .map(|m| m.to_string()[..8].to_string())
+                        .collect();
+                    let opt_tag = if hit.optimized {
+                        if let Some(seed) = hit.coarse_seed_amount {
+                            format!(" opt=1 seed={:.4}SOL", seed as f64 / 1e9)
+                        } else {
+                            " opt=1".to_string()
+                        }
+                    } else {
+                        String::new()
+                    };
+                    eprintln!(
+                        "[cycle]   #{rank} {}-hop{opt_tag}  in={:.4}SOL gross={:+}L net={:+}L  \
+path=[{}]  via=[{}]",
+                        hit.hops(),
+                        hit.amount_in as f64 / 1e9,
+                        hit.profit_gross as i64,
+                        hit.profit_net,
+                        path.join("→"),
+                        if mints.is_empty() { "direct".to_string() } else { mints.join("→") },
+                    );
+                }
             }
 
             // Forward all net-positive hits to the executor or validator (non-blocking).
@@ -1136,14 +1140,16 @@ path=[{}]  via=[{}]",
             }
 
             // Summary stats.
-            let total_gross = metrics.gross_positive.load(Ordering::Relaxed);
-            let total_net = metrics.net_positive.load(Ordering::Relaxed);
-            let best_gross_ever = metrics.best_gross_lamports.load(Ordering::Relaxed);
-            let best_net_ever = metrics.best_net_lamports.load(Ordering::Relaxed);
-            eprintln!(
-                "[cycle] cumulative: scans={scans} gross+={total_gross} net+={total_net} \
+            if verbose {
+                let total_gross = metrics.gross_positive.load(Ordering::Relaxed);
+                let total_net = metrics.net_positive.load(Ordering::Relaxed);
+                let best_gross_ever = metrics.best_gross_lamports.load(Ordering::Relaxed);
+                let best_net_ever = metrics.best_net_lamports.load(Ordering::Relaxed);
+                eprintln!(
+                    "[cycle] cumulative: scans={scans} gross+={total_gross} net+={total_net} \
 best_gross_ever={best_gross_ever}L best_net_ever={best_net_ever}L"
-            );
+                );
+            }
         }
     });
 }

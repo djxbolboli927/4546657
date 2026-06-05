@@ -47,6 +47,10 @@ use tracing::{debug, info, warn};
 use crate::account_cache::AccountCache;
 use crate::metrics::Metrics;
 
+// Alias to disambiguate the litesvm Clock (solana-clock 3.x) from the
+// solana-sdk 2.x Clock that lives in scope via solana_sdk imports.
+use solana_clock::Clock as LsClock;
+
 pub struct SimOutcome {
     pub compute_units: u64,
     pub wsol_after: u64,
@@ -197,9 +201,22 @@ impl Simulator {
 
         let mut svm = self.svm.lock().unwrap();
 
-        // Advance the SVM clock to the live Yellowstone slot.
+        // Advance the SVM clock to the live Yellowstone slot and real unix time.
+        // warp_to_slot only updates clock.slot; programs like Orca Whirlpool
+        // check clock.unix_timestamp > pool.last_updated_timestamp, so we must
+        // also set unix_timestamp to the current wall-clock time or they revert
+        // with InvalidTimestamp (error 6022).
         let live_slot = self.current_slot.load(Ordering::Relaxed);
         svm.warp_to_slot(live_slot);
+        {
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let mut clock = svm.get_sysvar::<LsClock>();
+            clock.unix_timestamp = now_unix;
+            svm.set_sysvar(&clock);
+        }
 
         // Inject ALT raw accounts so the SVM can expand v0 address lookups.
         for alt in alts {
@@ -308,6 +325,15 @@ impl Simulator {
 
         let live_slot = self.current_slot.load(Ordering::Relaxed);
         svm.warp_to_slot(live_slot);
+        {
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let mut clock = svm.get_sysvar::<LsClock>();
+            clock.unix_timestamp = now_unix;
+            svm.set_sysvar(&clock);
+        }
 
         for pk in &accounts {
             if let Some(acct) = cache.get(pk) {

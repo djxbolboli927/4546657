@@ -79,6 +79,9 @@ solana-account = "3.2.0"
 # conversion adapters at the solana-sdk 2.x / litesvm 3.x type boundary.
 solana-address = "2"
 solana-transaction = "3"
+# Clock sysvar for litesvm — matches litesvm's own pin so set_sysvar::<Clock>()
+# uses the same type. Required to set unix_timestamp before each simulation.
+solana-clock = "3.0"
 dashmap = "6"
 
 # Yellowstone gRPC — live account-state stream (feeds sim cache, same source as Metis).
