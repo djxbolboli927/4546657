@@ -186,6 +186,9 @@ strict_dex_filter = true
 require_ammkey_match = true
 
 [arb_test.no_metis]
+# dry_run=true: شبیه‌سازی انجام می‌شود ولی هیچ تراکنشی به Jito ارسال نمی‌شود.
+# هر CycleHit (۲-هاپ و ۳-هاپ) شبیه‌سازی می‌شود و نتیجه در /root/c/dif ذخیره می‌شود.
+dry_run = true
 # Jito tip per bundle (lamports). Large enough to incentivize landing.
 tip_lamports = 100000
 # Safety cap: only send cycles where amount_in <= this value (1 million lamports = 0.001 SOL).
