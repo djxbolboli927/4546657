@@ -4,11 +4,14 @@
 //! array / oracle PDAs, and returns a ready-to-sign `Instruction`.
 //!
 //! Supported DEXes:
-//!   • Raydium CLMM   (swap_v2 — Token-2022 compatible)
-//!   • Orca Whirlpool (swap)
+//!   • Raydium CLMM      (swap_v2 — Token-2022 compatible)
+//!   • Raydium CPMM      (swap_base_input)
+//!   • Orca Whirlpool    (swap)
+//!   • Meteora DAMM v2   (swap — cp-amm)
+//!   • Meteora DLMM      (swap — bin-based, remaining_accounts = BinArrays)
+//!   • Raydium AMM v4    (SwapBaseIn — requires Serum market in store)
 //!
-//! Unsupported DEXes return `Err(NativeIxError::UnsupportedDex)` so the
-//! no-metis executor can log and skip rather than panic.
+//! Unsupported DEXes return `Err` so the no-metis executor can log and skip.
 
 use anyhow::{bail, Result};
 use solana_sdk::{
@@ -32,6 +35,18 @@ pub const ORCA_WHIRLPOOL_PROGRAM: Pubkey =
     Pubkey::from_str_const("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc");
 pub const RAYDIUM_CPMM_PROGRAM: Pubkey =
     Pubkey::from_str_const("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C");
+pub const RAYDIUM_AMM_V4_PROGRAM: Pubkey =
+    Pubkey::from_str_const("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
+pub const METEORA_DAMM_V2_PROGRAM: Pubkey =
+    Pubkey::from_str_const("cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG");
+pub const METEORA_DLMM_PROGRAM: Pubkey =
+    Pubkey::from_str_const("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
+pub const PUMPSWAP_PROGRAM: Pubkey =
+    Pubkey::from_str_const("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
+pub const SYSTEM_PROGRAM: Pubkey =
+    Pubkey::from_str_const("11111111111111111111111111111111");
+pub const ASSOCIATED_TOKEN_PROGRAM: Pubkey =
+    Pubkey::from_str_const("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bRS");
 
 // ── Anchor discriminator helper ───────────────────────────────────────────────
 
@@ -437,6 +452,516 @@ pub fn build_raydium_cpmm(
     })
 }
 
+// ── Raydium AMM V4 layout ─────────────────────────────────────────────────────
+//
+// AmmInfo (no Anchor discriminator, raw LE layout):
+//   [0..128]   header fields (status, nonce, decimals, flags, …)
+//   [128..192] Fees (64 bytes)
+//   [192..320] OutPutData (128 bytes)
+//   [320..352] token_coin  (coin vault Pubkey)
+//   [352..384] token_pc    (pc vault Pubkey)
+//   [384..416] coin_mint_address
+//   [416..448] pc_mint_address
+//   [448..480] lp_mint_address
+//   [480..512] open_orders  (Serum open-orders account)
+//   [512..544] market       (Serum market)
+//   [544..576] serum_dex    (Serum program id)
+//
+// Serum/OpenBook market layout (5-byte prefix + raw fields):
+//   [5..13]   accountFlags (u64)
+//   [13..45]  ownAddress   (Pubkey)
+//   [45..53]  vaultSignerNonce (u64)
+//   [53..85]  baseMint     (Pubkey)
+//   [85..117] quoteMint    (Pubkey)
+//   [117..149] baseVault   (Pubkey)  — serum coin vault
+//   [165..197] quoteVault  (Pubkey)  — serum pc vault
+//   [253..285] eventQueue  (Pubkey)
+//   [285..317] bids        (Pubkey)
+//   [317..349] asks        (Pubkey)
+
+const AMM_V4_COIN_VAULT_OFF: usize = 320;
+const AMM_V4_PC_VAULT_OFF: usize = 352;
+const AMM_V4_OPEN_ORDERS_OFF: usize = 480;
+const AMM_V4_MARKET_OFF: usize = 512;
+const AMM_V4_SERUM_DEX_OFF: usize = 544;
+const AMM_V4_MIN_LEN: usize = 576;
+
+const SERUM_VAULT_SIGNER_NONCE_OFF: usize = 45;
+const SERUM_COIN_VAULT_OFF: usize = 117;
+const SERUM_PC_VAULT_OFF: usize = 165;
+const SERUM_EVENT_QUEUE_OFF: usize = 253;
+const SERUM_BIDS_OFF: usize = 285;
+const SERUM_ASKS_OFF: usize = 317;
+const SERUM_MARKET_MIN_LEN: usize = 349;
+
+/// Build a Raydium AMM V4 `SwapBaseIn` (instruction id = 9) instruction.
+///
+/// Requires both the pool account AND the Serum market account to be present
+/// in the store (both are subscribed via mix.json for AMM V4 pools).
+pub fn build_raydium_amm_v4(
+    pool: &Pubkey,
+    user: &Pubkey,
+    mint_in: &Pubkey,
+    mint_out: &Pubkey,
+    amount_in: u64,
+    min_out: u64,
+    store: &PoolStateStore,
+) -> Result<Instruction> {
+    let pool_data = store
+        .accounts
+        .get(pool)
+        .map(|r| r.data.clone())
+        .ok_or_else(|| anyhow::anyhow!("RaydiumAmmV4 pool {pool} not in store"))?;
+    if pool_data.len() < AMM_V4_MIN_LEN {
+        bail!("RaydiumAmmV4 pool {pool} data too short ({})", pool_data.len());
+    }
+
+    let read_pk = |off: usize| -> Pubkey {
+        Pubkey::from(<[u8; 32]>::try_from(&pool_data[off..off + 32]).unwrap())
+    };
+
+    let coin_vault = read_pk(AMM_V4_COIN_VAULT_OFF);
+    let pc_vault = read_pk(AMM_V4_PC_VAULT_OFF);
+    let open_orders = read_pk(AMM_V4_OPEN_ORDERS_OFF);
+    let market = read_pk(AMM_V4_MARKET_OFF);
+    let serum_dex = read_pk(AMM_V4_SERUM_DEX_OFF);
+
+    let user_source_ata = spl_associated_token_account::get_associated_token_address(user, mint_in);
+    let user_dest_ata = spl_associated_token_account::get_associated_token_address(user, mint_out);
+
+    // AMM authority is a program-level PDA shared across all AMM V4 pools.
+    let (amm_authority, _) = Pubkey::find_program_address(
+        &[b"amm authority"],
+        &RAYDIUM_AMM_V4_PROGRAM,
+    );
+
+    // Read the Serum market account to get bids/asks/event_queue/vaults/nonce.
+    let market_data = store
+        .accounts
+        .get(&market)
+        .map(|r| r.data.clone())
+        .ok_or_else(|| anyhow::anyhow!("RaydiumAmmV4: Serum market {market} not in store"))?;
+    if market_data.len() < SERUM_MARKET_MIN_LEN {
+        bail!("RaydiumAmmV4: Serum market {market} data too short ({})", market_data.len());
+    }
+
+    let read_market_pk = |off: usize| -> Pubkey {
+        Pubkey::from(<[u8; 32]>::try_from(&market_data[off..off + 32]).unwrap())
+    };
+    let read_u64_le = |off: usize| -> u64 {
+        u64::from_le_bytes(market_data[off..off + 8].try_into().unwrap())
+    };
+
+    let vault_signer_nonce = read_u64_le(SERUM_VAULT_SIGNER_NONCE_OFF);
+    let serum_coin_vault = read_market_pk(SERUM_COIN_VAULT_OFF);
+    let serum_pc_vault = read_market_pk(SERUM_PC_VAULT_OFF);
+    let serum_event_queue = read_market_pk(SERUM_EVENT_QUEUE_OFF);
+    let serum_bids = read_market_pk(SERUM_BIDS_OFF);
+    let serum_asks = read_market_pk(SERUM_ASKS_OFF);
+
+    let vault_signer = Pubkey::create_program_address(
+        &[market.as_ref(), &vault_signer_nonce.to_le_bytes()],
+        &serum_dex,
+    )
+    .map_err(|e| anyhow::anyhow!("RaydiumAmmV4: vault_signer derivation failed: {e:?}"))?;
+
+    // SwapBaseIn: instruction byte = 9, then amount_in (u64), min_out (u64).
+    let mut data = Vec::with_capacity(17);
+    data.push(9u8);
+    data.extend_from_slice(&amount_in.to_le_bytes());
+    data.extend_from_slice(&min_out.to_le_bytes());
+
+    let accounts = vec![
+        AccountMeta::new(*pool, false),                     // amm
+        AccountMeta::new_readonly(amm_authority, false),    // amm_authority
+        AccountMeta::new(open_orders, false),               // amm_open_orders
+        AccountMeta::new(coin_vault, false),                // amm_coin_vault
+        AccountMeta::new(pc_vault, false),                  // amm_pc_vault
+        AccountMeta::new_readonly(serum_dex, false),        // serum_program
+        AccountMeta::new(market, false),                    // serum_market
+        AccountMeta::new(serum_bids, false),                // serum_bids
+        AccountMeta::new(serum_asks, false),                // serum_asks
+        AccountMeta::new(serum_event_queue, false),         // serum_event_queue
+        AccountMeta::new(serum_coin_vault, false),          // serum_coin_vault
+        AccountMeta::new(serum_pc_vault, false),            // serum_pc_vault
+        AccountMeta::new_readonly(vault_signer, false),     // serum_vault_signer
+        AccountMeta::new(user_source_ata, false),           // user_source_token
+        AccountMeta::new(user_dest_ata, false),             // user_dest_token
+        AccountMeta::new_readonly(*user, true),             // user_owner (signer)
+        AccountMeta::new_readonly(SPL_TOKEN, false),        // token_program
+    ];
+
+    Ok(Instruction {
+        program_id: RAYDIUM_AMM_V4_PROGRAM,
+        accounts,
+        data,
+    })
+}
+
+// ── Meteora DAMM v2 layout ────────────────────────────────────────────────────
+//
+// Pool (cp-amm, Anchor, LE) key offsets:
+//   [168..200] token_a_mint  (Pubkey)
+//   [200..232] token_b_mint  (Pubkey)
+//   [232..264] token_a_vault (Pubkey)
+//   [264..296] token_b_vault (Pubkey)
+
+const DAMM_V2_TOKEN_A_MINT_OFF: usize = 168;
+const DAMM_V2_TOKEN_B_MINT_OFF: usize = 200;
+const DAMM_V2_TOKEN_A_VAULT_OFF: usize = 232;
+const DAMM_V2_TOKEN_B_VAULT_OFF: usize = 264;
+const DAMM_V2_MIN_LEN: usize = 296;
+
+/// Build a Meteora DAMM v2 (cp-amm) `swap` instruction.
+///
+/// Pool authority and event authority are program PDAs shared across all pools.
+/// The token programs are inferred from the vault account owners in the store
+/// (defaults to SPL Token if the vault isn't present yet).
+pub fn build_meteora_damm_v2(
+    pool: &Pubkey,
+    user: &Pubkey,
+    mint_in: &Pubkey,
+    mint_out: &Pubkey,
+    amount_in: u64,
+    min_out: u64,
+    store: &PoolStateStore,
+) -> Result<Instruction> {
+    let pool_data = store
+        .accounts
+        .get(pool)
+        .map(|r| r.data.clone())
+        .ok_or_else(|| anyhow::anyhow!("MeteoraDammV2 pool {pool} not in store"))?;
+    if pool_data.len() < DAMM_V2_MIN_LEN {
+        bail!("MeteoraDammV2 pool {pool} data too short ({})", pool_data.len());
+    }
+
+    let read_pk = |off: usize| -> Pubkey {
+        Pubkey::from(<[u8; 32]>::try_from(&pool_data[off..off + 32]).unwrap())
+    };
+
+    let token_a_mint = read_pk(DAMM_V2_TOKEN_A_MINT_OFF);
+    let token_b_mint = read_pk(DAMM_V2_TOKEN_B_MINT_OFF);
+    let token_a_vault = read_pk(DAMM_V2_TOKEN_A_VAULT_OFF);
+    let token_b_vault = read_pk(DAMM_V2_TOKEN_B_VAULT_OFF);
+
+    let a_to_b = *mint_in == token_a_mint;
+    let expected_out = if a_to_b { &token_b_mint } else { &token_a_mint };
+    if mint_out != expected_out {
+        bail!("MeteoraDammV2 {pool}: mint_out mismatch (expected {expected_out}, got {mint_out})");
+    }
+
+    // Infer token programs from vault owners (defaults to SPL Token).
+    let vault_token_program = |vault: &Pubkey| -> Pubkey {
+        store
+            .accounts
+            .get(vault)
+            .map(|r| if r.owner == TOKEN_2022 { TOKEN_2022 } else { SPL_TOKEN })
+            .unwrap_or(SPL_TOKEN)
+    };
+    let token_a_program = vault_token_program(&token_a_vault);
+    let token_b_program = vault_token_program(&token_b_vault);
+
+    let user_in_ata = spl_associated_token_account::get_associated_token_address(user, mint_in);
+    let user_out_ata = spl_associated_token_account::get_associated_token_address(user, mint_out);
+
+    let (pool_authority, _) = Pubkey::find_program_address(&[b"authority"], &METEORA_DAMM_V2_PROGRAM);
+    let (event_authority, _) =
+        Pubkey::find_program_address(&[b"__event_authority"], &METEORA_DAMM_V2_PROGRAM);
+
+    // When no referral: pass the output vault as the referral_token_account.
+    // It has the correct mint for whichever token the fee is collected in.
+    let referral_token_account = if a_to_b { token_b_vault } else { token_a_vault };
+
+    let disc = anchor_disc("swap");
+    let mut data = Vec::with_capacity(24);
+    data.extend_from_slice(&disc);
+    data.extend_from_slice(&amount_in.to_le_bytes());
+    data.extend_from_slice(&min_out.to_le_bytes());
+
+    let accounts = vec![
+        AccountMeta::new_readonly(pool_authority, false),       // pool_authority
+        AccountMeta::new(*pool, false),                         // pool (writable)
+        AccountMeta::new(user_in_ata, false),                   // input_token_account
+        AccountMeta::new(user_out_ata, false),                  // output_token_account
+        AccountMeta::new(token_a_vault, false),                 // token_a_vault
+        AccountMeta::new(token_b_vault, false),                 // token_b_vault
+        AccountMeta::new_readonly(token_a_mint, false),         // token_a_mint
+        AccountMeta::new_readonly(token_b_mint, false),         // token_b_mint
+        AccountMeta::new(*user, true),                          // payer (writable, signer)
+        AccountMeta::new_readonly(token_a_program, false),      // token_a_program
+        AccountMeta::new_readonly(token_b_program, false),      // token_b_program
+        AccountMeta::new(referral_token_account, false),        // referral_token_account
+        AccountMeta::new_readonly(event_authority, false),      // event_authority
+        AccountMeta::new_readonly(METEORA_DAMM_V2_PROGRAM, false), // program
+    ];
+
+    Ok(Instruction {
+        program_id: METEORA_DAMM_V2_PROGRAM,
+        accounts,
+        data,
+    })
+}
+
+// ── Meteora DLMM layout ───────────────────────────────────────────────────────
+//
+// LbPair (Anchor, LE) key offsets:
+//   [76..80]   active_id    (i32)
+//   [80..82]   bin_step     (u16)
+//   [88..120]  token_x_mint (Pubkey)
+//   [120..152] token_y_mint (Pubkey)
+//   [152..184] reserve_x    (Pubkey)
+//   [184..216] reserve_y    (Pubkey)
+//
+// Bin arrays are derived PDAs (seeds: ["bin_array", lb_pair, index_le8]).
+// Active bin array index = active_id.div_euclid(70).
+
+const DLMM_ACTIVE_ID_OFF: usize = 76;
+const DLMM_BIN_STEP_OFF: usize = 80;
+const DLMM_TOKEN_X_MINT_OFF: usize = 88;
+const DLMM_TOKEN_Y_MINT_OFF: usize = 120;
+const DLMM_RESERVE_X_OFF: usize = 152;
+const DLMM_RESERVE_Y_OFF: usize = 184;
+const DLMM_MIN_LEN: usize = 216;
+const DLMM_BINS_PER_ARRAY: i32 = 70;
+
+fn dlmm_bin_array_pda(lb_pair: &Pubkey, index: i32) -> Pubkey {
+    let idx_le = (index as i64).to_le_bytes();
+    Pubkey::find_program_address(
+        &[b"bin_array", lb_pair.as_ref(), &idx_le],
+        &METEORA_DLMM_PROGRAM,
+    )
+    .0
+}
+
+/// Build a Meteora DLMM `swap` instruction.
+///
+/// BinArray accounts are appended as remaining_accounts. We include the active
+/// bin array plus two adjacent arrays in the swap direction to cover price
+/// movement. Any missing bin arrays fall through to the RPC fallback in the
+/// calibrator (they are derived PDAs that are typically subscribed in mix.json).
+pub fn build_meteora_dlmm(
+    pool: &Pubkey,
+    user: &Pubkey,
+    mint_in: &Pubkey,
+    mint_out: &Pubkey,
+    amount_in: u64,
+    min_out: u64,
+    store: &PoolStateStore,
+) -> Result<Instruction> {
+    let pool_data = store
+        .accounts
+        .get(pool)
+        .map(|r| r.data.clone())
+        .ok_or_else(|| anyhow::anyhow!("MeteoraDlmm pool {pool} not in store"))?;
+    if pool_data.len() < DLMM_MIN_LEN {
+        bail!("MeteoraDlmm pool {pool} data too short ({})", pool_data.len());
+    }
+
+    let read_pk = |off: usize| -> Pubkey {
+        Pubkey::from(<[u8; 32]>::try_from(&pool_data[off..off + 32]).unwrap())
+    };
+    let active_id = i32::from_le_bytes(pool_data[DLMM_ACTIVE_ID_OFF..DLMM_ACTIVE_ID_OFF + 4].try_into()?);
+    let token_x_mint = read_pk(DLMM_TOKEN_X_MINT_OFF);
+    let token_y_mint = read_pk(DLMM_TOKEN_Y_MINT_OFF);
+    let reserve_x = read_pk(DLMM_RESERVE_X_OFF);
+    let reserve_y = read_pk(DLMM_RESERVE_Y_OFF);
+
+    let swap_for_y = *mint_in == token_x_mint;
+    let expected_out = if swap_for_y { &token_y_mint } else { &token_x_mint };
+    if mint_out != expected_out {
+        bail!("MeteoraDlmm {pool}: mint_out mismatch (expected {expected_out}, got {mint_out})");
+    }
+
+    let user_in_ata = spl_associated_token_account::get_associated_token_address(user, mint_in);
+    let user_out_ata = spl_associated_token_account::get_associated_token_address(user, mint_out);
+
+    let (oracle, _) = Pubkey::find_program_address(
+        &[b"oracle", pool.as_ref()],
+        &METEORA_DLMM_PROGRAM,
+    );
+    let (bitmap_extension, _) = Pubkey::find_program_address(
+        &[b"bitmap_extension", pool.as_ref()],
+        &METEORA_DLMM_PROGRAM,
+    );
+    let (event_authority, _) =
+        Pubkey::find_program_address(&[b"__event_authority"], &METEORA_DLMM_PROGRAM);
+
+    // Infer token programs from reserve account owners.
+    let reserve_token_program = |reserve: &Pubkey| -> Pubkey {
+        store
+            .accounts
+            .get(reserve)
+            .map(|r| if r.owner == TOKEN_2022 { TOKEN_2022 } else { SPL_TOKEN })
+            .unwrap_or(SPL_TOKEN)
+    };
+    let token_x_program = reserve_token_program(&reserve_x);
+    let token_y_program = reserve_token_program(&reserve_y);
+
+    // Bin arrays: active + 2 in the swap direction.
+    let active_index = active_id.div_euclid(DLMM_BINS_PER_ARRAY);
+    let (i1, i2, i3) = if swap_for_y {
+        (active_index, active_index - 1, active_index - 2)
+    } else {
+        (active_index, active_index + 1, active_index + 2)
+    };
+    let ba0 = dlmm_bin_array_pda(pool, i1);
+    let ba1 = dlmm_bin_array_pda(pool, i2);
+    let ba2 = dlmm_bin_array_pda(pool, i3);
+
+    // host_fee_in: use the input reserve so the fee stays in-protocol.
+    let host_fee_in = if swap_for_y { reserve_x } else { reserve_y };
+
+    let disc = anchor_disc("swap");
+    let mut data = Vec::with_capacity(24);
+    data.extend_from_slice(&disc);
+    data.extend_from_slice(&amount_in.to_le_bytes());
+    data.extend_from_slice(&min_out.to_le_bytes());
+
+    let mut accounts = vec![
+        AccountMeta::new(*pool, false),                           // lb_pair (writable)
+        AccountMeta::new_readonly(bitmap_extension, false),       // bin_array_bitmap_extension
+        AccountMeta::new(reserve_x, false),                       // reserve_x (writable)
+        AccountMeta::new(reserve_y, false),                       // reserve_y (writable)
+        AccountMeta::new(user_in_ata, false),                     // user_token_in
+        AccountMeta::new(user_out_ata, false),                    // user_token_out
+        AccountMeta::new_readonly(token_x_mint, false),           // token_x_mint
+        AccountMeta::new_readonly(token_y_mint, false),           // token_y_mint
+        AccountMeta::new(oracle, false),                          // oracle (writable)
+        AccountMeta::new(host_fee_in, false),                     // host_fee_in
+        AccountMeta::new_readonly(*user, true),                   // user (signer)
+        AccountMeta::new_readonly(token_x_program, false),        // token_x_program
+        AccountMeta::new_readonly(token_y_program, false),        // token_y_program
+        AccountMeta::new_readonly(event_authority, false),        // event_authority
+        AccountMeta::new_readonly(METEORA_DLMM_PROGRAM, false),   // program
+        // Remaining accounts: bin arrays
+        AccountMeta::new(ba0, false),
+        AccountMeta::new(ba1, false),
+        AccountMeta::new(ba2, false),
+    ];
+
+    Ok(Instruction {
+        program_id: METEORA_DLMM_PROGRAM,
+        accounts,
+        data,
+    })
+}
+
+// ── PumpSwap layout ───────────────────────────────────────────────────────────
+//
+// Pool (Anchor, LE) key offsets (from pumpswap.rs):
+//   [43..75]   base_mint  (Pubkey)
+//   [75..107]  quote_mint (Pubkey)
+//   [139..171] base_vault (Pubkey)
+//   [171..203] quote_vault (Pubkey)
+//
+// GlobalConfig (Anchor, LE) — first protocol_fee_recipient at offset 64.
+// The global_config PDA is ["global_config"] with PumpSwap program.
+
+const PUMPSWAP_BASE_MINT_OFF: usize = 43;
+const PUMPSWAP_QUOTE_MINT_OFF: usize = 75;
+const PUMPSWAP_BASE_VAULT_OFF: usize = 139;
+const PUMPSWAP_QUOTE_VAULT_OFF: usize = 171;
+const PUMPSWAP_POOL_MIN_LEN: usize = 203;
+const PUMPSWAP_GLOBAL_CONFIG_FEE_RECIPIENT_OFF: usize = 64; // first pubkey after admin
+
+/// Build a PumpSwap `buy` or `sell` instruction depending on swap direction.
+///
+/// Requires the `global_config` PDA to be in the store so the fee recipient
+/// can be read. If not in the store this returns Err (will log as no_builder).
+pub fn build_pumpswap(
+    pool: &Pubkey,
+    user: &Pubkey,
+    mint_in: &Pubkey,
+    mint_out: &Pubkey,
+    amount_in: u64,
+    min_out: u64,
+    store: &PoolStateStore,
+) -> Result<Instruction> {
+    let pool_data = store
+        .accounts
+        .get(pool)
+        .map(|r| r.data.clone())
+        .ok_or_else(|| anyhow::anyhow!("PumpSwap pool {pool} not in store"))?;
+    if pool_data.len() < PUMPSWAP_POOL_MIN_LEN {
+        bail!("PumpSwap pool {pool} data too short ({})", pool_data.len());
+    }
+
+    let read_pk = |off: usize| -> Pubkey {
+        Pubkey::from(<[u8; 32]>::try_from(&pool_data[off..off + 32]).unwrap())
+    };
+
+    let base_mint = read_pk(PUMPSWAP_BASE_MINT_OFF);
+    let quote_mint = read_pk(PUMPSWAP_QUOTE_MINT_OFF);
+    let base_vault = read_pk(PUMPSWAP_BASE_VAULT_OFF);
+    let quote_vault = read_pk(PUMPSWAP_QUOTE_VAULT_OFF);
+
+    // Validate mints.
+    let is_buy = *mint_in == quote_mint && *mint_out == base_mint;
+    let is_sell = *mint_in == base_mint && *mint_out == quote_mint;
+    if !is_buy && !is_sell {
+        bail!("PumpSwap {pool}: mint mismatch (in={mint_in} out={mint_out} base={base_mint} quote={quote_mint})");
+    }
+
+    // Read global_config to get the fee recipient address.
+    let (global_config, _) = Pubkey::find_program_address(&[b"global_config"], &PUMPSWAP_PROGRAM);
+    let gc_data = store
+        .accounts
+        .get(&global_config)
+        .map(|r| r.data.clone())
+        .ok_or_else(|| anyhow::anyhow!("PumpSwap global_config not in store — cannot build swap"))?;
+    if gc_data.len() < PUMPSWAP_GLOBAL_CONFIG_FEE_RECIPIENT_OFF + 32 {
+        bail!("PumpSwap global_config data too short ({})", gc_data.len());
+    }
+    let fee_recipient = Pubkey::from(
+        <[u8; 32]>::try_from(
+            &gc_data[PUMPSWAP_GLOBAL_CONFIG_FEE_RECIPIENT_OFF
+                ..PUMPSWAP_GLOBAL_CONFIG_FEE_RECIPIENT_OFF + 32],
+        )
+        .unwrap(),
+    );
+
+    let user_base_ata = spl_associated_token_account::get_associated_token_address(user, &base_mint);
+    let user_quote_ata = spl_associated_token_account::get_associated_token_address(user, &quote_mint);
+    let fee_recipient_ata =
+        spl_associated_token_account::get_associated_token_address(&fee_recipient, &quote_mint);
+
+    let (event_authority, _) =
+        Pubkey::find_program_address(&[b"__event_authority"], &PUMPSWAP_PROGRAM);
+
+    // buy = quote→base, sell = base→quote. Both use anchor_disc("buy"/"sell").
+    let disc = if is_buy { anchor_disc("buy") } else { anchor_disc("sell") };
+    let mut data = Vec::with_capacity(24);
+    data.extend_from_slice(&disc);
+    data.extend_from_slice(&amount_in.to_le_bytes());
+    data.extend_from_slice(&min_out.to_le_bytes());
+
+    let accounts = vec![
+        AccountMeta::new_readonly(global_config, false),     // global_config
+        AccountMeta::new(*pool, false),                      // pool (writable)
+        AccountMeta::new_readonly(*user, true),              // user (signer)
+        AccountMeta::new_readonly(base_mint, false),         // base_mint
+        AccountMeta::new_readonly(quote_mint, false),        // quote_mint
+        AccountMeta::new(user_base_ata, false),              // user_base_token_account
+        AccountMeta::new(user_quote_ata, false),             // user_quote_token_account
+        AccountMeta::new(base_vault, false),                 // pool_base_token_account
+        AccountMeta::new(quote_vault, false),                // pool_quote_token_account
+        AccountMeta::new_readonly(fee_recipient, false),     // protocol_fee_recipient
+        AccountMeta::new(fee_recipient_ata, false),          // protocol_fee_recipient_token_account
+        AccountMeta::new_readonly(SPL_TOKEN, false),         // base_token_program
+        AccountMeta::new_readonly(SPL_TOKEN, false),         // quote_token_program
+        AccountMeta::new_readonly(SYSTEM_PROGRAM, false),    // system_program
+        AccountMeta::new_readonly(ASSOCIATED_TOKEN_PROGRAM, false), // associated_token_program
+        AccountMeta::new_readonly(event_authority, false),   // event_authority
+        AccountMeta::new_readonly(PUMPSWAP_PROGRAM, false),  // program
+    ];
+
+    Ok(Instruction {
+        program_id: PUMPSWAP_PROGRAM,
+        accounts,
+        data,
+    })
+}
+
 // ── Dispatch ─────────────────────────────────────────────────────────────────
 
 /// Build a native swap instruction for the given DEX name.
@@ -464,6 +989,18 @@ pub fn build_swap(
         }
         "OrcaWhirlpoolV1" => {
             build_orca_whirlpool(pool, user, mint_in, mint_out, amount_in, min_out, store)
+        }
+        "MeteoraDammV2" => {
+            build_meteora_damm_v2(pool, user, mint_in, mint_out, amount_in, min_out, store)
+        }
+        "MeteoraDlmm" => {
+            build_meteora_dlmm(pool, user, mint_in, mint_out, amount_in, min_out, store)
+        }
+        "RaydiumAmmV4" => {
+            build_raydium_amm_v4(pool, user, mint_in, mint_out, amount_in, min_out, store)
+        }
+        "PumpSwap" => {
+            build_pumpswap(pool, user, mint_in, mint_out, amount_in, min_out, store)
         }
         other => bail!("missing_native_ix_builder dex={other}"),
     }
