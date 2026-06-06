@@ -46,10 +46,63 @@ use tracing::{debug, info, warn};
 
 use crate::account_cache::AccountCache;
 use crate::metrics::Metrics;
+use crate::pool_state_store::PoolStateStore;
+
+// Alias to disambiguate the litesvm Clock (solana-clock 3.x) from the
+// solana-sdk 2.x Clock that lives in scope via solana_sdk imports.
+use solana_clock::Clock as LsClock;
+
+/// Build a LiteSVM account-override map for `tx` by pulling every referenced
+/// account that is live in the `PoolStateStore`. This is the bridge between the
+/// bot's pool-state data source (PoolStateStore, fed by the Yellowstone pool
+/// stream) and the simulator (which otherwise reads the separate AccountCache).
+///
+/// Without this, the AccountCache used by the no-metis sim path is empty and
+/// every swap reverts with `AccountNotInitialized` (Anchor error 3012).
+///
+/// Token programs, sysvars, and the System program are built into LiteSVM via
+/// `with_default_programs()` and are intentionally not copied here.
+pub fn store_overrides_for_tx(
+    tx: &VersionedTransaction,
+    store: &PoolStateStore,
+) -> std::collections::HashMap<Pubkey, solana_account::Account> {
+    let mut map = std::collections::HashMap::new();
+    for pk in tx.message.static_account_keys() {
+        if let Some(raw) = store.accounts.get(pk) {
+            map.insert(
+                *pk,
+                solana_account::Account {
+                    lamports: raw.lamports,
+                    data: raw.data.clone(),
+                    owner: solana_address::Address::from(raw.owner.to_bytes()),
+                    executable: false,
+                    rent_epoch: u64::MAX,
+                },
+            );
+        }
+    }
+    map
+}
 
 pub struct SimOutcome {
     pub compute_units: u64,
     pub wsol_after: u64,
+}
+
+/// Output of a per-hop simulation (single swap instruction).
+pub struct HopSimOutcome {
+    pub compute_units: u64,
+    /// Balance of the output token ATA after the hop executes.
+    pub out_balance: u64,
+}
+
+/// Result of a no-gate simulation (simulate_native).
+pub struct NativeSimResult {
+    pub wsol_before: u64,
+    pub wsol_after: u64,
+    pub compute_units: u64,
+    /// First log line from a revert (None if success).
+    pub revert_log: Option<String>,
 }
 
 pub struct Simulator {
@@ -188,9 +241,22 @@ impl Simulator {
 
         let mut svm = self.svm.lock().unwrap();
 
-        // Advance the SVM clock to the live Yellowstone slot.
+        // Advance the SVM clock to the live Yellowstone slot and real unix time.
+        // warp_to_slot only updates clock.slot; programs like Orca Whirlpool
+        // check clock.unix_timestamp > pool.last_updated_timestamp, so we must
+        // also set unix_timestamp to the current wall-clock time or they revert
+        // with InvalidTimestamp (error 6022).
         let live_slot = self.current_slot.load(Ordering::Relaxed);
         svm.warp_to_slot(live_slot);
+        {
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let mut clock = svm.get_sysvar::<LsClock>();
+            clock.unix_timestamp = now_unix;
+            svm.set_sysvar(&clock);
+        }
 
         // Inject ALT raw accounts so the SVM can expand v0 address lookups.
         for alt in alts {
@@ -274,6 +340,144 @@ impl Simulator {
                         wsol_after: 0,
                     })
                 }
+            }
+        }
+    }
+
+    /// Simulate without profitability gating. Returns raw wsol balances and CU.
+    /// Returns `Err` only if the transaction reverts at the SVM level.
+    pub fn simulate_native(
+        &self,
+        tx: &VersionedTransaction,
+        cache: &AccountCache,
+    ) -> Result<NativeSimResult> {
+        let accounts = collect_tx_accounts(tx, &[]);
+
+        for pk in &accounts {
+            if cache.get(pk).is_none() {
+                if let Err(e) = cache.get_or_fetch(pk) {
+                    debug!(pubkey = %pk, error = %e, "lazy RPC fetch");
+                }
+            }
+        }
+
+        let mut svm = self.svm.lock().unwrap();
+
+        let live_slot = self.current_slot.load(Ordering::Relaxed);
+        svm.warp_to_slot(live_slot);
+        {
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let mut clock = svm.get_sysvar::<LsClock>();
+            clock.unix_timestamp = now_unix;
+            svm.set_sysvar(&clock);
+        }
+
+        for pk in &accounts {
+            if let Some(acct) = cache.get(pk) {
+                if acct.executable() {
+                    continue;
+                }
+                let _ = svm.set_account(pk_to_addr(*pk), acct);
+            }
+        }
+
+        let wsol_before = parse_wsol_amount(&svm, self.wsol_ata);
+        let litesvm_tx = to_litesvm_tx(tx)?;
+
+        match svm.simulate_transaction(litesvm_tx) {
+            Ok(info) => {
+                let wsol_ata_addr = pk_to_addr(self.wsol_ata);
+                let wsol_after = info
+                    .post_accounts
+                    .iter()
+                    .find(|(addr, _)| *addr == wsol_ata_addr)
+                    .and_then(|(_, acc)| parse_token_amount(acc.data()))
+                    .unwrap_or(wsol_before);
+                Ok(NativeSimResult {
+                    wsol_before,
+                    wsol_after,
+                    compute_units: info.meta.compute_units_consumed,
+                    revert_log: None,
+                })
+            }
+            Err(meta) => {
+                // Show the last few log lines — the relevant program error is
+                // typically at the end, after the invoke chain.
+                let logs = &meta.meta.logs;
+                let excerpt = if logs.len() <= 6 {
+                    logs.join(" | ")
+                } else {
+                    logs[logs.len() - 6..].join(" | ")
+                };
+                anyhow::bail!(
+                    "sim reverted: err={:?} logs=[{}]",
+                    meta.err,
+                    excerpt,
+                )
+            }
+        }
+    }
+
+    /// Simulate a single swap instruction with explicit account overrides.
+    /// Overrides are applied on top of the Yellowstone cache but are NOT
+    /// written back to the cache, so concurrent simulations are unaffected.
+    /// Use for per-hop diagnostic simulation with injected input/output ATAs.
+    pub fn simulate_hop(
+        &self,
+        tx: &VersionedTransaction,
+        cache: &AccountCache,
+        overrides: &std::collections::HashMap<Pubkey, solana_account::Account>,
+        output_ata: Pubkey,
+    ) -> Result<HopSimOutcome> {
+        let accounts = collect_tx_accounts(tx, &[]);
+
+        let mut svm = self.svm.lock().unwrap();
+
+        let live_slot = self.current_slot.load(Ordering::Relaxed);
+        svm.warp_to_slot(live_slot);
+        {
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let mut clock = svm.get_sysvar::<LsClock>();
+            clock.unix_timestamp = now_unix;
+            svm.set_sysvar(&clock);
+        }
+
+        for pk in &accounts {
+            let acct = overrides.get(pk).cloned().or_else(|| cache.get(pk));
+            if let Some(acct) = acct {
+                if acct.executable() { continue; }
+                let _ = svm.set_account(pk_to_addr(*pk), acct);
+            }
+        }
+
+        let litesvm_tx = to_litesvm_tx(tx)?;
+
+        match svm.simulate_transaction(litesvm_tx) {
+            Ok(info) => {
+                let out_addr = pk_to_addr(output_ata);
+                let out_balance = info.post_accounts.iter()
+                    .find(|(addr, _)| *addr == out_addr)
+                    .and_then(|(_, acc)| parse_token_amount(acc.data()))
+                    .unwrap_or(0);
+                Ok(HopSimOutcome {
+                    compute_units: info.meta.compute_units_consumed,
+                    out_balance,
+                })
+            }
+            Err(meta) => {
+                let logs = &meta.meta.logs;
+                let excerpt = if logs.len() <= 6 {
+                    logs.join(" | ")
+                } else {
+                    logs[logs.len() - 6..].join(" | ")
+                };
+                anyhow::bail!("sim reverted: err={:?} logs=[{}]", meta.err, excerpt)
             }
         }
     }
@@ -362,6 +566,26 @@ impl SimulatorPool {
     pub fn acquire(&self) -> Arc<Simulator> {
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.sims.len();
         self.sims[idx].clone()
+    }
+
+    /// Run simulate_native on a round-robin simulator.
+    pub fn simulate_native(
+        &self,
+        tx: &VersionedTransaction,
+        cache: &AccountCache,
+    ) -> Result<NativeSimResult> {
+        self.acquire().simulate_native(tx, cache)
+    }
+
+    /// Run simulate_hop on a round-robin simulator.
+    pub fn simulate_hop(
+        &self,
+        tx: &VersionedTransaction,
+        cache: &AccountCache,
+        overrides: &std::collections::HashMap<Pubkey, solana_account::Account>,
+        output_ata: Pubkey,
+    ) -> Result<HopSimOutcome> {
+        self.acquire().simulate_hop(tx, cache, overrides, output_ata)
     }
 }
 
