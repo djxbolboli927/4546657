@@ -46,10 +46,43 @@ use tracing::{debug, info, warn};
 
 use crate::account_cache::AccountCache;
 use crate::metrics::Metrics;
+use crate::pool_state_store::PoolStateStore;
 
 // Alias to disambiguate the litesvm Clock (solana-clock 3.x) from the
 // solana-sdk 2.x Clock that lives in scope via solana_sdk imports.
 use solana_clock::Clock as LsClock;
+
+/// Build a LiteSVM account-override map for `tx` by pulling every referenced
+/// account that is live in the `PoolStateStore`. This is the bridge between the
+/// bot's pool-state data source (PoolStateStore, fed by the Yellowstone pool
+/// stream) and the simulator (which otherwise reads the separate AccountCache).
+///
+/// Without this, the AccountCache used by the no-metis sim path is empty and
+/// every swap reverts with `AccountNotInitialized` (Anchor error 3012).
+///
+/// Token programs, sysvars, and the System program are built into LiteSVM via
+/// `with_default_programs()` and are intentionally not copied here.
+pub fn store_overrides_for_tx(
+    tx: &VersionedTransaction,
+    store: &PoolStateStore,
+) -> std::collections::HashMap<Pubkey, solana_account::Account> {
+    let mut map = std::collections::HashMap::new();
+    for pk in tx.message.static_account_keys() {
+        if let Some(raw) = store.accounts.get(pk) {
+            map.insert(
+                *pk,
+                solana_account::Account {
+                    lamports: raw.lamports,
+                    data: raw.data.clone(),
+                    owner: solana_address::Address::from(raw.owner.to_bytes()),
+                    executable: false,
+                    rent_epoch: u64::MAX,
+                },
+            );
+        }
+    }
+    map
+}
 
 pub struct SimOutcome {
     pub compute_units: u64,

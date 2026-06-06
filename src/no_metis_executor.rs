@@ -15,7 +15,6 @@
 //!   8. Send to Jito if sim succeeded and delta within match_threshold.
 //!      → REST first, gRPC fallback.
 
-use std::collections::HashMap;
 use std::io::Write as IoWrite;
 use std::sync::{
     atomic::{AtomicI64, AtomicU64, Ordering::Relaxed},
@@ -447,10 +446,21 @@ async fn simulate_hops(
             }
         };
 
-        // Inject input ATA with exact amount; output ATA with 0.
+        // Pull every account this hop touches from the live PoolStateStore
+        // (pool, vaults, tick arrays, config). Without this the sim cache is
+        // empty and every swap reverts with AccountNotInitialized (3012).
         let input_ata = spl_associated_token_account::get_associated_token_address(&user, &mint_in);
         let output_ata = spl_associated_token_account::get_associated_token_address(&user, &mint_out);
-        let mut overrides: HashMap<Pubkey, solana_account::Account> = HashMap::new();
+        let mut overrides = crate::litesvm_sim::store_overrides_for_tx(&tx, &ctx.store);
+        // RPC-warm anything the store lacks (mints, observation accounts) into
+        // the sim cache; cached after first fetch so it self-warms over time.
+        for pk in tx.message.static_account_keys() {
+            if overrides.contains_key(pk) { continue; }
+            if *pk == input_ata || *pk == output_ata { continue; }
+            if sim_cache.get(pk).is_none() {
+                let _ = sim_cache.get_or_fetch(pk);
+            }
+        }
         overrides.insert(input_ata, make_spl_token_account_with_amount(&mint_in, &user, amount_in));
         overrides.insert(output_ata, make_spl_token_account(&mint_out, &user));
 

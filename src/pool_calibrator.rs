@@ -143,7 +143,20 @@ async fn run_calibration(
                         let output_ata = spl_associated_token_account::get_associated_token_address(
                             &user, &edge.mint_out,
                         );
-                        let mut overrides: HashMap<Pubkey, solana_account::Account> = HashMap::new();
+                        // Pull every account this swap touches from the live
+                        // PoolStateStore (pool, vaults, tick arrays, config…).
+                        let mut overrides = crate::litesvm_sim::store_overrides_for_tx(&tx, &store);
+                        // RPC-warm anything the store doesn't have (mints,
+                        // observation accounts) into the sim cache. One-time cost
+                        // — the calibrator runs once and the cache memoizes.
+                        for pk in tx.message.static_account_keys() {
+                            if overrides.contains_key(pk) { continue; }
+                            if *pk == input_ata || *pk == output_ata { continue; }
+                            if sim_cache.get(pk).is_none() {
+                                let _ = sim_cache.get_or_fetch(pk);
+                            }
+                        }
+                        // User ATAs override everything (test balance).
                         overrides.insert(input_ata, make_token_account(&wsol_mint, &user, TEST_AMOUNT));
                         overrides.insert(output_ata, make_token_account(&edge.mint_out, &user, 0));
 
