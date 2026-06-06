@@ -18,6 +18,7 @@ mod metis;
 mod metrics;
 mod native_ix;
 mod no_metis_executor;
+mod pool_calibrator;
 mod program_registry;
 mod rate_limiter;
 mod pool_state_socket;
@@ -294,6 +295,11 @@ simulation disabled, ALL transactions will be sent"
                 let cu_limit = config.arb_test.no_metis.cu_limit;
                 let nm_cfg = config.arb_test.no_metis.clone();
 
+                // Clone Arc refs before ctx consumes them, for the calibrator.
+                let calib_sim_pool = nm_sim_pool.clone();
+                let calib_cache = nm_cache.clone();
+                let calib_bh = blockhash_cache_nm.clone();
+
                 let ctx = Arc::new(no_metis_executor::NoMetisCtx {
                     jito: jito_nm,
                     jito_grpc: jito_grpc_nm,
@@ -311,6 +317,21 @@ simulation disabled, ALL transactions will be sent"
 
                 let (tx, rx) = tokio::sync::mpsc::channel::<arb_cycle::CycleHit>(200);
                 no_metis_executor::spawn_no_metis_executor(rx, ctx);
+
+                // Per-pool price calibration: compare RAM quote vs LiteSVM for
+                // every pool in the registry. Runs once after state warms up.
+                if let Some(sp) = calib_sim_pool {
+                    pool_calibrator::spawn_pool_calibrator(
+                        vault_pairs.clone(),
+                        store.clone(),
+                        sp,
+                        calib_cache,
+                        trading_keypair.clone(),
+                        calib_bh,
+                        cu_limit,
+                    );
+                }
+
                 Some(tx)
             // 2c. Optionally init execution stack and forward hits to Jito.
             } else if config.validation.execute_cycles {
