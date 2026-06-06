@@ -2,8 +2,12 @@
 mod account_cache;
 mod alt_cache;
 mod arbitrage;
+mod arb_cycle;
+mod arb_validator;
 mod blockhash_cache;
 mod config;
+mod cycle_executor;
+mod dex;
 mod dex_accounts;
 mod jito;
 #[allow(dead_code)]
@@ -12,9 +16,16 @@ mod jito_grpc;
 mod litesvm_sim;
 mod metis;
 mod metrics;
+mod native_ix;
+mod no_metis_executor;
+mod pool_calibrator;
 mod program_registry;
 mod rate_limiter;
+mod pool_state_socket;
+mod pool_state_store;
+mod pool_state_stream;
 mod template_cache;
+mod validator;
 mod token_metrics;
 mod tokens;
 mod transaction;
@@ -92,6 +103,320 @@ async fn async_main(config: config::Config) -> Result<()> {
             "[template] loaded {hops_loaded} hop templates and {routes_loaded} route templates from /root/c/cache/"
         );
         template_store.spawn_flush_task(60);
+    }
+
+    // ── Pool state data source — explicit `mode`, no implicit gRPC ──────────
+    //   mode = "direct_grpc_fast"  → bot subscribes directly to Yellowstone.
+    //   mode = "relay_socket"      → bot reads from the fanout Unix socket.
+    //   mode = "disabled"          → no pool-state stream.
+    //
+    // validation.enabled is a *consumer* flag — it never selects a data source.
+    // If validation is on but the source is disabled, we bail with a clear
+    // message rather than silently doing nothing.
+    let source = config.pool_state.resolved_mode();
+    if source == "invalid" {
+        anyhow::bail!(
+            "[pool_state] mode = \"{}\" is not recognised. Use one of: \
+             direct_grpc_fast, relay_socket, disabled.",
+            config.pool_state.mode
+        );
+    }
+    if source == "disabled" && config.validation.enabled {
+        anyhow::bail!(
+            "validation.enabled=true but pool_state source is disabled.\n\
+             Set [pool_state].mode = \"direct_grpc_fast\" (direct Yellowstone gRPC)\n\
+             or [pool_state].mode = \"relay_socket\" with a socket path."
+        );
+    }
+
+    let pool_state_result = if source != "disabled" {
+        match pool_state_stream::load_mix_json(&config.pool_state.mix_json) {
+            Ok(parsed) => {
+                // Optional truncation for connectivity tests. 0 = no limit.
+                let mut subscribe_list = parsed.subscribe_list;
+                let full = subscribe_list.len();
+                let max = config.pool_state.max_accounts;
+                if max > 0 && full > max {
+                    eprintln!(
+                        "[pool_state] WARNING: truncating subscription {full} → {max} \
+                         accounts (max_accounts={max}); some pools will never go live. \
+                         Set max_accounts=0 for production."
+                    );
+                    subscribe_list.truncate(max);
+                }
+
+                let store = pool_state_store::PoolStateStore::new(
+                    parsed.account_to_pools,
+                    parsed.pool_to_accounts,
+                );
+                eprintln!(
+                    "[pool_state] mode={source} mix.json: {} pools, {} unique accounts, {} vault pairs",
+                    store.pool_count,
+                    full,
+                    parsed.vault_pairs.len(),
+                );
+
+                match source {
+                    "relay_socket" => {
+                        if config.pool_state.socket.is_empty() {
+                            anyhow::bail!(
+                                "[pool_state] mode=relay_socket but socket path is empty. \
+                                 Set [pool_state].socket = \"/tmp/yellowstone_fanout.sock\"."
+                            );
+                        }
+                        eprintln!(
+                            "[pool_state] data source: relay socket {}",
+                            config.pool_state.socket
+                        );
+                        pool_state_socket::spawn_socket_reader(
+                            config.pool_state.socket.clone(),
+                            store.clone(),
+                        );
+                    }
+                    "direct_grpc_fast" => {
+                        eprintln!(
+                            "[pool_state] data source: direct Yellowstone gRPC ({})",
+                            config.yellowstone_grpc.endpoint
+                        );
+                        pool_state_stream::spawn_pool_state_stream_sharded(
+                            config.yellowstone_grpc.endpoint.clone(),
+                            config.yellowstone_grpc.x_token.clone(),
+                            subscribe_list,
+                            store.clone(),
+                            config.pool_state.accounts_per_stream,
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+
+                Some((store, parsed.vault_pairs))
+            }
+            Err(e) => {
+                eprintln!(
+                    "[pool_state] WARNING: could not load mix.json ({e}); pool state disabled"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // ── Validation mode: price comparison + cycle scan ───────────────────────
+    // When execute_cycles=true, profitable cycles are also forwarded to Metis
+    // for /swap-instructions and then submitted to Jito.
+    if config.validation.enabled {
+        if let Some((store, vault_pairs)) = pool_state_result {
+            // 1. Jupiter price validator (local spot price vs Jupiter reference).
+            validator::spawn_validator(
+                vault_pairs.clone(),
+                store.clone(),
+                rpc_client.clone(),
+                config.validation.clone(),
+                config.jupiter_price.clone(),
+            );
+
+            // 2a. validate_local mode: per-hop Metis /quote comparison, no Jito sends.
+            //     Takes priority over execute_cycles when both are enabled.
+            let hit_tx = if config.arb_test.validate_local {
+                let metis_val = Arc::new(metis::MetisClient::new(
+                    &config.metis.url,
+                    config.performance.quote_timeout_ms,
+                ));
+                let (tx, rx) = tokio::sync::mpsc::channel::<arb_cycle::CycleHit>(200);
+                arb_validator::spawn_arb_validator(rx, metis_val, config.arb_test.clone());
+                Some(tx)
+            // 2b. send_no_metis mode: native DEX instructions + LiteSVM sim + Jito send.
+            } else if config.arb_test.send_no_metis {
+                let blockhash_cache_nm = Arc::new(BlockhashCache::new(rpc_client.clone()));
+                let jito_nm = Arc::new(jito::JitoClient::new(
+                    &config.jito.urls,
+                    &config.jito.uuid,
+                ));
+                let jito_lim_nm = Arc::new(Mutex::new(
+                    RateLimiter::new(config.jito.max_bundles_per_second),
+                ));
+
+                let (jito_grpc_nm, grpc_lim_nm) = if config.jito_grpc.enabled {
+                    match jito_grpc::JitoGrpcClient::new(
+                        &config.jito_grpc.endpoints,
+                        &config.jito_grpc.auth_keypair,
+                    )
+                    .await
+                    {
+                        Ok(client) => {
+                            let lim = Arc::new(Mutex::new(RateLimiter::new(
+                                config.jito_grpc.max_bundles_per_second,
+                            )));
+                            (Some(Arc::new(client)), Some(lim))
+                        }
+                        Err(e) => {
+                            eprintln!("[no_metis] Jito gRPC init failed: {e} — REST-only");
+                            (None, None)
+                        }
+                    }
+                } else {
+                    (None, None)
+                };
+
+                // Build LiteSVM simulation pool for pre-send validation.
+                // wsol_mint used for reference only
+                let nm_cache = account_cache::AccountCache::new(rpc_client.clone());
+                // Seed slot and pre-fetch the trading wallet's WSOL ATA.
+                if let Ok(slot) = rpc_client.get_slot() {
+                    nm_cache.seed_slot(slot);
+                }
+                nm_cache.prefetch(&[wsol_ata, trading_keypair.pubkey()]);
+                let nm_cache = Arc::new(nm_cache);
+
+                let nm_sim_pool = match litesvm_sim::SimulatorPool::new(
+                    config.arb_test.no_metis.sim_workers,
+                    &config.simulation.so_dir,
+                    wsol_ata,
+                    true,
+                    nm_cache.stream_slot(),
+                ) {
+                    Ok(p) => {
+                        eprintln!(
+                            "[no_metis] LiteSVM sim pool ready — workers={}",
+                            config.arb_test.no_metis.sim_workers,
+                        );
+                        Some(Arc::new(p))
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[no_metis] LiteSVM sim pool FAILED ({e}) — \
+simulation disabled, ALL transactions will be sent"
+                        );
+                        None
+                    }
+                };
+
+                let cu_limit = config.arb_test.no_metis.cu_limit;
+                let nm_cfg = config.arb_test.no_metis.clone();
+
+                // Clone Arc refs before ctx consumes them, for the calibrator.
+                let calib_sim_pool = nm_sim_pool.clone();
+                let calib_cache = nm_cache.clone();
+                let calib_bh = blockhash_cache_nm.clone();
+
+                let ctx = Arc::new(no_metis_executor::NoMetisCtx {
+                    jito: jito_nm,
+                    jito_grpc: jito_grpc_nm,
+                    jito_limiter: jito_lim_nm,
+                    jito_grpc_limiter: grpc_lim_nm,
+                    trading_keypair: trading_keypair.clone(),
+                    rpc_client: rpc_client.clone(),
+                    blockhash_cache: blockhash_cache_nm,
+                    store: store.clone(),
+                    cfg: nm_cfg,
+                    cu_limit,
+                    sim_pool: nm_sim_pool,
+                    sim_cache: Some(nm_cache),
+                });
+
+                let (tx, rx) = tokio::sync::mpsc::channel::<arb_cycle::CycleHit>(200);
+                no_metis_executor::spawn_no_metis_executor(rx, ctx);
+
+                // Per-pool price calibration: compare RAM quote vs LiteSVM for
+                // every pool in the registry. Runs once after state warms up.
+                if let Some(sp) = calib_sim_pool {
+                    pool_calibrator::spawn_pool_calibrator(
+                        vault_pairs.clone(),
+                        store.clone(),
+                        sp,
+                        calib_cache,
+                        trading_keypair.clone(),
+                        calib_bh,
+                        cu_limit,
+                    );
+                }
+
+                Some(tx)
+            // 2c. Optionally init execution stack and forward hits to Jito.
+            } else if config.validation.execute_cycles {
+                let blockhash_cache_exec = Arc::new(BlockhashCache::new(rpc_client.clone()));
+                let alt_cache_exec = AltCache::new(transaction::jito_tip_pubkeys());
+                let metis_exec = Arc::new(metis::MetisClient::new(
+                    &config.metis.url,
+                    config.performance.quote_timeout_ms,
+                ));
+                let jito_exec = Arc::new(jito::JitoClient::new(
+                    &config.jito.urls,
+                    &config.jito.uuid,
+                ));
+                let jito_lim_exec = Arc::new(Mutex::new(
+                    RateLimiter::new(config.jito.max_bundles_per_second),
+                ));
+
+                let (jito_grpc_exec, grpc_lim_exec) = if config.jito_grpc.enabled {
+                    match jito_grpc::JitoGrpcClient::new(
+                        &config.jito_grpc.endpoints,
+                        &config.jito_grpc.auth_keypair,
+                    )
+                    .await
+                    {
+                        Ok(client) => {
+                            let lim = Arc::new(Mutex::new(RateLimiter::new(
+                                config.jito_grpc.max_bundles_per_second,
+                            )));
+                            (Some(Arc::new(client)), Some(lim))
+                        }
+                        Err(e) => {
+                            eprintln!("[executor] Jito gRPC init failed: {e} — REST-only");
+                            (None, None)
+                        }
+                    }
+                } else {
+                    (None, None)
+                };
+
+                let ctx = Arc::new(cycle_executor::ExecutorCtx {
+                    metis: metis_exec,
+                    jito: jito_exec,
+                    jito_grpc: jito_grpc_exec,
+                    jito_limiter: jito_lim_exec,
+                    jito_grpc_limiter: grpc_lim_exec,
+                    trading_keypair: trading_keypair.clone(),
+                    rpc_client: rpc_client.clone(),
+                    blockhash_cache: blockhash_cache_exec,
+                    alt_cache: alt_cache_exec,
+                    cu_limits: config.performance.cu_limits.clone(),
+                    user_pubkey: trading_keypair.pubkey().to_string(),
+                    min_profit_lamports: config.validation.min_exec_profit_lamports,
+                    tip_lamports: config.jito.tip_min_lamports,
+                    base_fee_lamports: config.trading.base_fee_lamports,
+                });
+
+                let (tx, rx) = tokio::sync::mpsc::channel(200);
+                cycle_executor::spawn_cycle_executor(rx, ctx);
+                eprintln!(
+                    "[executor] started — min_profit={}L tip={}L base_fee={}L",
+                    config.validation.min_exec_profit_lamports,
+                    config.jito.tip_min_lamports,
+                    config.trading.base_fee_lamports,
+                );
+                Some(tx)
+            } else {
+                None
+            };
+
+            // 3. WSOL cycle evaluator — finds 2-hop and 3-hop arb opportunities.
+            //    Net-positive hits are forwarded to executor when execute_cycles=true.
+            arb_cycle::spawn_cycle_scanner(
+                vault_pairs,
+                store,
+                config.validation.interval_secs,
+                config.validation.max_pools_log,
+                arb_cycle::DEFAULT_TX_COST,
+                hit_tx,
+            );
+        } else {
+            eprintln!("[validator] ERROR: pool state unavailable; set pool_state.mix_json in config");
+        }
+        // Park here until ctrl-c.
+        tokio::signal::ctrl_c().await.ok();
+        return Ok(());
     }
 
     let metrics = metrics::Metrics::new();

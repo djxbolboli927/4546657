@@ -1,0 +1,35 @@
+[package]
+name = "yellowstone_fanout"
+version = "0.1.0"
+edition = "2021"
+
+# Phase A: a standalone test tool that proves the bot can receive the same raw
+# account state from Yellowstone (PublicNode) that Metis receives, and decode
+# it correctly. It does NOT touch Metis. It is intentionally EXCLUDED from the
+# main workspace (see exclude in the root Cargo.toml) so the bot build is
+# completely independent and cannot be affected by this tool.
+[[bin]]
+name = "yellowstone_fanout_phase_a"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+
+# Yellowstone gRPC — pinned to 6.1 to match the version the bot ALREADY uses
+# successfully against the same PublicNode endpoint (see the main crate's
+# account_cache.rs). The friend's note suggested 12.3.0, but matching the
+# proven-working version removes any proto/transport mismatch risk for Phase A.
+yellowstone-grpc-client = "6.1"
+yellowstone-grpc-proto = "6.1"
+
+futures = "0.3"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+bs58 = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3

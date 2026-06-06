@@ -16,6 +16,14 @@ pub struct Config {
     pub jito_grpc: JitoGrpcConfig,
     #[serde(default)]
     pub template_cache: TemplateCacheConfig,
+    #[serde(default)]
+    pub pool_state: PoolStateConfig,
+    #[serde(default)]
+    pub jupiter_price: JupiterPriceConfig,
+    #[serde(default)]
+    pub validation: ValidationConfig,
+    #[serde(default)]
+    pub arb_test: ArbTestConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -251,6 +259,283 @@ impl Default for TemplateCacheConfig {
 
 fn default_true_tc() -> bool {
     true
+}
+
+// ── Pool state stream config ──────────────────────────────────────────────────
+
+/// Configuration for the live pool-account state stream (Phase 2).
+///
+/// When `enabled = true`, the bot connects to the same Yellowstone endpoint
+/// used by the account_cache, subscribes to all pool accounts listed in
+/// `mix_json`, and keeps a live PoolStateStore in memory.
+///
+/// This store feeds the per-DEX price/slippage calculators (Phase 2 step 2).
+/// In Phase A it simply receives and stores data — no calculator is wired yet.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PoolStateConfig {
+    /// Explicit data-source selector. One of:
+    ///   "direct_grpc_fast" — bot subscribes directly to Yellowstone gRPC.
+    ///   "relay_socket"     — bot reads decoded updates from a Unix socket.
+    ///   "disabled"         — no pool-state stream.
+    /// When empty, falls back to the legacy `enabled`/`socket` booleans.
+    #[serde(default)]
+    pub mode: String,
+    /// Legacy: enable direct Yellowstone gRPC subscription (used only when
+    /// `mode` is empty). Prefer `mode = "direct_grpc_fast"`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to mix.json (Metis market cache).
+    #[serde(default = "default_mix_json")]
+    pub mix_json: String,
+    /// Unix socket written by yellowstone_fanout_phase_a.
+    /// Used only when `mode = "relay_socket"` (or legacy: non-empty socket).
+    /// Set to the same value as BOT_SOCKET_PATH in the fanout process.
+    /// Example: /tmp/yellowstone_fanout.sock
+    #[serde(default)]
+    pub socket: String,
+    /// Cap on the number of subscribed accounts. 0 = no limit (production).
+    /// A non-zero value truncates the subscription list and logs a warning —
+    /// useful only for small connectivity tests.
+    #[serde(default)]
+    pub max_accounts: usize,
+    /// Accounts per gRPC subscription stream. 0 = single stream (no sharding).
+    /// Set to e.g. 1000–2000 if the provider limits accounts per request;
+    /// the list is split into chunks, each on its own stream, all writing to
+    /// the same PoolStateStore.
+    #[serde(default)]
+    pub accounts_per_stream: usize,
+}
+
+fn default_mix_json() -> String {
+    "/root/c/metis/1/mix.json".to_string()
+}
+
+impl Default for PoolStateConfig {
+    fn default() -> Self {
+        Self {
+            mode: String::new(),
+            enabled: false,
+            mix_json: default_mix_json(),
+            socket: String::new(),
+            max_accounts: 0,
+            accounts_per_stream: 0,
+        }
+    }
+}
+
+impl PoolStateConfig {
+    /// Resolve the effective data source, honouring the explicit `mode` first
+    /// and falling back to the legacy boolean/socket fields.
+    pub fn resolved_mode(&self) -> &str {
+        match self.mode.trim() {
+            "direct_grpc_fast" | "relay_socket" | "disabled" => self.mode.trim(),
+            "" => {
+                if !self.socket.is_empty() {
+                    "relay_socket"
+                } else if self.enabled {
+                    "direct_grpc_fast"
+                } else {
+                    "disabled"
+                }
+            }
+            // Unknown value — treat as disabled but the caller logs it.
+            _ => "invalid",
+        }
+    }
+}
+
+// ── Jupiter Price API config ──────────────────────────────────────────────────
+
+/// Jupiter Price API V3 settings.
+/// Used by the price validator to fetch USD reference prices.
+/// Free tier: 1 RPS / 60 RPM; up to 50 mint IDs per request.
+#[derive(Debug, Deserialize, Clone)]
+pub struct JupiterPriceConfig {
+    /// Base URL, e.g. "https://api.jup.ag/price/v3"
+    #[serde(default = "default_jupiter_url")]
+    pub url: String,
+    /// x-api-key header value. Empty string = no auth (public endpoint).
+    #[serde(default)]
+    pub api_key: String,
+}
+
+fn default_jupiter_url() -> String {
+    "https://api.jup.ag/price/v3".to_string()
+}
+
+impl Default for JupiterPriceConfig {
+    fn default() -> Self {
+        Self {
+            url: default_jupiter_url(),
+            api_key: String::new(),
+        }
+    }
+}
+
+// ── Validation mode config ────────────────────────────────────────────────────
+
+/// When `enabled = true`, the bot starts ONLY the pool-state stream and the
+/// price validator — the normal Metis/Jito scan loop is not started.
+///
+/// When `execute_cycles = true` is added, net-positive cycles found by the
+/// local scanner are forwarded to Metis for /swap-instructions and then
+/// submitted to Jito.  This reuses the same Jito credentials as production
+/// mode.  Template-cache tier-1/2 (RAM serve) is not used; every hit goes
+/// directly to Metis.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ValidationConfig {
+    /// Enable validation mode. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How often to run a comparison cycle (seconds). Default: 5.
+    #[serde(default = "default_val_interval")]
+    pub interval_secs: u64,
+    /// Maximum number of pool lines to print per validator cycle (sorted by diff).
+    /// Set to 0 to suppress individual pool lines and show only max/min summary.
+    #[serde(default = "default_val_max_log")]
+    pub max_pools_log: usize,
+    /// When true, net-positive arb_cycle hits are forwarded to Metis for
+    /// /swap-instructions and submitted to Jito. Default: false.
+    #[serde(default)]
+    pub execute_cycles: bool,
+    /// Minimum local (and Metis-confirmed) profit in lamports before a cycle
+    /// hit is sent to /swap-instructions.  Default: 6600.
+    #[serde(default = "default_min_exec_profit")]
+    pub min_exec_profit_lamports: u64,
+}
+
+fn default_val_interval() -> u64 { 5 }
+fn default_val_max_log() -> usize { 0 }
+fn default_min_exec_profit() -> u64 { 6_600 }
+
+impl Default for ValidationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: 5,
+            max_pools_log: 0,
+            execute_cycles: false,
+            min_exec_profit_lamports: 6_600,
+        }
+    }
+}
+
+// ── Arb test / validate_local config ─────────────────────────────────────────
+
+/// Configuration for the no-Metis native executor.
+#[derive(Debug, Deserialize, Clone)]
+pub struct NoMetisConfig {
+    /// Jito tip in lamports for each bundle.
+    #[serde(default = "default_tip_lamports")]
+    pub tip_lamports: u64,
+    /// Maximum amount_in (lamports) per CycleHit. Safety cap for testing.
+    #[serde(default = "default_max_amount")]
+    pub max_amount_lamports: u64,
+    /// Compute unit limit for native transactions.
+    #[serde(default = "default_cu_limit")]
+    pub cu_limit: u32,
+    /// If true, min_out for the final hop is `final_min_out_lamports` (allow loss).
+    /// If false, min_out = amount_in (protect principal).
+    #[serde(default)]
+    pub test_land_even_if_loss: bool,
+    /// min_out for the final hop when test_land_even_if_loss=true. Set to 1 to accept any output.
+    #[serde(default = "default_final_min_out")]
+    pub final_min_out_lamports: u64,
+    /// Delta threshold (lamports) for LiteSVM vs RAM match. Transactions within
+    /// ±match_threshold are considered a match and sent to Jito.
+    #[serde(default = "default_match_threshold")]
+    pub match_threshold_lamports: u64,
+    /// Number of LiteSVM simulator workers.
+    #[serde(default = "default_sim_workers")]
+    pub sim_workers: usize,
+    /// Dry-run mode: simulate everything but never send to Jito.
+    /// Use to measure sim success/fail rates without risking funds.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+fn default_tip_lamports() -> u64 { 5_000 }
+fn default_max_amount() -> u64 { 100_000_000 }
+fn default_cu_limit() -> u32 { 300_000 }
+fn default_final_min_out() -> u64 { 1 }
+fn default_match_threshold() -> u64 { 500 }
+fn default_sim_workers() -> usize { 2 }
+
+impl NoMetisConfig {
+    /// Effective min_out for the final hop.
+    pub fn final_min_out(&self, amount_in: u64) -> u64 {
+        if self.test_land_even_if_loss {
+            self.final_min_out_lamports
+        } else {
+            amount_in
+        }
+    }
+}
+
+impl Default for NoMetisConfig {
+    fn default() -> Self {
+        Self {
+            tip_lamports: 5_000,
+            max_amount_lamports: 100_000_000,
+            cu_limit: 300_000,
+            test_land_even_if_loss: false,
+            final_min_out_lamports: 1,
+            match_threshold_lamports: 500,
+            sim_workers: 2,
+            dry_run: false,
+        }
+    }
+}
+
+/// Configuration for the three-mode arb-test system.
+///
+/// Mode 1 (validate_local): per-hop strict Metis /quote + ammKey match logging.
+/// Mode 2 (positive_slippage_probe): conditional bundle send (future).
+/// Mode 3 (send_no_metis): native DEX instructions without Metis.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ArbTestConfig {
+    /// Enable per-hop Metis /quote validation and ammKey matching. No Jito sends.
+    #[serde(default)]
+    pub validate_local: bool,
+    /// Enable conditional bundle send when Metis output is near the floor.
+    #[serde(default)]
+    pub positive_slippage_probe: bool,
+    /// Enable native DEX instruction send without Metis.
+    #[serde(default)]
+    pub send_no_metis: bool,
+    /// Maximum CycleHit candidates to validate per scan cycle.
+    #[serde(default = "default_max_candidates")]
+    pub max_candidates_per_scan: usize,
+    /// Also validate 3-hop cycles in validate_local mode.
+    #[serde(default = "default_arb_true")]
+    pub enable_3hop_validation: bool,
+    /// Restrict each per-hop Metis /quote to the same DEX label as the local pool.
+    #[serde(default = "default_arb_true")]
+    pub strict_dex_filter: bool,
+    /// Require routePlan[0].swapInfo.ammKey to equal the local pool pubkey.
+    #[serde(default = "default_arb_true")]
+    pub require_ammkey_match: bool,
+    /// Settings for send_no_metis mode.
+    #[serde(default)]
+    pub no_metis: NoMetisConfig,
+}
+
+fn default_max_candidates() -> usize { 5 }
+fn default_arb_true() -> bool { true }
+
+impl Default for ArbTestConfig {
+    fn default() -> Self {
+        Self {
+            validate_local: false,
+            positive_slippage_probe: false,
+            send_no_metis: false,
+            max_candidates_per_scan: 5,
+            enable_3hop_validation: true,
+            strict_dex_filter: true,
+            require_ammkey_match: true,
+            no_metis: NoMetisConfig::default(),
+        }
+    }
 }
 
 impl Config {

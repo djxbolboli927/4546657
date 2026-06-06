@@ -7,8 +7,8 @@ use std::sync::{Arc, RwLock};
 
 const BASE_DIR: &str = "/root/c/cache";
 /// Max distinct routes kept live (hot+cold ≤ 2×). For 200 pools ×2 directions
-/// that's ~400 routes; 2000 gives plenty of headroom without growing unbounded.
-const ROUTE_SEG_CAP: usize = 2_000;
+/// that's ~400 routes; 4000 gives plenty of headroom without growing unbounded.
+const ROUTE_SEG_CAP: usize = 4_000;
 
 // ─── Route signature ──────────────────────────────────────────────────────────
 

@@ -31,7 +31,7 @@ urls = [
 ]
 uuid = "8c7cda54-ef6e-4792-8617-da0341f8d485"
 trading_keypair = "/root/c/wallet/wallet.json"
-tip_min_lamports = 1000
+tip_min_lamports = 1600
 tip_max_lamports = 1000000
 tip_profit_percent = 0.50
 # ریت لیمیت فقط سمت ما: 5 باندل در ثانیه برای کل loop
@@ -42,8 +42,10 @@ max_bundles_per_second = 5
 url = "https://rpc.fra.shyft.to?api_key=farYqEW-7r1vxqok"
 
 [yellowstone_grpc]
-endpoint = "https://grpc.fra.shyft.to"
-x_token = "41cd21e6-6a66-493d-bdc6-a7057409c2a1"
+# منبع state استخرها — مستقیم از Yellowstone gRPC (DirectGrpcFast).
+# PublicNode سریع‌ترین حالت بدون relay است.
+endpoint = "https://solana-yellowstone-grpc.publicnode.com:443"
+x_token = "cba491e2cd18e339c6517a51d4d497737cb04edd08d8915fc872c8a30cd5656a"
 
 [performance]
 # تعداد worker thread های tokio برای ربات. در سرور 16 هسته‌ای،
@@ -119,3 +121,88 @@ max_bundles_per_second = 5
 save_new = true
 serve_route = true
 serve_from_metis = true
+
+[pool_state]
+# ── انتخاب صریح منبع داده ──────────────────────────────────────────────
+#   mode = "direct_grpc_fast"  → ربات مستقیماً به Yellowstone gRPC وصل می‌شود
+#                                (endpoint از [yellowstone_grpc]).
+#   mode = "relay_socket"      → ربات از سوکت fanout می‌خواند (socket پایین).
+#   mode = "disabled"          → هیچ stream اجرا نمی‌شود.
+# توجه: validation.enabled هیچ‌وقت خودش direct gRPC را روشن نمی‌کند.
+mode = "direct_grpc_fast"
+mix_json = "/root/c/metis/1/mix.json"
+# مسیر سوکت — فقط در حالت relay_socket استفاده می‌شود.
+socket = ""
+# سقف تعداد account برای subscribe. 0 = بدون محدودیت (production).
+# مقدار غیرصفر لیست را truncate می‌کند و warning می‌دهد (فقط برای تست اتصال).
+max_accounts = 0
+# تعداد account در هر stream. 0 = یک stream واحد (بدون sharding).
+# اگر provider روی تعداد account در هر SubscribeRequest محدودیت داشت،
+# مثلاً 1000 یا 2000 بگذارید تا لیست shard شود.
+accounts_per_stream = 0
+# legacy (وقتی mode خالی باشد استفاده می‌شود) — اکنون نادیده گرفته می‌شود.
+enabled = false
+
+[jupiter_price]
+# Jupiter Price API V3 — برای اعتبارسنجی قیمت‌های محلی.
+# حداکثر ۵۰ mint در هر درخواست.
+url = "https://api.jup.ag/price/v3"
+api_key = "jup_a12f7d564cf72370a4b3e5a9e0c14f6253d3c1c256314b4116dc83790ec30ee1"
+
+[validation]
+# ════════════════════════════════════════════════════════════════
+# VALIDATION MODE — enabled = true
+#   • loop اصلی ربات (Metis/Jito) کاملاً خاموش می‌شود
+#   • arb_cycle مسیرهای سودده را محلی پیدا می‌کند
+#   • اگر execute_cycles = true: هر hit سودده به Metis فرستاده شده
+#     و اگر Metis هم تأیید کرد → swap-instructions → Jito bundle
+# برای بازگشت به حالت عادی ربات: enabled = false
+# ════════════════════════════════════════════════════════════════
+enabled = true
+# هر چند ثانیه یک چرخه scan اجرا شود
+interval_secs = 5
+# حداکثر تعداد pool لاین که در هر چرخه validator نشان داده می‌شود.
+# 0 = فقط max/min diff نمایش داده می‌شود (بدون لیست جداگانه استخرها)
+max_pools_log = 0
+# وقتی true است: cycleهای net-positive به Metis برای ساخت اینستراکشن
+# فرستاده شده و سپس به Jito ارسال می‌شوند.
+execute_cycles = false
+# حداقل سود محلی (و تأیید Metis) به لمپرت قبل از رفتن به /swap-instructions.
+# 6600 = tx_fee(5000) + jito_tip(1000) + margin(600)
+min_exec_profit_lamports = 6600
+
+[arb_test]
+# Mode 1: per-hop strict Metis quote + ammKey match — no Jito sends.
+validate_local = false
+# Mode 2: send bundle only when Metis output is close to floor (disabled).
+positive_slippage_probe = false
+# Mode 3: native DEX instructions without Metis — ACTIVE.
+send_no_metis = true
+# Max CycleHit candidates forwarded per scan cycle.
+max_candidates_per_scan = 5
+# (unused in send_no_metis mode — kept for validate_local)
+enable_3hop_validation = false
+strict_dex_filter = true
+require_ammkey_match = true
+
+[arb_test.no_metis]
+# dry_run=true: شبیه‌سازی انجام می‌شود ولی هیچ تراکنشی به Jito ارسال نمی‌شود.
+# هر CycleHit (۲-هاپ و ۳-هاپ) شبیه‌سازی می‌شود و نتیجه در /root/c/dif ذخیره می‌شود.
+dry_run = true
+# Jito tip per bundle (lamports). Large enough to incentivize landing.
+tip_lamports = 100000
+# Safety cap: only send cycles where amount_in <= this value (1 million lamports = 0.001 SOL).
+max_amount_lamports = 1000000
+# Compute unit limit for native transactions.
+cu_limit = 300000
+# test_land_even_if_loss=true: min_out for the last hop = final_min_out_lamports (allow loss).
+# This is to verify the transaction executes at all, not to make profit.
+test_land_even_if_loss = true
+# Minimum output required from the final hop when test_land_even_if_loss=true.
+# 1 = accept any output (pure execution test).
+final_min_out_lamports = 1
+# LiteSVM vs RAM delta threshold. Transactions where |litesvm_profit - ram_profit| <= threshold
+# are considered a match and sent to Jito.
+match_threshold_lamports = 500
+# Number of parallel LiteSVM simulation workers.
+sim_workers = 2

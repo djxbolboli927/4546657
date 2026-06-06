@@ -106,6 +106,13 @@ impl AccountCache {
         self.inner.len()
     }
 
+    /// Inject an account directly into the cache (bypasses streaming/RPC).
+    /// Used to pre-populate synthetic empty SPL token ATAs for intermediate
+    /// hops that won't appear in the Yellowstone owner-filter subscription.
+    pub fn inject_account(&self, pubkey: Pubkey, account: Account) {
+        self.inner.insert(pubkey, account);
+    }
+
     /// Spawn the Yellowstone subscription task. Reconnects with exponential
     /// backoff if the stream drops.
     pub fn spawn_subscription(
